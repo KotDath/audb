@@ -11,8 +11,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use anyhow::{anyhow, Result};
+
+use crate::tools::shell_escape::escape_single_quote;
 
 const DEFAULT_USER: &str = "defaultuser";
 
@@ -50,6 +52,10 @@ impl SshClient {
     ///
     /// Uses the `echo 'password' | devel-su sh -c 'command'` pattern to automate
     /// devel-su password input through SSH exec channels.
+    ///
+    /// # Security
+    /// This function properly escapes the password and command to prevent shell injection.
+    /// Both parameters are escaped for use in single-quote contexts.
     pub fn exec_as_devel_su(
         session: &mut Handle<SshClient>,
         command: &str,
@@ -61,10 +67,14 @@ impl SshClient {
             ));
         }
 
+        // Escape password and command for single-quote context to prevent shell injection
+        let password_escaped = escape_single_quote(password);
+        let command_escaped = escape_single_quote(command);
+
         // Use echo pipe pattern: echo 'password' | devel-su sh -c 'command'
         let devel_su_command = format!(
             "echo '{}' | devel-su sh -c '{}'",
-            password, command
+            password_escaped, command_escaped
         );
 
         Self::exec(session, &devel_su_command)
@@ -85,7 +95,7 @@ impl SshClient {
         }
 
         // Join lines and remove whitespace
-        Ok(output.join("").replace('\n', "").replace('\r', ""))
+        Ok(output.join("").replace(['\n', '\r'], ""))
     }
 
     pub fn upload(
@@ -98,15 +108,6 @@ impl SshClient {
         })
     }
 
-    pub fn download(
-        session: &mut Handle<SshClient>,
-        remote_path: &Path,
-        local_path: &Path,
-    ) -> Result<()> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::_download(session, remote_path, local_path))
-        })
-    }
 
     pub fn test_connection(
         host: &str,
@@ -246,38 +247,6 @@ impl SshClient {
         Ok(())
     }
 
-    async fn _download(
-        session: &mut Handle<SshClient>,
-        remote_path: &Path,
-        local_path: &Path,
-    ) -> Result<()> {
-        let sftp_session = Self::_sftp_session(session).await?;
-
-        let mut sftp_file = sftp_session
-            .open_with_flags(
-                remote_path.to_string_lossy().to_string(),
-                OpenFlags::READ,
-            )
-            .await?;
-
-        // Read remote file
-        let mut data = Vec::new();
-        sftp_file.read_to_end(&mut data).await?;
-
-        if data.is_empty() {
-            return Err(anyhow!("Downloaded file is empty"));
-        }
-
-        // Create parent directory if needed
-        if let Some(parent) = local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Write to local file
-        fs::write(local_path, data)?;
-
-        Ok(())
-    }
 
     async fn _sftp_session(session: &mut Handle<SshClient>) -> Result<SftpSession> {
         let channel = session.channel_open_session().await?;

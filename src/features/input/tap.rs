@@ -5,10 +5,12 @@
 
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::features::input::scripts::ScriptManager;
-use crate::print_info;
-use crate::tools::ssh::SshClient;
-use crate::tools::types::DeviceIdentifier;
-use anyhow::{anyhow, Result};
+use crate::tools::{
+    macros::print_info,
+    session::DeviceSession,
+    types::DeviceIdentifier,
+};
+use anyhow::{anyhow, Context, Result};
 
 pub async fn execute(x: u16, y: u16) -> Result<()> {
     // Validate coordinates
@@ -16,47 +18,36 @@ pub async fn execute(x: u16, y: u16) -> Result<()> {
         return Err(anyhow!("Coordinates out of range: ({}, {}). Max: 4096x4096", x, y));
     }
 
-    // Get device
+    // Get device and establish session
     let current_host = DeviceState::get_current()?;
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    print_info!("Tapping at ({}, {}) on device {}", x, y, device.display_name());
+    print_info(format!("Tapping at ({}, {}) on device {}", x, y, device.display_name()));
+    print_info(format!("Connecting to {}:{}...", device.host, device.port));
 
-    // Connect as defaultuser
-    print_info!("Connecting to {}:{}...", device.host, device.port);
-    let mut session = SshClient::connect(&device.host, device.port, &device.auth_path())?;
+    let mut session = DeviceSession::connect(&device)
+        .context("Failed to connect to device")?;
 
     // Ensure tap script is present on device
-    ScriptManager::ensure_tap_script(&mut session)?;
+    ScriptManager::ensure_tap_script_with_session(&mut session)?;
 
     // Execute tap command using devel-su for root access
     let script_path = ScriptManager::tap_script_path();
     let tap_command = format!("python3 {} {} {}", script_path, x, y);
 
-    print_info!("Executing tap with devel-su...");
-    match SshClient::exec_as_devel_su(&mut session, &tap_command, &device.root_password) {
-        Ok(output) => {
-            // Display output
-            for line in &output {
-                if !line.is_empty() {
-                    println!("{}", line);
-                }
-            }
-            print_info!("Tap completed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            // Check if error is related to missing root password
-            if e.to_string().contains("Root password not configured") {
-                Err(anyhow!(
-                    "Tap requires root access. {}. \
-                    Set root password using: audb device add",
-                    e
-                ))
-            } else {
-                Err(e)
-            }
+    print_info("Executing tap with devel-su...");
+
+    let output = session.exec_as_root(&tap_command)
+        .context("Tap requires root access. Set root password using: audb device add")?;
+
+    // Display output
+    for line in &output {
+        if !line.is_empty() {
+            println!("{}", line);
         }
     }
+
+    print_info("Tap completed successfully");
+    Ok(())
 }
