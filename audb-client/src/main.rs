@@ -117,6 +117,9 @@ enum Commands {
         /// Direct evdev device for fast mode (e.g., /dev/input/event4 or "auto")
         #[arg(long)]
         event: Option<String>,
+        /// Duration in milliseconds for long press (default: 30ms, use 500-1000 for long press)
+        #[arg(long)]
+        duration: Option<u32>,
     },
 
     /// Swipe on device screen
@@ -127,6 +130,12 @@ enum Commands {
         /// Direct evdev device for fast mode (e.g., /dev/input/event4 or "auto")
         #[arg(long)]
         event: Option<String>,
+    },
+
+    /// Send key event (power, home, back, volume, etc.)
+    Key {
+        /// Key name: power, home, back, volumeup/vol+, volumedown/vol-, menu, close, lock, unlock
+        key_name: String,
     },
 
     /// Take screenshot of device
@@ -187,6 +196,12 @@ enum Commands {
     Reconnect {
         /// Device to reconnect (reconnects all if not specified)
         device: Option<String>,
+    },
+
+    /// Open URL on device (browser, file, etc.)
+    Open {
+        /// URL to open (https://, file://, tel:, mailto:, etc.)
+        url: String,
     },
 }
 
@@ -266,11 +281,14 @@ async fn main() {
         Commands::Info { category } => {
             execute_info_command(device_override, category).await
         }
-        Commands::Tap { x, y, event } => {
-            execute_tap_command(device_override, x, y, event).await
+        Commands::Tap { x, y, event, duration } => {
+            execute_tap_command(device_override, x, y, event, duration).await
         }
         Commands::Swipe { args, event } => {
             execute_swipe_command(device_override, args, event).await
+        }
+        Commands::Key { key_name } => {
+            execute_key_command(device_override, key_name).await
         }
         Commands::Screenshot { output } => {
             execute_screenshot_command(device_override, output).await
@@ -295,6 +313,9 @@ async fn main() {
         }
         Commands::Reconnect { device } => {
             execute_command(Command::Reconnect { device }).await
+        }
+        Commands::Open { url } => {
+            execute_open_command(device_override, url).await
         }
     };
 
@@ -737,7 +758,7 @@ fn print_device_info(info: &audb_protocol::DeviceInfo, category: Option<&str>) {
 }
 
 /// Execute Tap command
-async fn execute_tap_command(device_override: Option<String>, x: u16, y: u16, event: Option<String>) -> Result<()> {
+async fn execute_tap_command(device_override: Option<String>, x: u16, y: u16, event: Option<String>, duration: Option<u32>) -> Result<()> {
     let device = get_device(device_override)?;
 
     execute_command(Command::Tap {
@@ -745,6 +766,7 @@ async fn execute_tap_command(device_override: Option<String>, x: u16, y: u16, ev
         x,
         y,
         event_device: event,
+        duration_ms: duration,
     }).await
 }
 
@@ -778,6 +800,16 @@ async fn execute_swipe_command(device_override: Option<String>, args: Vec<String
         device,
         mode,
         event_device: event,
+    }).await
+}
+
+/// Execute Key command
+async fn execute_key_command(device_override: Option<String>, key_name: String) -> Result<()> {
+    let device = get_device(device_override)?;
+
+    execute_command(Command::Key {
+        device,
+        key_name,
     }).await
 }
 
@@ -919,4 +951,15 @@ async fn kill_server() -> Result<()> {
             }
         }
     }
+}
+
+
+/// Execute Open command
+async fn execute_open_command(device_override: Option<String>, url: String) -> Result<()> {
+    let device = get_device(device_override)?;
+
+    execute_command(Command::Open {
+        device,
+        url,
+    }).await
 }

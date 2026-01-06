@@ -10,6 +10,7 @@ Usage:
   python3 tap.py X Y                    # uinput mode (safe)
   python3 tap.py X Y --event /dev/input/event4   # direct evdev (fast)
   python3 tap.py X Y --event auto       # auto-detect touchscreen
+  python3 tap.py X Y --duration 1000    # long press (1000ms)
 
 Run as root: devel-su -c "python3 tap.py 200 400"
 
@@ -17,7 +18,7 @@ Env overrides:
   XMAX=720 YMAX=1440 SLOT_MAX=4
   TOUCH_MAJOR=19 WIDTH_MAJOR=19
   SETTLE=0.15   # seconds to wait after creating uinput device
-  DOWN_MS=30    # press duration (ms)
+  DOWN_MS=30    # press duration (ms), overridden by --duration
 """
 
 import os
@@ -232,6 +233,7 @@ def tap_evdev(x, y, device):
     print(f"tap({x},{y}) via {device}")
 
 def main():
+    global DOWN_MS
     # Parse args
     args = sys.argv[1:]
     event_device = None
@@ -245,8 +247,17 @@ def main():
             print("ERROR: --event requires device path or 'auto'", file=sys.stderr)
             return 2
 
+    if "--duration" in args:
+        idx = args.index("--duration")
+        if idx + 1 < len(args):
+            DOWN_MS = int(args[idx + 1])
+            args = args[:idx] + args[idx+2:]
+        else:
+            print("ERROR: --duration requires milliseconds value", file=sys.stderr)
+            return 2
+
     if len(args) != 2:
-        print("Usage: python3 tap.py X Y [--event /dev/input/eventN|auto]", file=sys.stderr)
+        print("Usage: python3 tap.py X Y [--event DEV] [--duration MS]", file=sys.stderr)
         return 2
 
     x = int(args[0])
