@@ -1,0 +1,15 @@
+[package]
+name = "audb-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["io-util", "net"] }
+
+[lib]
+name = "audb_protocol"
+path = "src/lib.rs"

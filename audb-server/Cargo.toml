@@ -1,0 +1,38 @@
+[package]
+name = "audb-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "audb-server"
+path = "src/main.rs"
+
+[dependencies]
+audb-core = { path = "../audb-core" }
+audb-protocol = { path = "../audb-protocol" }
+
+tokio = { version = "1.48", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive"] }
+russh = "0.54.5"
+
+# Daemonization and process management
+daemonize = "0.5"
+nix = { version = "0.27", features = ["signal", "process", "user"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# File system operations
+directories = "5.0"
+
+# Async utilities
+futures = "0.3"
+
+# Utilities
+chrono = "0.4"
+base64 = "0.22"

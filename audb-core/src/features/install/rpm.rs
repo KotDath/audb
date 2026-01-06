@@ -1,5 +1,5 @@
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
-use crate::print_info;
+use crate::tools::macros::print_info;
 use crate::tools::ssh::SshClient;
 use crate::tools::types::DeviceIdentifier;
 use crate::tools::validation::validate_rpm_exists;
@@ -23,19 +23,19 @@ pub async fn execute(rpm_path: &str) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    print_info!("Installing {} on device {}", file_name, device.display_name());
+    print_info(format!("Installing {} on device {}", file_name, device.display_name()));
 
     // Connect to device
-    print_info!("Connecting to {}:{}...", device.host, device.port);
+    print_info(format!("Connecting to {}:{}...", device.host, device.port));
     let mut session = SshClient::connect(&device.host, device.port, &device.auth_path())?;
 
     // Upload RPM to Downloads directory (APM requires access to user's Downloads)
     let remote_path = PathBuf::from(format!("/home/defaultuser/Downloads/{}", file_name));
-    print_info!("Uploading {} to {}...", file_name, remote_path.display());
+    print_info(format!("Uploading {} to {}...", file_name, remote_path.display()));
     SshClient::upload(&mut session, &local_path, &remote_path)?;
 
     // Install via gdbus (runs as defaultuser, APM handles permissions via D-Bus)
-    print_info!("Installing package via APM...");
+    print_info("Installing package via APM...");
     let install_command = format!(
         "gdbus call --system --dest ru.omp.APM --object-path /ru/omp/APM --method ru.omp.APM.Install \"{}\" \"{{}}\"",
         remote_path.display()
@@ -51,7 +51,7 @@ pub async fn execute(rpm_path: &str) -> Result<()> {
     }
 
     // Cleanup
-    print_info!("Cleaning up temporary files...");
+    print_info("Cleaning up temporary files...");
     let cleanup_command = format!("rm -f {}", remote_path.display());
     SshClient::exec(&mut session, &cleanup_command).ok();
 

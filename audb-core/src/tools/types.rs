@@ -82,3 +82,38 @@ impl Device {
         PathBuf::from(shellexpand::tilde(&self.auth).to_string())
     }
 }
+
+/// Log level for journalctl filtering (Android/iOS style + journalctl native)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    V,
+    D,
+    I,
+    W,
+    E,
+    F,
+    Debug,
+    Info,
+    Notice,
+    Warning,
+    Err,
+    Crit,
+    Alert,
+    Emerg,
+}
+
+impl LogLevel {
+    pub fn to_journalctl_priority(&self) -> &str {
+        match self {
+            Self::V | Self::D | Self::Debug => "debug",
+            Self::I | Self::Info => "info",
+            Self::Notice => "notice",
+            Self::W | Self::Warning => "warning",
+            Self::E | Self::Err => "err",
+            Self::F | Self::Crit => "crit",
+            Self::Alert => "alert",
+            Self::Emerg => "emerg",
+        }
+    }
+}

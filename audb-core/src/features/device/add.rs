@@ -1,5 +1,5 @@
 use crate::features::config::device_store::DeviceStore;
-use crate::print_info;
+use crate::tools::macros::print_info;
 use crate::tools::ssh::SshClient;
 use crate::tools::types::{Device, Platform};
 use crate::tools::validation::{validate_ip_address, validate_port, validate_ssh_key_exists};
@@ -94,7 +94,7 @@ pub async fn execute() -> Result<()> {
     };
 
     // Test defaultuser SSH connection
-    print_info!("Testing SSH connection as defaultuser...");
+    print_info("Testing SSH connection as defaultuser...");
     let key_path = device.auth_path();
     let connection_ok = SshClient::test_connection(&host, port, &key_path);
 

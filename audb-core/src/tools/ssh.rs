@@ -108,6 +108,15 @@ impl SshClient {
         })
     }
 
+    pub fn download(
+        session: &mut Handle<SshClient>,
+        remote_path: &Path,
+        local_path: &Path,
+    ) -> Result<()> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(Self::_download(session, remote_path, local_path))
+        })
+    }
 
     pub fn test_connection(
         host: &str,
@@ -247,6 +256,34 @@ impl SshClient {
         Ok(())
     }
 
+
+    async fn _download(
+        session: &mut Handle<SshClient>,
+        remote_path: &Path,
+        local_path: &Path,
+    ) -> Result<()> {
+        let sftp_session = Self::_sftp_session(session).await?;
+
+        let mut sftp_file = sftp_session
+            .open_with_flags(
+                remote_path.to_string_lossy().to_string(),
+                OpenFlags::READ,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to open remote file {}: {}", remote_path.display(), e))?;
+
+        // Read file contents
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        sftp_file.read_to_end(&mut data).await
+            .map_err(|e| anyhow!("Failed to read remote file: {}", e))?;
+
+        // Write to local file
+        fs::write(local_path, &data)
+            .map_err(|e| anyhow!("Failed to write local file {}: {}", local_path.display(), e))?;
+
+        Ok(())
+    }
 
     async fn _sftp_session(session: &mut Handle<SshClient>) -> Result<SftpSession> {
         let channel = session.channel_open_session().await?;
