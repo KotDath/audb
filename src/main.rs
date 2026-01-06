@@ -41,6 +41,17 @@ enum Commands {
         #[command(subcommand)]
         action: SwipeAction,
     },
+    /// Take screenshot of selected device (outputs base64-encoded PNG to stdout)
+    Screenshot,
+    /// Execute shell command on remote device (adb shell style)
+    Shell {
+        /// Run as root (devel-su)
+        #[arg(short, long)]
+        root: bool,
+        /// Command to execute (required)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -134,6 +145,13 @@ async fn main() {
                     ).await
                 }
             }
+        }
+        Commands::Screenshot => {
+            features::input::screenshot::execute().await
+        }
+        Commands::Shell { root, command } => {
+            let cmd = command.join(" ");
+            features::shell::execute(root, cmd).await
         }
     };
 

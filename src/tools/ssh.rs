@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use anyhow::{anyhow, Result};
 
 const DEFAULT_USER: &str = "defaultuser";
@@ -46,36 +46,46 @@ impl SshClient {
         })
     }
 
-    pub fn exec_as_root(
-        session: &mut Handle<SshClient>,
-        command: &str,
-        password: &str,
-    ) -> Result<Vec<String>> {
-        let escaped_command = command.replace('\'', "'\\''");
-        let su_command = format!("echo '{}' | su -c '{}'", password, escaped_command);
-        Self::exec(session, &su_command)
-    }
-
     /// Execute command as root using devel-su (Aurora OS)
-    /// More secure - password via stdin, not process args
+    ///
+    /// Uses the `echo 'password' | devel-su sh -c 'command'` pattern to automate
+    /// devel-su password input through SSH exec channels.
     pub fn exec_as_devel_su(
         session: &mut Handle<SshClient>,
         command: &str,
         password: &str,
     ) -> Result<Vec<String>> {
-        // Escape single quotes in command and password
-        let escaped_command = command.replace('\'', "'\\''");
-        let escaped_password = password.replace('\'', "'\\''");
+        if password.is_empty() {
+            return Err(anyhow!(
+                "Root password not configured. Use 'audb device add' to set the root password."
+            ));
+        }
 
-        // Use printf to avoid echo interpretation issues
-        // printf '%s\n' 'PASSWORD' | devel-su -c 'COMMAND'
+        // Use echo pipe pattern: echo 'password' | devel-su sh -c 'command'
         let devel_su_command = format!(
-            "printf '%s\\n' '{}' | devel-su -c '{}'",
-            escaped_password,
-            escaped_command
+            "echo '{}' | devel-su sh -c '{}'",
+            password, command
         );
 
         Self::exec(session, &devel_su_command)
+    }
+
+    /// Read file contents as base64 string via SSH exec
+    /// Useful for reading files owned by root when used with exec_as_devel_su
+    pub fn read_file_base64(
+        session: &mut Handle<SshClient>,
+        remote_path: &Path,
+        password: &str,
+    ) -> Result<String> {
+        let command = format!("base64 {}", remote_path.display());
+        let output = Self::exec_as_devel_su(session, &command, password)?;
+
+        if output.is_empty() {
+            return Err(anyhow!("File is empty or could not be read"));
+        }
+
+        // Join lines and remove whitespace
+        Ok(output.join("").replace('\n', "").replace('\r', ""))
     }
 
     pub fn upload(
@@ -85,6 +95,16 @@ impl SshClient {
     ) -> Result<()> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::_upload(session, local_path, remote_path))
+        })
+    }
+
+    pub fn download(
+        session: &mut Handle<SshClient>,
+        remote_path: &Path,
+        local_path: &Path,
+    ) -> Result<()> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(Self::_download(session, remote_path, local_path))
         })
     }
 
@@ -102,6 +122,15 @@ impl SshClient {
     }
 
     async fn _connect(
+        host: &str,
+        port: u16,
+        key_path: &Path,
+    ) -> Result<Handle<SshClient>> {
+        Self::_connect_with_user(DEFAULT_USER, host, port, key_path).await
+    }
+
+    async fn _connect_with_user(
+        user: &str,
         host: &str,
         port: u16,
         key_path: &Path,
@@ -128,9 +157,9 @@ impl SshClient {
         };
         let secret_key = Arc::new(russh::keys::load_secret_key(key_path, None)?);
         let key_pair = PrivateKeyWithHashAlg::new(secret_key, session.best_supported_rsa_hash().await?.flatten());
-        let result = session.authenticate_publickey(DEFAULT_USER, key_pair).await?;
+        let result = session.authenticate_publickey(user, key_pair).await?;
         if !result.success() {
-            return Err(anyhow!("Failed to authenticate via SSH"));
+            return Err(anyhow!("Failed to authenticate via SSH as {}", user));
         }
         Ok(session)
     }
@@ -213,6 +242,39 @@ impl SshClient {
 
         let data = fs::read(local_path)?;
         sftp_file.write_all(&data).await?;
+
+        Ok(())
+    }
+
+    async fn _download(
+        session: &mut Handle<SshClient>,
+        remote_path: &Path,
+        local_path: &Path,
+    ) -> Result<()> {
+        let sftp_session = Self::_sftp_session(session).await?;
+
+        let mut sftp_file = sftp_session
+            .open_with_flags(
+                remote_path.to_string_lossy().to_string(),
+                OpenFlags::READ,
+            )
+            .await?;
+
+        // Read remote file
+        let mut data = Vec::new();
+        sftp_file.read_to_end(&mut data).await?;
+
+        if data.is_empty() {
+            return Err(anyhow!("Downloaded file is empty"));
+        }
+
+        // Create parent directory if needed
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Write to local file
+        fs::write(local_path, data)?;
 
         Ok(())
     }

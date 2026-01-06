@@ -62,9 +62,10 @@ pub async fn execute() -> Result<()> {
         })
         .interact_text()?;
 
-    // Root password
+    // Root password for devel-su automation (tap, swipe, screenshot commands)
     let root_password: String = Password::new()
-        .with_prompt("Root password")
+        .with_prompt("Root password (for devel-su automation - tap/swipe/screenshot)")
+        .allow_empty_password(true)
         .interact()?;
 
     // Platform selection
@@ -87,14 +88,13 @@ pub async fn execute() -> Result<()> {
         host: host.clone(),
         port,
         auth: auth.clone(),
-        root_password,
+        root_password: root_password.clone(),
         platform,
         enabled: true,
     };
 
-    // Test connection
-    print_info!("Testing SSH connection to {}:{}...", host, port);
-
+    // Test defaultuser SSH connection
+    print_info!("Testing SSH connection as defaultuser...");
     let key_path = device.auth_path();
     let connection_ok = SshClient::test_connection(&host, port, &key_path);
 
@@ -110,12 +110,15 @@ pub async fn execute() -> Result<()> {
             return Err(anyhow!("Device not added"));
         }
     } else {
-        println!("\x1b[1m\x1b[32msuccess\x1b[0m: SSH connection successful");
+        println!("\x1b[1m\x1b[32msuccess\x1b[0m: defaultuser SSH connection verified");
     }
 
     // Save device
     DeviceStore::add(device)?;
 
     println!("\n\x1b[1m\x1b[32msuccess\x1b[0m: Device added successfully");
+    if root_password.is_empty() {
+        println!("\x1b[1m\x1b[90mnote\x1b[0m: Tap/swipe/screenshot commands require root password to be configured");
+    }
     Ok(())
 }

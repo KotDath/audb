@@ -1,3 +1,8 @@
+// Tap command implementation for Aurora OS devices
+//
+// This feature requires root access to work properly. The Python script uses
+// /dev/uinput which needs root permissions via devel-su.
+
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::features::input::scripts::ScriptManager;
 use crate::print_info;
@@ -18,27 +23,40 @@ pub async fn execute(x: u16, y: u16) -> Result<()> {
 
     print_info!("Tapping at ({}, {}) on device {}", x, y, device.display_name());
 
-    // Connect
+    // Connect as defaultuser
     print_info!("Connecting to {}:{}...", device.host, device.port);
     let mut session = SshClient::connect(&device.host, device.port, &device.auth_path())?;
 
-    // Ensure script present
+    // Ensure tap script is present on device
     ScriptManager::ensure_tap_script(&mut session)?;
 
-    // Execute tap
+    // Execute tap command using devel-su for root access
     let script_path = ScriptManager::tap_script_path();
     let tap_command = format!("python3 {} {} {}", script_path, x, y);
 
-    print_info!("Executing tap...");
-    let output = SshClient::exec_as_devel_su(&mut session, &tap_command, &device.root_password)?;
-
-    // Display output
-    for line in &output {
-        if !line.is_empty() {
-            println!("{}", line);
+    print_info!("Executing tap with devel-su...");
+    match SshClient::exec_as_devel_su(&mut session, &tap_command, &device.root_password) {
+        Ok(output) => {
+            // Display output
+            for line in &output {
+                if !line.is_empty() {
+                    println!("{}", line);
+                }
+            }
+            print_info!("Tap completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            // Check if error is related to missing root password
+            if e.to_string().contains("Root password not configured") {
+                Err(anyhow!(
+                    "Tap requires root access. {}. \
+                    Set root password using: audb device add",
+                    e
+                ))
+            } else {
+                Err(e)
+            }
         }
     }
-
-    print_info!("Tap completed successfully");
-    Ok(())
 }

@@ -1,3 +1,8 @@
+// Swipe command implementation for Aurora OS devices
+//
+// This feature requires root access to work properly. The Python script uses
+// /dev/uinput which needs root permissions via devel-su.
+
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::features::input::scripts::ScriptManager;
 use crate::print_info;
@@ -54,11 +59,11 @@ pub async fn execute(mode: SwipeMode) -> Result<()> {
         }
     }
 
-    // Connect
+    // Connect as defaultuser
     print_info!("Connecting to {}:{}...", device.host, device.port);
     let mut session = SshClient::connect(&device.host, device.port, &device.auth_path())?;
 
-    // Ensure script present
+    // Ensure swipe script is present on device
     ScriptManager::ensure_swipe_script(&mut session)?;
 
     // Build command
@@ -72,16 +77,30 @@ pub async fn execute(mode: SwipeMode) -> Result<()> {
         }
     };
 
-    print_info!("Executing swipe...");
-    let output = SshClient::exec_as_devel_su(&mut session, &swipe_command, &device.root_password)?;
-
-    // Display output
-    for line in &output {
-        if !line.is_empty() {
-            println!("{}", line);
+    // Execute swipe command using devel-su for root access
+    print_info!("Executing swipe with devel-su...");
+    match SshClient::exec_as_devel_su(&mut session, &swipe_command, &device.root_password) {
+        Ok(output) => {
+            // Display output
+            for line in &output {
+                if !line.is_empty() {
+                    println!("{}", line);
+                }
+            }
+            print_info!("Swipe completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            // Check if error is related to missing root password
+            if e.to_string().contains("Root password not configured") {
+                Err(anyhow!(
+                    "Swipe requires root access. {}. \
+                    Set root password using: audb device add",
+                    e
+                ))
+            } else {
+                Err(e)
+            }
         }
     }
-
-    print_info!("Swipe completed successfully");
-    Ok(())
 }

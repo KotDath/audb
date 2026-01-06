@@ -10,6 +10,9 @@ pub struct Device {
     #[serde(default = "default_port")]
     pub port: u16,
     pub auth: String,
+    /// Root password for devel-su (stored for potential future use)
+    /// NOTE: Root automation is not yet implemented - see ssh.rs::exec_as_devel_su
+    #[serde(default = "default_root_password")]
     pub root_password: String,
     pub platform: Platform,
     #[serde(default = "default_enabled")]
@@ -22,6 +25,10 @@ fn default_port() -> u16 {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_root_password() -> String {
+    String::new()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
