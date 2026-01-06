@@ -1,6 +1,6 @@
-# audb - Aurora OS Device Manager
+# audb - Aurora Debug Bridge
 
-Device management CLI tool for Aurora OS (similar to Android's adb).
+Development and debugging CLI tool for Aurora OS (similar to Android's adb).
 
 ## Features
 

@@ -5,7 +5,7 @@ mod tools;
 
 #[derive(Parser)]
 #[command(name = "audb")]
-#[command(about = "Aurora OS Device Manager - Device management CLI tool for Aurora OS", long_about = None)]
+#[command(about = "Aurora Debug Bridge - Development and debugging CLI tool for Aurora OS", long_about = None)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -43,6 +43,16 @@ enum Commands {
     },
     /// Take screenshot of selected device (outputs base64-encoded PNG to stdout)
     Screenshot,
+    /// Launch an application on selected device
+    Launch {
+        /// Application name (e.g., ru.auroraos.MLPackLearning)
+        app_name: String,
+    },
+    /// Stop a running application on selected device
+    Stop {
+        /// Application name (e.g., ru.auroraos.MLPackLearning)
+        app_name: String,
+    },
     /// Execute shell command on remote device (adb shell style)
     Shell {
         /// Run as root (devel-su)
@@ -51,6 +61,33 @@ enum Commands {
         /// Command to execute (required)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Retrieve device logs via journalctl
+    Logs {
+        /// Number of log lines (default: 100)
+        #[arg(short = 'n', long, default_value = "100")]
+        lines: usize,
+        /// Log level: V/D/I/W/E/F (Android) or debug/info/warning/err (journalctl)
+        #[arg(short = 'p', long, value_name = "LEVEL")]
+        priority: Option<LogLevel>,
+        /// Filter by systemd unit/service (e.g., sailfish-browser.service)
+        #[arg(short = 'u', long, value_name = "UNIT")]
+        unit: Option<String>,
+        /// Search pattern (grep filter)
+        #[arg(short = 'g', long)]
+        grep: Option<String>,
+        /// Show logs since time (e.g., "1 hour ago", "2024-01-06 10:00:00")
+        #[arg(short = 's', long)]
+        since: Option<String>,
+        /// Clear all logs (requires --force to prevent accidents)
+        #[arg(long)]
+        clear: bool,
+        /// Force clear logs without confirmation
+        #[arg(long)]
+        force: bool,
+        /// Show kernel/dmesg messages only
+        #[arg(short = 'k', long)]
+        kernel: bool,
     },
 }
 
@@ -107,6 +144,40 @@ impl From<SwipeDirectionArg> for features::input::swipe::SwipeDirection {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+#[clap(rename_all = "lowercase")]
+enum LogLevel {
+    V,
+    D,
+    I,
+    W,
+    E,
+    F,
+    Debug,
+    Info,
+    Notice,
+    Warning,
+    Err,
+    Crit,
+    Alert,
+    Emerg,
+}
+
+impl LogLevel {
+    fn to_journalctl_priority(&self) -> &str {
+        match self {
+            Self::V | Self::D | Self::Debug => "debug",
+            Self::I | Self::Info => "info",
+            Self::Notice => "notice",
+            Self::W | Self::Warning => "warning",
+            Self::E | Self::Err => "err",
+            Self::F | Self::Crit => "crit",
+            Self::Alert => "alert",
+            Self::Emerg => "emerg",
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -149,9 +220,27 @@ async fn main() {
         Commands::Screenshot => {
             features::input::screenshot::execute().await
         }
+        Commands::Launch { app_name } => {
+            features::app::launch::execute(&app_name).await
+        }
+        Commands::Stop { app_name } => {
+            features::app::stop::execute(&app_name).await
+        }
         Commands::Shell { root, command } => {
             let cmd = command.join(" ");
             features::shell::execute(root, cmd).await
+        }
+        Commands::Logs { lines, priority, unit, grep, since, clear, force, kernel } => {
+            features::logs::execute(features::logs::LogsArgs {
+                lines,
+                priority,
+                unit,
+                grep,
+                since,
+                clear,
+                force,
+                kernel,
+            }).await
         }
     };
 
