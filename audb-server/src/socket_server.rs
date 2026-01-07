@@ -7,9 +7,9 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn, error};
 
-// Script content embedded at compile time
-const TAP_SCRIPT: &str = include_str!("../../scripts/tap.py");
-const SWIPE_SCRIPT: &str = include_str!("../../scripts/swipe.py");
+// Get scripts from audb-core (single source of truth)
+const TAP_SCRIPT: &str = audb_core::features::input::scripts::ScriptManager::tap_script_content();
+const SWIPE_SCRIPT: &str = audb_core::features::input::scripts::ScriptManager::swipe_script_content();
 const REMOTE_TAP_PATH: &str = "/tmp/audb_tap.py";
 const REMOTE_SWIPE_PATH: &str = "/tmp/audb_swipe.py";
 

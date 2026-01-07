@@ -4,8 +4,8 @@ use russh::client::Handle;
 use std::path::Path;
 
 // Embed scripts at compile time
-const TAP_SCRIPT: &str = include_str!("../../../scripts/tap.py");
-const SWIPE_SCRIPT: &str = include_str!("../../../scripts/swipe.py");
+const TAP_SCRIPT: &str = include_str!("../../scripts/tap.py");
+const SWIPE_SCRIPT: &str = include_str!("../../scripts/swipe.py");
 
 const REMOTE_TAP_PATH: &str = "/tmp/audb_tap.py";
 const REMOTE_SWIPE_PATH: &str = "/tmp/audb_swipe.py";
@@ -116,5 +116,15 @@ impl ScriptManager {
 
     pub fn swipe_script_path() -> &'static str {
         REMOTE_SWIPE_PATH
+    }
+
+    /// Get tap script content
+    pub const fn tap_script_content() -> &'static str {
+        TAP_SCRIPT
+    }
+
+    /// Get swipe script content
+    pub const fn swipe_script_content() -> &'static str {
+        SWIPE_SCRIPT
     }
 }

@@ -14,7 +14,7 @@ name = "audb-server"
 path = "src/main.rs"
 
 [dependencies]
-audb-core = { version = "0.1.0", path = "../audb-core" }
+audb-core = { version = "0.1.1", path = "../audb-core" }
 audb-protocol = { version = "0.1.0", path = "../audb-protocol" }
 
 tokio = { version = "1.48", features = ["full"] }
