@@ -370,12 +370,6 @@ audb server-status
 devel-su pkcon install python3
 ```
 
-### "Aurora SDK Docker image not found"
-Download from Aurora OS Developer Portal and load:
-```bash
-docker load -i aurora-build-tools-5.2.0.tar.gz
-```
-
 ### Server issues
 ```bash
 audb kill-server
