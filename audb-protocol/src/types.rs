@@ -38,6 +38,8 @@ pub enum Command {
         y: u16,
         /// Optional: direct evdev device path for fast mode (e.g., "/dev/input/event4" or "auto")
         event_device: Option<String>,
+        /// Optional: duration in milliseconds for long press (default: 30ms)
+        duration_ms: Option<u32>,
     },
     /// Swipe gesture on device
     Swipe {
@@ -45,6 +47,12 @@ pub enum Command {
         mode: SwipeMode,
         /// Optional: direct evdev device path for fast mode
         event_device: Option<String>,
+    },
+    /// Send key event (back, home, power, volume, etc.)
+    Key {
+        device: String,
+        /// Key name (back, home, power, volumeup, volumedown, etc.)
+        key_name: String,
     },
     /// Take screenshot of device
     Screenshot { device: String },
@@ -85,8 +93,14 @@ pub enum Command {
     ServerStatus,
     /// Shutdown server
     KillServer,
-    /// Force reconnection to device
+    /// Force reconnection to device(s)
     Reconnect { device: Option<String> },
+    /// Open URL on device (browser, file, etc.)
+    Open {
+        device: String,
+        /// URL to open (https://, file://, tel:, etc.)
+        url: String,
+    },
 }
 
 /// Swipe mode (coordinates or direction)

@@ -1,6 +1,7 @@
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::tools::ssh::SshClient;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -8,11 +9,56 @@ pub async fn execute(active_only: bool) -> Result<()> {
     if active_only {
         list_active_devices().await
     } else {
-        list_all_devices()
+        list_all_devices().await
     }
 }
 
-fn list_all_devices() -> Result<()> {
+/// Try to get live status from server
+async fn get_server_status() -> Option<HashMap<String, String>> {
+    use std::path::PathBuf;
+    use tokio::net::UnixStream;
+    
+    let uid = unsafe { libc::getuid() };
+    let socket_path = PathBuf::from(format!("/tmp/audb-server-{}.sock", uid));
+    
+    if !socket_path.exists() {
+        return None;
+    }
+    
+    let mut stream = UnixStream::connect(&socket_path).await.ok()?;
+    
+    // Send ServerStatus command
+    let request = audb_protocol::Request {
+        id: 1,
+        command: audb_protocol::Command::ServerStatus,
+    };
+    
+    audb_protocol::send_message(&mut stream, &request).await.ok()?;
+    let response: audb_protocol::Response = audb_protocol::recv_message(&mut stream).await.ok()?;
+    
+    if let audb_protocol::CommandResult::Success { output: audb_protocol::CommandOutput::Status(status) } = response.result {
+        let mut map = HashMap::new();
+        for device in status.devices {
+            let state_str = match device.state {
+                audb_protocol::ConnectionStateInfo::Disconnected => "disconnected".to_string(),
+                audb_protocol::ConnectionStateInfo::Connecting { attempt } => format!("connecting({})", attempt),
+                audb_protocol::ConnectionStateInfo::Connected { duration_secs } => format!("connected({}s)", duration_secs),
+                audb_protocol::ConnectionStateInfo::Errored { ref error, .. } => {
+                    // Shorten error message
+                    let short_err = if error.len() > 20 { &error[..20] } else { error };
+                    format!("error:{}", short_err)
+                },
+                audb_protocol::ConnectionStateInfo::Disabled => "disabled".to_string(),
+            };
+            map.insert(device.host, state_str);
+        }
+        Some(map)
+    } else {
+        None
+    }
+}
+
+async fn list_all_devices() -> Result<()> {
     let devices = DeviceStore::list()?;
 
     if devices.is_empty() {
@@ -21,6 +67,9 @@ fn list_all_devices() -> Result<()> {
     }
 
     let current_host = DeviceState::get_current().ok();
+    
+    // Try to get live status from server
+    let live_status = get_server_status().await;
 
     // Header
     println!("\x1b[1m{:<5} {:<20} {:<18} {:<6} {:<15} {:<10}\x1b[0m",
@@ -29,10 +78,26 @@ fn list_all_devices() -> Result<()> {
 
     for (idx, device) in devices.iter().enumerate() {
         let name = device.name.as_deref().unwrap_or("-");
-        let status = if device.enabled {
-            "\x1b[32menabled\x1b[0m"
+        
+        // Use live status if available, otherwise show config status
+        let status = if let Some(ref live) = live_status {
+            if let Some(state) = live.get(&device.host) {
+                if state.starts_with("connected") {
+                    format!("\x1b[32m{}\x1b[0m", state)
+                } else if state.starts_with("error") || state == "disconnected" {
+                    format!("\x1b[31m{}\x1b[0m", state)
+                } else {
+                    format!("\x1b[33m{}\x1b[0m", state)
+                }
+            } else if device.enabled {
+                "\x1b[90mnot in server\x1b[0m".to_string()
+            } else {
+                "\x1b[90mdisabled\x1b[0m".to_string()
+            }
+        } else if device.enabled {
+            "\x1b[32menabled\x1b[0m".to_string()
         } else {
-            "\x1b[90mdisabled\x1b[0m"
+            "\x1b[90mdisabled\x1b[0m".to_string()
         };
 
         let is_current = current_host.as_ref() == Some(&device.host);
@@ -51,6 +116,10 @@ fn list_all_devices() -> Result<()> {
 
     if let Some(host) = current_host {
         println!("\n\x1b[36m*\x1b[0m Currently selected device: {}", host);
+    }
+    
+    if live_status.is_some() {
+        println!("\x1b[90m(live status from server)\x1b[0m");
     }
 
     Ok(())

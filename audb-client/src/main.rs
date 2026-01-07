@@ -33,6 +33,12 @@ enum Commands {
         action: DeviceCommands,
     },
 
+    /// Package management (install, uninstall, sign, validate)
+    Package {
+        #[command(subcommand)]
+        action: PackageCommands,
+    },
+
     /// Select active device
     Select {
         /// Device identifier (name, IP address, or index)
@@ -63,25 +69,6 @@ enum Commands {
         /// Command to execute (required)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
-    },
-
-    /// Install RPM package on device
-    Install {
-        /// Path to RPM file
-        rpm_path: String,
-    },
-
-    /// Uninstall package from device
-    Uninstall {
-        /// Package name (e.g., ru.domain.AppName)
-        package_name: String,
-    },
-
-    /// List installed packages on device
-    Packages {
-        /// Filter packages by name pattern
-        #[arg(short, long)]
-        filter: Option<String>,
     },
 
     /// Push file to device
@@ -222,6 +209,36 @@ enum DeviceCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum PackageCommands {
+    /// Install RPM package on device
+    Install {
+        /// Path to RPM file
+        rpm_path: String,
+    },
+    /// Uninstall package from device
+    Uninstall {
+        /// Package name (e.g., ru.domain.AppName)
+        package_name: String,
+    },
+    /// List installed packages on device
+    List {
+        /// Filter packages by name pattern
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Sign RPM package with Aurora OS keys (local, uses Docker)
+    Sign {
+        /// Path to RPM file
+        rpm_path: String,
+    },
+    /// Validate RPM package for Aurora OS compliance (local, uses Docker)
+    Validate {
+        /// Path to RPM file
+        rpm_path: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -241,6 +258,26 @@ async fn main() {
                 audb_core::features::device::remove::execute(&identifier).await
             }
         },
+
+        // Package management commands
+        Commands::Package { action } => match action {
+            PackageCommands::Install { rpm_path } => {
+                execute_install_command(device_override, rpm_path).await
+            }
+            PackageCommands::Uninstall { package_name } => {
+                execute_uninstall_command(device_override, package_name).await
+            }
+            PackageCommands::List { filter } => {
+                execute_packages_command(device_override, filter).await
+            }
+            PackageCommands::Sign { rpm_path } => {
+                execute_sign_command(rpm_path).await
+            }
+            PackageCommands::Validate { rpm_path } => {
+                execute_validate_command(rpm_path).await
+            }
+        },
+
         Commands::Select { identifier } => {
             audb_core::features::device::select::execute(&identifier).await
         }
@@ -262,15 +299,6 @@ async fn main() {
         // Device commands (through server)
         Commands::Shell { root, command } => {
             execute_shell_command(device_override, root, command).await
-        }
-        Commands::Install { rpm_path } => {
-            execute_install_command(device_override, rpm_path).await
-        }
-        Commands::Uninstall { package_name } => {
-            execute_uninstall_command(device_override, package_name).await
-        }
-        Commands::Packages { filter } => {
-            execute_packages_command(device_override, filter).await
         }
         Commands::Push { local, remote } => {
             execute_push_command(device_override, local, remote).await
@@ -382,11 +410,28 @@ fn handle_response(response: Response) -> Result<()> {
                     println!("  Socket: {}", status.socket_path);
                     println!("\nDevices ({}):", status.devices.len());
                     for device in status.devices {
-                        println!("  {} ({}:{})",
+                        let state_str = match &device.state {
+                            audb_protocol::ConnectionStateInfo::Disconnected => "disconnected".to_string(),
+                            audb_protocol::ConnectionStateInfo::Connecting { attempt } => format!("connecting (attempt {})", attempt),
+                            audb_protocol::ConnectionStateInfo::Connected { duration_secs } => format!("connected ({}s)", duration_secs),
+                            audb_protocol::ConnectionStateInfo::Errored { error, .. } => format!("error: {}", error),
+                            audb_protocol::ConnectionStateInfo::Disabled => "disabled".to_string(),
+                        };
+                        println!("  {} ({}:{}) - {}",
                             device.name.unwrap_or_else(|| "unnamed".to_string()),
                             device.host,
-                            device.port
+                            device.port,
+                            state_str
                         );
+                        if device.stats.failed_commands > 0 || device.stats.last_error.is_some() {
+                            println!("    Commands: {} ok, {} failed",
+                                device.stats.successful_commands,
+                                device.stats.failed_commands
+                            );
+                            if let Some(ref err) = device.stats.last_error {
+                                println!("    Last error: {}", err);
+                            }
+                        }
                     }
                 }
                 CommandOutput::DeviceInfo(info) => {
@@ -400,7 +445,12 @@ fn handle_response(response: Response) -> Result<()> {
             Ok(())
         }
         CommandResult::Error { message, kind } => {
-            Err(anyhow!("{:?}: {}", kind, message))
+            // Improve error message for disconnected device
+            if message.contains("deadline has elapsed") || message.contains("Channel send error") {
+                Err(anyhow!("Device disconnected or unreachable. Check 'audb device list' for status."))
+            } else {
+                Err(anyhow!("{:?}: {}", kind, message))
+            }
         }
     }
 }
@@ -962,4 +1012,236 @@ async fn execute_open_command(device_override: Option<String>, url: String) -> R
         device,
         url,
     }).await
+}
+
+
+/// Execute Sign command (local, uses Docker)
+async fn execute_sign_command(rpm_path: String) -> Result<()> {
+    use std::process::Command as ProcessCommand;
+    use std::path::Path;
+
+    let rpm_path = Path::new(&rpm_path);
+    
+    // Validate RPM file exists
+    if !rpm_path.exists() {
+        return Err(anyhow!("RPM file not found: {}", rpm_path.display()));
+    }
+    
+    if !rpm_path.is_file() {
+        return Err(anyhow!("Not a file: {}", rpm_path.display()));
+    }
+
+    // Get absolute path
+    let rpm_path = rpm_path.canonicalize()
+        .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
+    
+    let rpm_name = rpm_path.file_name()
+        .ok_or_else(|| anyhow!("Invalid RPM path"))?
+        .to_string_lossy();
+    
+    let project_dir = rpm_path.parent()
+        .ok_or_else(|| anyhow!("Invalid RPM path"))?;
+
+    // Find keys directory
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+    let keys_dir = PathBuf::from(&home).join("AuroraOS").join("package-signing");
+    
+    if !keys_dir.exists() || !keys_dir.is_dir() {
+        return Err(anyhow!(
+            "Keys directory not found: {}\n\
+            Please ensure you have Aurora OS signing keys installed.\n\
+            Expected files:\n\
+            - {}/regular_key.pem\n\
+            - {}/regular_cert.pem",
+            keys_dir.display(),
+            keys_dir.display(),
+            keys_dir.display()
+        ));
+    }
+
+    let cert_path = keys_dir.join("regular_cert.pem");
+    let key_path = keys_dir.join("regular_key.pem");
+
+    if !cert_path.exists() {
+        return Err(anyhow!("Certificate not found: {}", cert_path.display()));
+    }
+    if !key_path.exists() {
+        return Err(anyhow!("Key not found: {}", key_path.display()));
+    }
+
+    // Copy keys to project directory temporarily
+    let temp_cert = project_dir.join("regular_cert.pem");
+    let temp_key = project_dir.join("regular_key.pem");
+    
+    std::fs::copy(&cert_path, &temp_cert)
+        .map_err(|e| anyhow!("Failed to copy certificate: {}", e))?;
+    std::fs::copy(&key_path, &temp_key)
+        .map_err(|e| anyhow!("Failed to copy key: {}", e))?;
+
+    // Find Aurora SDK Docker image
+    let docker_image = find_aurora_docker_image()?;
+    
+    println!("Signing {} with Aurora SDK...", rpm_name);
+
+    // Generate unique container name
+    let container_name = format!("audb-sign-{}", std::process::id());
+
+    // Run Docker container
+    let docker_run = ProcessCommand::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--name", &container_name,
+            "-v", &format!("{}:/project", project_dir.display()),
+            &docker_image,
+            "/bin/bash", "-c",
+            &format!(
+                "rpmsign-external sign --force --key=/project/regular_key.pem --cert=/project/regular_cert.pem /project/{}",
+                rpm_name
+            ),
+        ])
+        .output();
+
+    // Clean up temp keys regardless of result
+    let _ = std::fs::remove_file(&temp_cert);
+    let _ = std::fs::remove_file(&temp_key);
+
+    match docker_run {
+        Ok(output) => {
+            if output.status.success() {
+                println!("Successfully signed: {}", rpm_path.display());
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(anyhow!(
+                    "Failed to sign package:\n{}\n{}",
+                    stdout.trim(),
+                    stderr.trim()
+                ))
+            }
+        }
+        Err(e) => Err(anyhow!("Failed to run Docker: {}", e)),
+    }
+}
+
+/// Find Aurora SDK Docker image
+fn find_aurora_docker_image() -> Result<String> {
+    use std::process::Command as ProcessCommand;
+
+    // List Docker images and find Aurora SDK
+    let output = ProcessCommand::new("docker")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+        .output()
+        .map_err(|e| anyhow!("Failed to list Docker images: {}", e))?;
+
+    if !output.status.success() {
+        return Err(anyhow!("Docker command failed. Is Docker installed and running?"));
+    }
+
+    let images = String::from_utf8_lossy(&output.stdout);
+    
+    // Look for Aurora SDK image patterns (prioritize build-tools)
+    let mut candidates: Vec<&str> = Vec::new();
+    
+    for line in images.lines() {
+        let lower = line.to_lowercase();
+        if lower.contains("aurora") && (lower.contains("build") || lower.contains("sdk") || lower.contains("engine")) {
+            candidates.push(line);
+        }
+    }
+
+    // Prefer build-tools over build-engine
+    for candidate in &candidates {
+        if candidate.to_lowercase().contains("build-tools") {
+            return Ok(candidate.to_string());
+        }
+    }
+    
+    // Fall back to any Aurora image
+    if let Some(candidate) = candidates.first() {
+        return Ok(candidate.to_string());
+    }
+
+    Err(anyhow!(
+        "Aurora SDK Docker image not found.\n\
+        Please ensure you have the Aurora SDK Docker image installed.\n\
+        You can pull it from the Aurora OS developer portal."
+    ))
+}
+
+
+/// Execute Validate command (local, uses Docker)
+async fn execute_validate_command(rpm_path: String) -> Result<()> {
+    use std::process::Command as ProcessCommand;
+    use std::path::Path;
+
+    let rpm_path = Path::new(&rpm_path);
+    
+    // Validate RPM file exists
+    if !rpm_path.exists() {
+        return Err(anyhow!("RPM file not found: {}", rpm_path.display()));
+    }
+    
+    if !rpm_path.is_file() {
+        return Err(anyhow!("Not a file: {}", rpm_path.display()));
+    }
+
+    // Get absolute path
+    let rpm_path = rpm_path.canonicalize()
+        .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
+    
+    let rpm_name = rpm_path.file_name()
+        .ok_or_else(|| anyhow!("Invalid RPM path"))?
+        .to_string_lossy();
+    
+    let project_dir = rpm_path.parent()
+        .ok_or_else(|| anyhow!("Invalid RPM path"))?;
+
+    // Find Aurora SDK Docker image
+    let docker_image = find_aurora_docker_image()?;
+    
+    println!("Validating {} with Aurora SDK...", rpm_name);
+
+    // Generate unique container name
+    let container_name = format!("audb-validate-{}", std::process::id());
+
+    // Run Docker container
+    let docker_run = ProcessCommand::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--name", &container_name,
+            "-v", &format!("{}:/project", project_dir.display()),
+            &docker_image,
+            "/bin/bash", "-c",
+            &format!("rpm-validator -p regular /project/{}", rpm_name),
+        ])
+        .output();
+
+    match docker_run {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            
+            // Print output
+            if !stdout.is_empty() {
+                println!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprintln!("{}", stderr);
+            }
+
+            // Check for errors in output
+            if stdout.contains("(ERROR)") || stderr.contains("(ERROR)") {
+                Err(anyhow!("Validation failed: errors found"))
+            } else if output.status.success() {
+                println!("Validation passed: no errors found");
+                Ok(())
+            } else {
+                Err(anyhow!("Validation failed with exit code: {:?}", output.status.code()))
+            }
+        }
+        Err(e) => Err(anyhow!("Failed to run Docker: {}", e)),
+    }
 }

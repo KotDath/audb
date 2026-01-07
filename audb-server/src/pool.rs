@@ -359,7 +359,7 @@ async fn device_command_processor(
             Err(anyhow!("No active session"))
         };
 
-        // Handle result and potential reconnection
+        // Handle result - keep connection alive, only update stats
         match &result {
             Ok(_) => {
                 // Update stats
@@ -374,27 +374,12 @@ async fn device_command_processor(
             Err(e) => {
                 let error_str = e.to_string();
 
-                // Check if this is a connection error that requires reconnection
-                if is_connection_error(&error_str) {
-                    warn!(
-                        "Connection error for {}: {}, marking for reconnection",
-                        host, error_str
-                    );
-                    session = None;
-                    connected_since = None;
-                    last_health_check = None;
-                    uploaded_scripts.clear();
-                }
-
-                // Update stats
+                // Update stats but don't disconnect - let health check handle real disconnections
                 let mut conns = connections.lock().await;
                 if let Some(conn) = conns.get_mut(&host) {
                     conn.stats.failed_commands += 1;
                     conn.stats.last_error = Some(error_str.clone());
-
-                    if session.is_none() {
-                        conn.state = ConnectionState::Disconnected;
-                    }
+                    // Keep state as connected - health check will detect real disconnections
                 }
             }
         }
@@ -503,26 +488,6 @@ async fn execute_operation(
             Ok(OperationResult::ScriptOk)
         }
     }
-}
-
-/// Check if an error indicates a connection problem that requires reconnection
-fn is_connection_error(error: &str) -> bool {
-    let connection_error_patterns = [
-        "connection",
-        "disconnect",
-        "timeout",
-        "broken pipe",
-        "reset by peer",
-        "channel",
-        "session",
-        "eof",
-        "closed",
-    ];
-
-    let error_lower = error.to_lowercase();
-    connection_error_patterns
-        .iter()
-        .any(|pattern| error_lower.contains(pattern))
 }
 
 impl Default for ConnectionPool {

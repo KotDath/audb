@@ -11,6 +11,7 @@ Usage:
   python3 tap.py X Y --event /dev/input/event4   # direct evdev (fast)
   python3 tap.py X Y --event auto       # auto-detect touchscreen
   python3 tap.py X Y --duration 1000    # long press (1000ms)
+  python3 tap.py X Y --no-rotate        # disable rotation handling
 
 Run as root: devel-su -c "python3 tap.py 200 400"
 
@@ -27,6 +28,7 @@ import time
 import ctypes
 import fcntl
 import glob
+import subprocess
 
 # ---------- Defaults ----------
 XMAX = int(os.environ.get("XMAX", "720"))
@@ -38,6 +40,12 @@ WIDTH_MAJOR = int(os.environ.get("WIDTH_MAJOR", "19"))
 
 SETTLE = float(os.environ.get("SETTLE", "0.15"))
 DOWN_MS = int(os.environ.get("DOWN_MS", "30"))
+
+# ---------- Orientation constants (Qt::ScreenOrientation) ----------
+ORIENTATION_PORTRAIT = 1
+ORIENTATION_LANDSCAPE = 2
+ORIENTATION_INVERTED_PORTRAIT = 4
+ORIENTATION_INVERTED_LANDSCAPE = 8
 
 # ---------- Input constants ----------
 EV_SYN = 0x00
@@ -131,11 +139,51 @@ def find_touchscreen():
             if os.path.exists(name_path):
                 with open(name_path) as f:
                     name = f.read().strip().lower()
-                    if any(x in name for x in ["touch", "tpd", "ts", "silead", "goodix", "fts", "atmel", "synaptics", "elan", "chsc"]):
+                    if any(x in name for x in ["touch", "tpd", "ts", "silead", "goodix", "fts", "atmel", "synaptics", "elan", "chsc", "himax"]):
                         return dev_path
         except:
             pass
     return "/dev/input/event3"  # fallback
+
+def get_screen_orientation():
+    """Get current screen orientation from dconf."""
+    try:
+        result = subprocess.run(
+            ["dconf", "read", "/desktop/lipstick-jolla-home/dialog_orientation"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+    except:
+        pass
+    return ORIENTATION_PORTRAIT  # default to portrait
+
+def transform_coordinates(x, y, orientation):
+    """Transform screen coordinates based on orientation.
+    
+    Input: screen coordinates (what user sees)
+    Output: raw touchscreen coordinates (hardware)
+    
+    Screen is XMAX x YMAX in portrait mode (hardware native).
+    """
+    if orientation == ORIENTATION_PORTRAIT:
+        # No transformation needed
+        return x, y
+    elif orientation == ORIENTATION_LANDSCAPE:
+        # Screen rotated 90° CCW: user's X becomes hardware Y, user's Y becomes (XMAX - hardware X)
+        # User sees: width=YMAX, height=XMAX
+        # Transform: hw_x = XMAX - y, hw_y = x
+        return XMAX - y, x
+    elif orientation == ORIENTATION_INVERTED_PORTRAIT:
+        # Screen rotated 180°
+        return XMAX - x, YMAX - y
+    elif orientation == ORIENTATION_INVERTED_LANDSCAPE:
+        # Screen rotated 90° CW (270° CCW)
+        # User sees: width=YMAX, height=XMAX
+        # Transform: hw_x = y, hw_y = YMAX - x
+        return y, YMAX - x
+    else:
+        return x, y
 
 # ---------- UINPUT MODE (default, safe) ----------
 def tap_uinput(x, y):
@@ -237,6 +285,7 @@ def main():
     # Parse args
     args = sys.argv[1:]
     event_device = None
+    no_rotate = False
     
     if "--event" in args:
         idx = args.index("--event")
@@ -256,12 +305,29 @@ def main():
             print("ERROR: --duration requires milliseconds value", file=sys.stderr)
             return 2
 
+    if "--no-rotate" in args:
+        args.remove("--no-rotate")
+        no_rotate = True
+
     if len(args) != 2:
-        print("Usage: python3 tap.py X Y [--event DEV] [--duration MS]", file=sys.stderr)
+        print("Usage: python3 tap.py X Y [--event DEV] [--duration MS] [--no-rotate]", file=sys.stderr)
         return 2
 
     x = int(args[0])
     y = int(args[1])
+
+    # Transform coordinates based on screen orientation
+    if not no_rotate:
+        orientation = get_screen_orientation()
+        orig_x, orig_y = x, y
+        x, y = transform_coordinates(x, y, orientation)
+        if orientation != ORIENTATION_PORTRAIT:
+            orient_name = {
+                ORIENTATION_LANDSCAPE: "landscape",
+                ORIENTATION_INVERTED_PORTRAIT: "inverted-portrait",
+                ORIENTATION_INVERTED_LANDSCAPE: "inverted-landscape"
+            }.get(orientation, f"unknown({orientation})")
+            print(f"orientation: {orient_name}, ({orig_x},{orig_y}) -> ({x},{y})", file=sys.stderr)
 
     if event_device:
         tap_evdev(x, y, event_device)

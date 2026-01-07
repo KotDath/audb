@@ -164,11 +164,13 @@ name = "audb-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "audb-protocol",
  "base64",
  "chrono",
  "colored",
  "dialoguer",
  "directories",
+ "libc",
  "russh",
  "russh-sftp",
  "serde",

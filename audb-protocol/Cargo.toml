@@ -2,6 +2,12 @@
 name = "audb-protocol"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Protocol definitions for Aurora Debug Bridge (audb)"
+repository = "https://github.com/KotDath/audb"
+readme = "../README.md"
+keywords = ["aurora", "adb", "protocol", "mobile"]
+categories = ["development-tools"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

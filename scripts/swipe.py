@@ -11,6 +11,7 @@ Usage:
   python3 swipe.py x0 y0 x1 y1                    # coords, uinput mode
   python3 swipe.py lr --event /dev/input/event4  # direction, fast mode
   python3 swipe.py lr --event auto               # direction, auto-detect
+  python3 swipe.py lr --no-rotate                # disable rotation handling
 
 Run as root: devel-su -c "python3 swipe.py lr"
 
@@ -28,6 +29,7 @@ import time
 import ctypes
 import fcntl
 import glob
+import subprocess
 
 # ---------- Defaults ----------
 XMAX = int(os.environ.get("XMAX", "720"))
@@ -45,6 +47,12 @@ MARGIN_X = float(os.environ.get("MARGIN_X", "0.10"))
 MARGIN_Y = float(os.environ.get("MARGIN_Y", "0.15"))
 SWIPE_Y = float(os.environ.get("SWIPE_Y", "0.50"))
 SWIPE_X = float(os.environ.get("SWIPE_X", "0.50"))
+
+# ---------- Orientation constants (Qt::ScreenOrientation) ----------
+ORIENTATION_PORTRAIT = 1
+ORIENTATION_LANDSCAPE = 2
+ORIENTATION_INVERTED_PORTRAIT = 4
+ORIENTATION_INVERTED_LANDSCAPE = 8
 
 # ---------- Input constants ----------
 EV_SYN = 0x00
@@ -138,20 +146,54 @@ def find_touchscreen():
             if os.path.exists(name_path):
                 with open(name_path) as f:
                     name = f.read().strip().lower()
-                    if any(x in name for x in ["touch", "tpd", "ts", "silead", "goodix", "fts", "atmel", "synaptics", "elan", "chsc"]):
+                    if any(x in name for x in ["touch", "tpd", "ts", "silead", "goodix", "fts", "atmel", "synaptics", "elan", "chsc", "himax"]):
                         return dev_path
         except:
             pass
     return "/dev/input/event3"
 
-def parse_direction(d):
-    """Convert direction to coordinates."""
-    cx = int(XMAX * SWIPE_X)
-    cy = int(YMAX * SWIPE_Y)
-    x_left = int(XMAX * MARGIN_X)
-    x_right = int(XMAX * (1.0 - MARGIN_X))
-    y_top = int(YMAX * MARGIN_Y)
-    y_bottom = int(YMAX * (1.0 - MARGIN_Y))
+def get_screen_orientation():
+    """Get current screen orientation from dconf."""
+    try:
+        result = subprocess.run(
+            ["dconf", "read", "/desktop/lipstick-jolla-home/dialog_orientation"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+    except:
+        pass
+    return ORIENTATION_PORTRAIT
+
+def transform_coordinates(x, y, orientation):
+    """Transform screen coordinates based on orientation."""
+    if orientation == ORIENTATION_PORTRAIT:
+        return x, y
+    elif orientation == ORIENTATION_LANDSCAPE:
+        return XMAX - y, x
+    elif orientation == ORIENTATION_INVERTED_PORTRAIT:
+        return XMAX - x, YMAX - y
+    elif orientation == ORIENTATION_INVERTED_LANDSCAPE:
+        return y, YMAX - x
+    else:
+        return x, y
+
+def get_screen_dimensions(orientation):
+    """Get screen dimensions based on orientation."""
+    if orientation in (ORIENTATION_LANDSCAPE, ORIENTATION_INVERTED_LANDSCAPE):
+        return YMAX, XMAX  # width, height swapped
+    return XMAX, YMAX
+
+def parse_direction(d, orientation):
+    """Convert direction to coordinates based on current orientation."""
+    width, height = get_screen_dimensions(orientation)
+    
+    cx = int(width * SWIPE_X)
+    cy = int(height * SWIPE_Y)
+    x_left = int(width * MARGIN_X)
+    x_right = int(width * (1.0 - MARGIN_X))
+    y_top = int(height * MARGIN_Y)
+    y_bottom = int(height * (1.0 - MARGIN_Y))
 
     if d == "lr":
         return x_left, cy, x_right, cy
@@ -256,6 +298,7 @@ def do_swipe(fd, x0, y0, x1, y1):
 def main():
     args = sys.argv[1:]
     event_device = None
+    no_rotate = False
 
     # Parse --event flag
     if "--event" in args:
@@ -267,15 +310,37 @@ def main():
             print("ERROR: --event requires device path or 'auto'", file=sys.stderr)
             return 2
 
+    # Parse --no-rotate flag
+    if "--no-rotate" in args:
+        args.remove("--no-rotate")
+        no_rotate = True
+
+    # Get orientation
+    orientation = ORIENTATION_PORTRAIT
+    if not no_rotate:
+        orientation = get_screen_orientation()
+
     # Parse swipe args
     if len(args) == 1 and args[0] in ("lr", "rl", "du", "ud"):
-        x0, y0, x1, y1 = parse_direction(args[0])
+        x0, y0, x1, y1 = parse_direction(args[0], orientation)
     elif len(args) == 4:
         x0, y0, x1, y1 = int(args[0]), int(args[1]), int(args[2]), int(args[3])
     else:
-        print("Usage: python3 swipe.py lr|rl|du|ud [--event DEV]", file=sys.stderr)
-        print("       python3 swipe.py x0 y0 x1 y1 [--event DEV]", file=sys.stderr)
+        print("Usage: python3 swipe.py lr|rl|du|ud [--event DEV] [--no-rotate]", file=sys.stderr)
+        print("       python3 swipe.py x0 y0 x1 y1 [--event DEV] [--no-rotate]", file=sys.stderr)
         return 2
+
+    # Transform coordinates based on orientation
+    if not no_rotate:
+        x0, y0 = transform_coordinates(x0, y0, orientation)
+        x1, y1 = transform_coordinates(x1, y1, orientation)
+        if orientation != ORIENTATION_PORTRAIT:
+            orient_name = {
+                ORIENTATION_LANDSCAPE: "landscape",
+                ORIENTATION_INVERTED_PORTRAIT: "inverted-portrait",
+                ORIENTATION_INVERTED_LANDSCAPE: "inverted-landscape"
+            }.get(orientation, f"unknown({orientation})")
+            print(f"orientation: {orient_name}", file=sys.stderr)
 
     if event_device:
         swipe_evdev(x0, y0, x1, y1, event_device)

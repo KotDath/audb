@@ -278,8 +278,8 @@ async fn process_command(command: Command, pool: &ConnectionPool) -> CommandResu
             }
         }
 
-        Command::Tap { device, x, y, event_device } => {
-            match execute_tap(pool, &device, x, y, event_device).await {
+        Command::Tap { device, x, y, event_device, duration_ms } => {
+            match execute_tap(pool, &device, x, y, event_device, duration_ms).await {
                 Ok(output) => CommandResult::Success {
                     output: CommandOutput::Lines(output),
                 },
@@ -299,6 +299,25 @@ async fn process_command(command: Command, pool: &ConnectionPool) -> CommandResu
 
         Command::Swipe { device, mode, event_device } => {
             match execute_swipe(pool, &device, mode, event_device).await {
+                Ok(output) => CommandResult::Success {
+                    output: CommandOutput::Lines(output),
+                },
+                Err(e) => {
+                    let kind = if e.to_string().contains("not found") {
+                        audb_protocol::ErrorKind::DeviceNotFound
+                    } else {
+                        audb_protocol::ErrorKind::CommandFailed
+                    };
+                    CommandResult::Error {
+                        message: e.to_string(),
+                        kind,
+                    }
+                }
+            }
+        }
+
+        Command::Key { device, key_name } => {
+            match execute_key(pool, &device, &key_name).await {
                 Ok(output) => CommandResult::Success {
                     output: CommandOutput::Lines(output),
                 },
@@ -397,6 +416,25 @@ async fn process_command(command: Command, pool: &ConnectionPool) -> CommandResu
             CommandResult::Error {
                 message: "Reconnect command not yet implemented in Phase 1".to_string(),
                 kind: audb_protocol::ErrorKind::ServerError,
+            }
+        }
+
+        Command::Open { device, url } => {
+            match execute_open(pool, &device, &url).await {
+                Ok(output) => CommandResult::Success {
+                    output: CommandOutput::Lines(output),
+                },
+                Err(e) => {
+                    let kind = if e.to_string().contains("not found") {
+                        audb_protocol::ErrorKind::DeviceNotFound
+                    } else {
+                        audb_protocol::ErrorKind::CommandFailed
+                    };
+                    CommandResult::Error {
+                        message: e.to_string(),
+                        kind,
+                    }
+                }
             }
         }
     }
@@ -504,6 +542,7 @@ async fn execute_tap(
     x: u16,
     y: u16,
     event_device: Option<String>,
+    duration_ms: Option<u32>,
 ) -> Result<Vec<String>> {
     info!("Tapping at ({}, {}) on device {}", x, y, device_host);
 
@@ -515,12 +554,16 @@ async fn execute_tap(
     // Ensure tap script is present (uses persistent connection)
     pool.ensure_script(device_host, "tap", REMOTE_TAP_PATH, TAP_SCRIPT).await?;
 
-    // Build tap command with optional --event flag
-    let tap_command = if let Some(ref event_dev) = event_device {
-        format!("python3 {} {} {} --event {}", REMOTE_TAP_PATH, x, y, event_dev)
-    } else {
-        format!("python3 {} {} {}", REMOTE_TAP_PATH, x, y)
-    };
+    // Build tap command with optional --event and --duration flags
+    let mut tap_command = format!("python3 {} {} {}", REMOTE_TAP_PATH, x, y);
+    
+    if let Some(ref event_dev) = event_device {
+        tap_command.push_str(&format!(" --event {}", event_dev));
+    }
+    
+    if let Some(duration) = duration_ms {
+        tap_command.push_str(&format!(" --duration {}", duration));
+    }
 
     info!("Executing tap with devel-su...");
     let output = pool.execute_command(device_host, &tap_command, true).await?;
@@ -576,6 +619,176 @@ async fn execute_swipe(
     let output = pool.execute_command(device_host, &swipe_command, true).await?;
 
     Ok(output)
+}
+
+/// Get screen dimensions from device
+async fn get_screen_dimensions(pool: &ConnectionPool, device_host: &str) -> (u32, u32) {
+    // Query screen resolution via D-Bus
+    let dbus_cmd = "gdbus call --system --dest ru.omp.deviceinfo --object-path /ru/omp/deviceinfo/Features --method ru.omp.deviceinfo.Features.getScreenResolution";
+    
+    if let Ok(output) = pool.execute_command(device_host, dbus_cmd, false).await {
+        if let Some(line) = output.first() {
+            // Parse format like "('720x1440',)"
+            let s = line.trim_matches(|c| c == '(' || c == ')' || c == ',' || c == '\'').trim();
+            if let Some((w, h)) = s.split_once('x') {
+                if let (Ok(width), Ok(height)) = (w.parse(), h.parse()) {
+                    return (width, height);
+                }
+            }
+        }
+    }
+    // Default fallback
+    (720, 1440)
+}
+
+/// Execute Key command
+async fn execute_key(
+    pool: &ConnectionPool,
+    device_host: &str,
+    key_name: &str,
+) -> Result<Vec<String>> {
+    info!("Sending key '{}' on device {}", key_name, device_host);
+
+    let key_lower = key_name.to_lowercase();
+
+    // Handle keys via MCE D-Bus (Sailfish/Aurora OS)
+    match key_lower.as_str() {
+        // Power key - use MCE D-Bus
+        "power" => {
+            let cmd = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_trigger_powerkey_event 0";
+            pool.execute_command(device_host, cmd, false).await?;
+            info!("Power key sent via MCE D-Bus");
+            Ok(vec!["Power key sent".to_string()])
+        }
+
+        // Home - Sailfish uses swipe from bottom edge, simulate with swipe gesture
+        "home" => {
+            let (width, height) = get_screen_dimensions(pool, device_host).await;
+            let center_x = width / 2;
+            let center_y = height / 2;
+            
+            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
+            // Swipe from bottom edge to center, pass screen dimensions via env
+            let cmd = format!(
+                "XMAX={} YMAX={} python3 {} {} {} {} {}",
+                width, height, REMOTE_SWIPE_PATH,
+                center_x, height, center_x, center_y
+            );
+            pool.execute_command(device_host, &cmd, true).await?;
+            info!("Home gesture sent (swipe from bottom edge)");
+            Ok(vec!["Home gesture sent (swipe up)".to_string()])
+        }
+
+        // Back - Sailfish uses swipe from left edge
+        "back" => {
+            let (width, height) = get_screen_dimensions(pool, device_host).await;
+            
+            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
+            // Use lr direction with correct screen dimensions
+            let cmd = format!("XMAX={} YMAX={} python3 {} lr", width, height, REMOTE_SWIPE_PATH);
+            pool.execute_command(device_host, &cmd, true).await?;
+            info!("Back gesture sent (swipe from left)");
+            Ok(vec!["Back gesture sent (swipe from left)".to_string()])
+        }
+
+        // Volume keys - use evdev injection to mtk-kpd (event1)
+        // First press shows indicator, second press changes volume
+        "volumeup" | "vol+" => {
+            let cmd = r#"python3 -c "
+import struct, os, time
+EV_KEY, EV_SYN, KEY_VOLUMEUP = 0x01, 0x00, 115
+fd = os.open('/dev/input/event1', os.O_WRONLY)
+def w(t, c, v):
+    os.write(fd, struct.pack('IIHHi', int(time.time()), int((time.time()%1)*1000000), t, c, v))
+for _ in range(2):
+    w(EV_KEY, KEY_VOLUMEUP, 1); w(EV_SYN, 0, 0)
+    time.sleep(0.05)
+    w(EV_KEY, KEY_VOLUMEUP, 0); w(EV_SYN, 0, 0)
+    time.sleep(0.1)
+os.close(fd)
+""#;
+            pool.execute_command(device_host, cmd, true).await?;
+            info!("Volume up sent via evdev");
+            Ok(vec!["Volume increased".to_string()])
+        }
+
+        "volumedown" | "vol-" => {
+            let cmd = r#"python3 -c "
+import struct, os, time
+EV_KEY, EV_SYN, KEY_VOLUMEDOWN = 0x01, 0x00, 114
+fd = os.open('/dev/input/event1', os.O_WRONLY)
+def w(t, c, v):
+    os.write(fd, struct.pack('IIHHi', int(time.time()), int((time.time()%1)*1000000), t, c, v))
+for _ in range(2):
+    w(EV_KEY, KEY_VOLUMEDOWN, 1); w(EV_SYN, 0, 0)
+    time.sleep(0.05)
+    w(EV_KEY, KEY_VOLUMEDOWN, 0); w(EV_SYN, 0, 0)
+    time.sleep(0.1)
+os.close(fd)
+""#;
+            pool.execute_command(device_host, cmd, true).await?;
+            info!("Volume down sent via evdev");
+            Ok(vec!["Volume decreased".to_string()])
+        }
+
+        // Menu - swipe from top (shows events/notifications)
+        "menu" => {
+            let (width, height) = get_screen_dimensions(pool, device_host).await;
+            
+            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
+            // Use ud direction with correct screen dimensions
+            let cmd = format!("XMAX={} YMAX={} python3 {} ud", width, height, REMOTE_SWIPE_PATH);
+            pool.execute_command(device_host, &cmd, true).await?;
+            info!("Menu gesture sent (swipe from top to bottom)");
+            Ok(vec!["Menu gesture sent (swipe down)".to_string()])
+        }
+
+        // Close app - same as home gesture (swipe from bottom edge)
+        "close" => {
+            let (width, height) = get_screen_dimensions(pool, device_host).await;
+            let center_x = width / 2;
+            let center_y = height / 2;
+            
+            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
+            // Same as home - swipe from bottom edge to center
+            let cmd = format!(
+                "XMAX={} YMAX={} python3 {} {} {} {} {}",
+                width, height, REMOTE_SWIPE_PATH,
+                center_x, height, center_x, center_y
+            );
+            pool.execute_command(device_host, &cmd, true).await?;
+            info!("Close gesture sent (swipe from bottom)");
+            Ok(vec!["Close gesture sent (swipe up)".to_string()])
+        }
+
+        // Lock screen
+        "lock" => {
+            let cmd = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_tklock_mode_change 'locked'";
+            pool.execute_command(device_host, cmd, false).await?;
+            info!("Screen locked via MCE D-Bus");
+            Ok(vec!["Screen locked".to_string()])
+        }
+
+        // Unlock screen (turn on display and show lock screen)
+        "unlock" | "wakeup" => {
+            // First unlock tklock, then turn on display
+            let cmd1 = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_tklock_mode_change 'unlocked'";
+            let cmd2 = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_display_state_on";
+            pool.execute_command(device_host, cmd1, false).await?;
+            pool.execute_command(device_host, cmd2, false).await?;
+            info!("Screen unlocked via MCE D-Bus");
+            Ok(vec!["Screen unlocked".to_string()])
+        }
+
+        _ => {
+            let valid_keys = "power, home, back, volumeup/vol+, volumedown/vol-, menu, close, lock, unlock/wakeup";
+            Err(anyhow!(
+                "Unknown key: '{}'. Valid keys for Aurora OS: {}",
+                key_name,
+                valid_keys
+            ))
+        }
+    }
 }
 
 /// Execute Screenshot command
@@ -1119,4 +1332,24 @@ async fn execute_info(
         internal_storage_total_mb,
         internal_storage_free_mb,
     })
+}
+
+/// Execute Open command - open URL on device
+async fn execute_open(
+    pool: &ConnectionPool,
+    device_host: &str,
+    url: &str,
+) -> Result<Vec<String>> {
+    info!("Opening URL '{}' on device {}", url, device_host);
+
+    // Use sailfish fileservice D-Bus to open URL
+    let dbus_command = format!(
+        "gdbus call --session --dest org.sailfishos.fileservice --object-path / --method org.sailfishos.fileservice.openUrl '{}'",
+        url.replace('\'', "'\\''")  // Escape single quotes
+    );
+
+    pool.execute_command(device_host, &dbus_command, false).await?;
+
+    info!("URL opened successfully");
+    Ok(vec![format!("Opened: {}", url)])
 }
