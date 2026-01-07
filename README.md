@@ -50,19 +50,29 @@ Image names: `aurora-build-tools-*` or `aurora-os-build-engine-*`
 
 ### Signing Keys
 
-For `package sign`, place your keys at:
-```
-~/AuroraOS/package-signing/
-├── regular_key.pem
-└── regular_cert.pem
+Signing keys are automatically downloaded from Aurora OS developer portal on first use and cached in `~/.cache/audb/`.
+
+To use custom keys:
+```bash
+audb package sign app.rpm --key /path/to/key.pem --cert /path/to/cert.pem
 ```
 
 ## Installation
 
+### From crates.io
+
+```bash
+cargo install audb-client audb-server
+```
+
+This installs both binaries:
+- `audb` - CLI client
+- `audb-server` - Background server daemon
+
 ### From Source
 
 ```bash
-git clone <repository>
+git clone https://github.com/KotDath/audb
 cd audb
 cargo build --release
 ```
@@ -71,7 +81,7 @@ Binaries will be at:
 - `target/release/audb` - CLI client
 - `target/release/audb-server` - Background server
 
-### Add to PATH
+### Add to PATH (from source)
 
 ```bash
 # Option 1: Copy to /usr/local/bin

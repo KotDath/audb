@@ -231,6 +231,12 @@ enum PackageCommands {
     Sign {
         /// Path to RPM file
         rpm_path: String,
+        /// Custom path to signing key (default: auto-download to cache)
+        #[arg(long)]
+        key: Option<String>,
+        /// Custom path to signing certificate (default: auto-download to cache)
+        #[arg(long)]
+        cert: Option<String>,
     },
     /// Validate RPM package for Aurora OS compliance (local, uses Docker)
     Validate {
@@ -270,8 +276,8 @@ async fn main() {
             PackageCommands::List { filter } => {
                 execute_packages_command(device_override, filter).await
             }
-            PackageCommands::Sign { rpm_path } => {
-                execute_sign_command(rpm_path).await
+            PackageCommands::Sign { rpm_path, key, cert } => {
+                execute_sign_command(rpm_path, key, cert).await
             }
             PackageCommands::Validate { rpm_path } => {
                 execute_validate_command(rpm_path).await
@@ -1014,9 +1020,78 @@ async fn execute_open_command(device_override: Option<String>, url: String) -> R
     }).await
 }
 
+/// URLs for Aurora OS signing keys
+const KEY_URL: &str = "https://developer.auroraos.ru/content-images/dev-doc/regular_key.pem";
+const CERT_URL: &str = "https://developer.auroraos.ru/content-images/dev-doc/regular_cert.pem";
+
+/// Get cache directory for audb
+fn get_cache_dir() -> Result<PathBuf> {
+    let cache_dir = PathBuf::from(shellexpand::tilde("~/.cache/audb").to_string());
+    if !cache_dir.exists() {
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| anyhow!("Failed to create cache directory: {}", e))?;
+    }
+    Ok(cache_dir)
+}
+
+/// Download file from URL to path
+fn download_file(url: &str, path: &std::path::Path) -> Result<()> {
+    use std::process::Command as ProcessCommand;
+    
+    println!("Downloading {}...", url);
+    
+    let output = ProcessCommand::new("curl")
+        .args(["-fsSL", "-o", &path.to_string_lossy(), url])
+        .output()
+        .map_err(|e| anyhow!("Failed to run curl: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("Failed to download {}: {}", url, stderr.trim()));
+    }
+    
+    Ok(())
+}
+
+/// Get signing keys (from custom path, cache, or download)
+fn get_signing_keys(custom_key: Option<String>, custom_cert: Option<String>) -> Result<(PathBuf, PathBuf)> {
+    let key_path = if let Some(key) = custom_key {
+        let path = PathBuf::from(&key);
+        if !path.exists() {
+            return Err(anyhow!("Key file not found: {}", key));
+        }
+        path
+    } else {
+        let cache_dir = get_cache_dir()?;
+        let cached_key = cache_dir.join("regular_key.pem");
+        
+        if !cached_key.exists() {
+            download_file(KEY_URL, &cached_key)?;
+        }
+        cached_key
+    };
+    
+    let cert_path = if let Some(cert) = custom_cert {
+        let path = PathBuf::from(&cert);
+        if !path.exists() {
+            return Err(anyhow!("Certificate file not found: {}", cert));
+        }
+        path
+    } else {
+        let cache_dir = get_cache_dir()?;
+        let cached_cert = cache_dir.join("regular_cert.pem");
+        
+        if !cached_cert.exists() {
+            download_file(CERT_URL, &cached_cert)?;
+        }
+        cached_cert
+    };
+    
+    Ok((key_path, cert_path))
+}
 
 /// Execute Sign command (local, uses Docker)
-async fn execute_sign_command(rpm_path: String) -> Result<()> {
+async fn execute_sign_command(rpm_path: String, custom_key: Option<String>, custom_cert: Option<String>) -> Result<()> {
     use std::process::Command as ProcessCommand;
     use std::path::Path;
 
@@ -1042,32 +1117,8 @@ async fn execute_sign_command(rpm_path: String) -> Result<()> {
     let project_dir = rpm_path.parent()
         .ok_or_else(|| anyhow!("Invalid RPM path"))?;
 
-    // Find keys directory
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
-    let keys_dir = PathBuf::from(&home).join("AuroraOS").join("package-signing");
-    
-    if !keys_dir.exists() || !keys_dir.is_dir() {
-        return Err(anyhow!(
-            "Keys directory not found: {}\n\
-            Please ensure you have Aurora OS signing keys installed.\n\
-            Expected files:\n\
-            - {}/regular_key.pem\n\
-            - {}/regular_cert.pem",
-            keys_dir.display(),
-            keys_dir.display(),
-            keys_dir.display()
-        ));
-    }
-
-    let cert_path = keys_dir.join("regular_cert.pem");
-    let key_path = keys_dir.join("regular_key.pem");
-
-    if !cert_path.exists() {
-        return Err(anyhow!("Certificate not found: {}", cert_path.display()));
-    }
-    if !key_path.exists() {
-        return Err(anyhow!("Key not found: {}", key_path.display()));
-    }
+    // Get signing keys (auto-download if needed)
+    let (key_path, cert_path) = get_signing_keys(custom_key, custom_cert)?;
 
     // Copy keys to project directory temporarily
     let temp_cert = project_dir.join("regular_cert.pem");
