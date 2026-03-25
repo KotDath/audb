@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+X-Nemo-Application-Type=silica-qt5
+Icon=ru.kotdath.AudbBridge
+Exec=/usr/bin/ru.kotdath.AudbBridge
+Name=AudbBridge
+Name[ru]=AudbBridge
+
+[X-Application]
+Permissions=
+Sandboxing=Disabled
+OrganizationName=ru.kotdath
+ApplicationName=AudbBridge
+ExecDBus=/usr/bin/ru.kotdath.AudbBridge
+
+[X-Sailjail]
+Sandboxing=Disabled

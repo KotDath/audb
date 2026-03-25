@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use audb_core::tools::{ssh::SshClient, types::Device};
 use russh::client::Handle;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,12 +27,6 @@ enum DeviceOperation {
         remote_path: std::path::PathBuf,
         local_path: std::path::PathBuf,
     },
-    /// Ensure a script is present on the device
-    EnsureScript {
-        script_name: String,
-        remote_path: String,
-        content: String,
-    },
 }
 
 /// Result of a device operation
@@ -43,8 +37,6 @@ enum OperationResult {
     UploadOk,
     /// Download success
     DownloadOk,
-    /// Script ensured
-    ScriptOk,
 }
 
 /// Command request for a device
@@ -162,31 +154,6 @@ impl ConnectionPool {
         }
     }
 
-    /// Ensure a script is present on the device
-    pub async fn ensure_script(
-        &self,
-        host: &str,
-        script_name: &str,
-        remote_path: &str,
-        content: &str,
-    ) -> Result<()> {
-        let result = self
-            .send_operation(
-                host,
-                DeviceOperation::EnsureScript {
-                    script_name: script_name.to_string(),
-                    remote_path: remote_path.to_string(),
-                    content: content.to_string(),
-                },
-            )
-            .await?;
-
-        match result {
-            OperationResult::ScriptOk => Ok(()),
-            _ => Err(anyhow!("Unexpected operation result")),
-        }
-    }
-
     /// Send an operation to a device's command queue
     async fn send_operation(
         &self,
@@ -276,9 +243,6 @@ async fn device_command_processor(
     let mut last_health_check: Option<Instant> = None;
     let mut current_backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
-    // Track which scripts have been uploaded to avoid re-checking every time
-    let mut uploaded_scripts: HashSet<String> = HashSet::new();
-
     while let Some(request) = rx.recv().await {
         debug!("Processing operation for {}", host);
 
@@ -297,7 +261,6 @@ async fn device_command_processor(
                                 warn!("Health check failed for {}: {}, will reconnect", host, e);
                                 session = None;
                                 connected_since = None;
-                                uploaded_scripts.clear(); // Scripts may need re-upload after reconnect
                             }
                         }
                     }
@@ -314,7 +277,6 @@ async fn device_command_processor(
                     connected_since = Some(Instant::now());
                     last_health_check = Some(Instant::now());
                     current_backoff_ms = INITIAL_BACKOFF_MS; // Reset backoff on success
-                    uploaded_scripts.clear(); // Clear script cache on new connection
 
                     // Update state to connected
                     let mut conns = connections.lock().await;
@@ -354,7 +316,7 @@ async fn device_command_processor(
 
         // Execute the operation using persistent session
         let result = if let Some(ref mut sess) = session {
-            execute_operation(sess, &device, request.operation, &mut uploaded_scripts).await
+            execute_operation(sess, &device, request.operation).await
         } else {
             Err(anyhow!("No active session"))
         };
@@ -420,7 +382,6 @@ async fn execute_operation(
     session: &mut Handle<SshClient>,
     device: &Device,
     operation: DeviceOperation,
-    uploaded_scripts: &mut HashSet<String>,
 ) -> Result<OperationResult> {
     match operation {
         DeviceOperation::Command { command, as_root } => {
@@ -444,48 +405,6 @@ async fn execute_operation(
         } => {
             SshClient::download(session, &remote_path, &local_path)?;
             Ok(OperationResult::DownloadOk)
-        }
-        DeviceOperation::EnsureScript {
-            script_name,
-            remote_path,
-            content,
-        } => {
-            // Check if we've already uploaded this script in this session
-            if uploaded_scripts.contains(&script_name) {
-                return Ok(OperationResult::ScriptOk);
-            }
-
-            // Check if script exists with correct size
-            let expected_size = content.len();
-            let check_cmd = format!(
-                "test -f {} && stat -c %s {} || echo 0",
-                remote_path, remote_path
-            );
-
-            let result = SshClient::exec(session, &check_cmd)?;
-            let current_size: usize = result.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-
-            if current_size != expected_size {
-                // Upload needed
-                let temp_file =
-                    std::env::temp_dir().join(Path::new(&remote_path).file_name().unwrap());
-                std::fs::write(&temp_file, &content)?;
-
-                SshClient::upload(session, &temp_file, Path::new(&remote_path))?;
-
-                // Make executable
-                SshClient::exec(session, &format!("chmod +x {}", remote_path))?;
-
-                // Cleanup local temp
-                std::fs::remove_file(&temp_file).ok();
-
-                debug!("Uploaded script {} to {}", script_name, remote_path);
-            }
-
-            // Mark as uploaded for this session
-            uploaded_scripts.insert(script_name);
-
-            Ok(OperationResult::ScriptOk)
         }
     }
 }

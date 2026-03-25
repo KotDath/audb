@@ -13,7 +13,7 @@ Development and debugging CLI tool for Aurora OS, similar to Android's ADB.
 - **Package Management** - Install, uninstall, sign, and validate RPM packages
 - **Shell Access** - Execute commands on device (as user or root)
 - **File Transfer** - Push/pull files via SFTP
-- **Input Injection** - Tap, swipe, and key events with rotation support
+- **Input Injection** - Tap, swipe, and key events via AudbBridge D-Bus helper app
 - **Screenshots** - Capture device screen
 - **App Control** - Launch and stop applications
 - **Logs** - View and filter system logs
@@ -34,11 +34,16 @@ Development and debugging CLI tool for Aurora OS, similar to Android's ADB.
 | Requirement | Notes |
 |-------------|-------|
 | **Aurora OS** | SSH access enabled |
-| **Python 3** | Required for `tap`, `swipe` commands |
+| **AudbBridge app** | Required for `tap`, `swipe`, `key` commands |
+| **Disabled sandbox** | AudbBridge package must be installed with `Sandboxing=Disabled` |
+| **devel-su access** | Root password must be configured inside AudbBridge |
 
-Install Python on device:
+Install and prepare AudbBridge on device:
 ```bash
-devel-su pkcon install python3
+# Build/install the RPM from app/AudbBridge
+# Then launch AudbBridge on device and:
+# 1. Set devel-su password
+# 2. Run self-test
 ```
 
 ### Aurora SDK Docker Image
@@ -100,10 +105,13 @@ audb device add
 # 2. Select it as active
 audb select 0
 
-# 3. Test connection
+# 3. Install and open AudbBridge on the device
+#    Then set devel-su password and run self-test in the app
+
+# 4. Test connection
 audb ping
 
-# 4. Run a command
+# 5. Run a command
 audb shell uname -a
 ```
 
@@ -169,6 +177,9 @@ audb pull /home/defaultuser/file.txt --output local.txt
 
 ### Input Injection
 
+`audb tap`, `audb swipe`, and `audb key` use the `ru.kotdath.AudbBridge` D-Bus service on the device.
+`python3` on the target device is no longer required for these commands.
+
 ```bash
 # Tap at coordinates
 audb tap 360 720
@@ -200,7 +211,7 @@ audb key volumeup    # or vol+
 audb key volumedown  # or vol-
 ```
 
-**Note:** Tap and swipe automatically handle screen rotation. Use `--no-rotate` to disable.
+**Note:** Tap and swipe automatically handle screen rotation through AudbBridge.
 
 ### Screenshots
 
@@ -334,12 +345,20 @@ audb --device my-device info
 ┌─────────────┐     Unix Socket     ┌─────────────┐     SSH/SFTP     ┌────────────┐
 │  audb CLI   │ ◄─────────────────► │ audb-server │ ◄──────────────► │   Device   │
 └─────────────┘                     └─────────────┘                  └────────────┘
+                                                                    │
+                                                                    │ session D-Bus
+                                                                    ▼
+                                                            ┌──────────────────┐
+                                                            │   AudbBridge     │
+                                                            │  helper app      │
+                                                            └──────────────────┘
 ```
 
 - **audb** - CLI client, sends commands to server
 - **audb-server** - Background daemon, manages SSH connections
 - **Connection Pool** - Persistent SSH sessions with auto-reconnect
 - **Health Check** - Automatic connection monitoring (60s interval)
+- **AudbBridge** - Aurora helper application with disabled sandbox, exposes privileged input methods over session D-Bus
 
 ## Touchscreen Devices
 
@@ -364,10 +383,13 @@ audb reconnect
 audb server-status
 ```
 
-### "Python not found" (tap/swipe)
+### "AudbBridge not available" (tap/swipe/key)
 ```bash
 # On device:
-devel-su pkcon install python3
+# 1. Install ru.kotdath.AudbBridge
+# 2. Launch the app
+# 3. Set devel-su password in the app
+# 4. Run self-test
 ```
 
 ### Server issues

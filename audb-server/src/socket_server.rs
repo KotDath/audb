@@ -7,11 +7,10 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn, error};
 
-// Get scripts from audb-core (single source of truth)
-const TAP_SCRIPT: &str = audb_core::features::input::scripts::ScriptManager::tap_script_content();
-const SWIPE_SCRIPT: &str = audb_core::features::input::scripts::ScriptManager::swipe_script_content();
-const REMOTE_TAP_PATH: &str = "/tmp/audb_tap.py";
-const REMOTE_SWIPE_PATH: &str = "/tmp/audb_swipe.py";
+const BRIDGE_SERVICE: &str = "ru.kotdath.AudbBridge";
+const BRIDGE_OBJECT_PATH: &str = "/ru/kotdath/AudbBridge";
+const BRIDGE_INTERFACE: &str = "ru.kotdath.AudbBridge";
+const BRIDGE_SESSION_ENV: &str = "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket";
 
 /// Get the path to the Unix socket
 pub fn socket_path() -> PathBuf {
@@ -551,24 +550,11 @@ async fn execute_tap(
         return Err(anyhow!("Coordinates out of range: ({}, {}). Max: 4096x4096", x, y));
     }
 
-    // Ensure tap script is present (uses persistent connection)
-    pool.ensure_script(device_host, "tap", REMOTE_TAP_PATH, TAP_SCRIPT).await?;
+    let tap_command = build_bridge_tap_command(x, y, event_device, duration_ms);
+    info!("Executing tap via AudbBridge D-Bus...");
+    pool.execute_command(device_host, &tap_command, false).await?;
 
-    // Build tap command with optional --event and --duration flags
-    let mut tap_command = format!("python3 {} {} {}", REMOTE_TAP_PATH, x, y);
-    
-    if let Some(ref event_dev) = event_device {
-        tap_command.push_str(&format!(" --event {}", event_dev));
-    }
-    
-    if let Some(duration) = duration_ms {
-        tap_command.push_str(&format!(" --duration {}", duration));
-    }
-
-    info!("Executing tap with devel-su...");
-    let output = pool.execute_command(device_host, &tap_command, true).await?;
-
-    Ok(output)
+    Ok(vec![format!("tap({}, {}) via AudbBridge", x, y)])
 }
 
 /// Execute Swipe command
@@ -589,56 +575,11 @@ async fn execute_swipe(
         }
     }
 
-    // Ensure swipe script is present (uses persistent connection)
-    pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
+    let swipe_command = build_bridge_swipe_command(mode, event_device);
+    info!("Executing swipe via AudbBridge D-Bus...");
+    pool.execute_command(device_host, &swipe_command, false).await?;
 
-    // Build command based on mode
-    let base_cmd = match mode {
-        audb_protocol::SwipeMode::Coords { x1, y1, x2, y2 } => {
-            format!("python3 {} {} {} {} {}", REMOTE_SWIPE_PATH, x1, y1, x2, y2)
-        }
-        audb_protocol::SwipeMode::Direction(dir) => {
-            let dir_arg = match dir {
-                audb_protocol::SwipeDirection::Left => "rl",
-                audb_protocol::SwipeDirection::Right => "lr",
-                audb_protocol::SwipeDirection::Up => "du",
-                audb_protocol::SwipeDirection::Down => "ud",
-            };
-            format!("python3 {} {}", REMOTE_SWIPE_PATH, dir_arg)
-        }
-    };
-
-    // Add --event flag if specified
-    let swipe_command = if let Some(ref event_dev) = event_device {
-        format!("{} --event {}", base_cmd, event_dev)
-    } else {
-        base_cmd
-    };
-
-    info!("Executing swipe with devel-su...");
-    let output = pool.execute_command(device_host, &swipe_command, true).await?;
-
-    Ok(output)
-}
-
-/// Get screen dimensions from device
-async fn get_screen_dimensions(pool: &ConnectionPool, device_host: &str) -> (u32, u32) {
-    // Query screen resolution via D-Bus
-    let dbus_cmd = "gdbus call --system --dest ru.omp.deviceinfo --object-path /ru/omp/deviceinfo/Features --method ru.omp.deviceinfo.Features.getScreenResolution";
-    
-    if let Ok(output) = pool.execute_command(device_host, dbus_cmd, false).await {
-        if let Some(line) = output.first() {
-            // Parse format like "('720x1440',)"
-            let s = line.trim_matches(|c| c == '(' || c == ')' || c == ',' || c == '\'').trim();
-            if let Some((w, h)) = s.split_once('x') {
-                if let (Ok(width), Ok(height)) = (w.parse(), h.parse()) {
-                    return (width, height);
-                }
-            }
-        }
-    }
-    // Default fallback
-    (720, 1440)
+    Ok(vec!["swipe via AudbBridge".to_string()])
 }
 
 /// Execute Key command
@@ -649,146 +590,11 @@ async fn execute_key(
 ) -> Result<Vec<String>> {
     info!("Sending key '{}' on device {}", key_name, device_host);
 
-    let key_lower = key_name.to_lowercase();
+    let key_command = build_bridge_key_command(key_name);
+    info!("Executing key via AudbBridge D-Bus...");
+    pool.execute_command(device_host, &key_command, false).await?;
 
-    // Handle keys via MCE D-Bus (Sailfish/Aurora OS)
-    match key_lower.as_str() {
-        // Power key - use MCE D-Bus
-        "power" => {
-            let cmd = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_trigger_powerkey_event 0";
-            pool.execute_command(device_host, cmd, false).await?;
-            info!("Power key sent via MCE D-Bus");
-            Ok(vec!["Power key sent".to_string()])
-        }
-
-        // Home - Sailfish uses swipe from bottom edge, simulate with swipe gesture
-        "home" => {
-            let (width, height) = get_screen_dimensions(pool, device_host).await;
-            let center_x = width / 2;
-            let center_y = height / 2;
-            
-            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
-            // Swipe from bottom edge to center, pass screen dimensions via env
-            let cmd = format!(
-                "XMAX={} YMAX={} python3 {} {} {} {} {}",
-                width, height, REMOTE_SWIPE_PATH,
-                center_x, height, center_x, center_y
-            );
-            pool.execute_command(device_host, &cmd, true).await?;
-            info!("Home gesture sent (swipe from bottom edge)");
-            Ok(vec!["Home gesture sent (swipe up)".to_string()])
-        }
-
-        // Back - Sailfish uses swipe from left edge
-        "back" => {
-            let (width, height) = get_screen_dimensions(pool, device_host).await;
-            
-            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
-            // Use lr direction with correct screen dimensions
-            let cmd = format!("XMAX={} YMAX={} python3 {} lr", width, height, REMOTE_SWIPE_PATH);
-            pool.execute_command(device_host, &cmd, true).await?;
-            info!("Back gesture sent (swipe from left)");
-            Ok(vec!["Back gesture sent (swipe from left)".to_string()])
-        }
-
-        // Volume keys - use evdev injection to mtk-kpd (event1)
-        // First press shows indicator, second press changes volume
-        "volumeup" | "vol+" => {
-            let cmd = r#"python3 -c "
-import struct, os, time
-EV_KEY, EV_SYN, KEY_VOLUMEUP = 0x01, 0x00, 115
-fd = os.open('/dev/input/event1', os.O_WRONLY)
-def w(t, c, v):
-    os.write(fd, struct.pack('IIHHi', int(time.time()), int((time.time()%1)*1000000), t, c, v))
-for _ in range(2):
-    w(EV_KEY, KEY_VOLUMEUP, 1); w(EV_SYN, 0, 0)
-    time.sleep(0.05)
-    w(EV_KEY, KEY_VOLUMEUP, 0); w(EV_SYN, 0, 0)
-    time.sleep(0.1)
-os.close(fd)
-""#;
-            pool.execute_command(device_host, cmd, true).await?;
-            info!("Volume up sent via evdev");
-            Ok(vec!["Volume increased".to_string()])
-        }
-
-        "volumedown" | "vol-" => {
-            let cmd = r#"python3 -c "
-import struct, os, time
-EV_KEY, EV_SYN, KEY_VOLUMEDOWN = 0x01, 0x00, 114
-fd = os.open('/dev/input/event1', os.O_WRONLY)
-def w(t, c, v):
-    os.write(fd, struct.pack('IIHHi', int(time.time()), int((time.time()%1)*1000000), t, c, v))
-for _ in range(2):
-    w(EV_KEY, KEY_VOLUMEDOWN, 1); w(EV_SYN, 0, 0)
-    time.sleep(0.05)
-    w(EV_KEY, KEY_VOLUMEDOWN, 0); w(EV_SYN, 0, 0)
-    time.sleep(0.1)
-os.close(fd)
-""#;
-            pool.execute_command(device_host, cmd, true).await?;
-            info!("Volume down sent via evdev");
-            Ok(vec!["Volume decreased".to_string()])
-        }
-
-        // Menu - swipe from top (shows events/notifications)
-        "menu" => {
-            let (width, height) = get_screen_dimensions(pool, device_host).await;
-            
-            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
-            // Use ud direction with correct screen dimensions
-            let cmd = format!("XMAX={} YMAX={} python3 {} ud", width, height, REMOTE_SWIPE_PATH);
-            pool.execute_command(device_host, &cmd, true).await?;
-            info!("Menu gesture sent (swipe from top to bottom)");
-            Ok(vec!["Menu gesture sent (swipe down)".to_string()])
-        }
-
-        // Close app - same as home gesture (swipe from bottom edge)
-        "close" => {
-            let (width, height) = get_screen_dimensions(pool, device_host).await;
-            let center_x = width / 2;
-            let center_y = height / 2;
-            
-            pool.ensure_script(device_host, "swipe", REMOTE_SWIPE_PATH, SWIPE_SCRIPT).await?;
-            // Same as home - swipe from bottom edge to center
-            let cmd = format!(
-                "XMAX={} YMAX={} python3 {} {} {} {} {}",
-                width, height, REMOTE_SWIPE_PATH,
-                center_x, height, center_x, center_y
-            );
-            pool.execute_command(device_host, &cmd, true).await?;
-            info!("Close gesture sent (swipe from bottom)");
-            Ok(vec!["Close gesture sent (swipe up)".to_string()])
-        }
-
-        // Lock screen
-        "lock" => {
-            let cmd = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_tklock_mode_change 'locked'";
-            pool.execute_command(device_host, cmd, false).await?;
-            info!("Screen locked via MCE D-Bus");
-            Ok(vec!["Screen locked".to_string()])
-        }
-
-        // Unlock screen (turn on display and show lock screen)
-        "unlock" | "wakeup" => {
-            // First unlock tklock, then turn on display
-            let cmd1 = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_tklock_mode_change 'unlocked'";
-            let cmd2 = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.req_display_state_on";
-            pool.execute_command(device_host, cmd1, false).await?;
-            pool.execute_command(device_host, cmd2, false).await?;
-            info!("Screen unlocked via MCE D-Bus");
-            Ok(vec!["Screen unlocked".to_string()])
-        }
-
-        _ => {
-            let valid_keys = "power, home, back, volumeup/vol+, volumedown/vol-, menu, close, lock, unlock/wakeup";
-            Err(anyhow!(
-                "Unknown key: '{}'. Valid keys for Aurora OS: {}",
-                key_name,
-                valid_keys
-            ))
-        }
-    }
+    Ok(vec![format!("key '{}' via AudbBridge", key_name)])
 }
 
 /// Execute Screenshot command
@@ -976,9 +782,114 @@ fn build_journalctl_command(args: &audb_protocol::LogsArgs) -> Result<String> {
     Ok(cmd)
 }
 
+fn build_bridge_tap_command(
+    x: u16,
+    y: u16,
+    event_device: Option<String>,
+    duration_ms: Option<u32>,
+) -> String {
+    let options = build_tap_options_map(event_device, duration_ms);
+    build_bridge_command("Tap", &[x.to_string(), y.to_string(), options])
+}
+
+fn build_bridge_swipe_command(
+    mode: audb_protocol::SwipeMode,
+    event_device: Option<String>,
+) -> String {
+    let options = build_swipe_options_map(event_device);
+
+    match mode {
+        audb_protocol::SwipeMode::Coords { x1, y1, x2, y2 } => build_bridge_command(
+            "Swipe",
+            &[
+                x1.to_string(),
+                y1.to_string(),
+                x2.to_string(),
+                y2.to_string(),
+                options,
+            ],
+        ),
+        audb_protocol::SwipeMode::Direction(dir) => {
+            build_bridge_command("SwipeDirection", &[swipe_direction_to_bridge_arg(dir).to_string(), options])
+        }
+    }
+}
+
+fn build_bridge_key_command(key_name: &str) -> String {
+    build_bridge_command("Key", &[key_name.to_string()])
+}
+
+fn build_bridge_command(method: &str, arguments: &[String]) -> String {
+    let mut parts = vec![
+        BRIDGE_SESSION_ENV.to_string(),
+        "gdbus".to_string(),
+        "call".to_string(),
+        "--session".to_string(),
+        "--dest".to_string(),
+        shell_quote(BRIDGE_SERVICE),
+        "--object-path".to_string(),
+        shell_quote(BRIDGE_OBJECT_PATH),
+        "--method".to_string(),
+        shell_quote(&format!("{}.{}", BRIDGE_INTERFACE, method)),
+    ];
+
+    parts.extend(arguments.iter().map(|argument| shell_quote(argument)));
+    parts.join(" ")
+}
+
+fn build_tap_options_map(event_device: Option<String>, duration_ms: Option<u32>) -> String {
+    let mut entries = Vec::new();
+
+    if let Some(event_device) = event_device {
+        entries.push(("eventDevice", gvariant_string(&event_device)));
+    }
+    if let Some(duration_ms) = duration_ms {
+        entries.push(("durationMs", duration_ms.to_string()));
+    }
+
+    build_gvariant_dict(entries)
+}
+
+fn build_swipe_options_map(event_device: Option<String>) -> String {
+    let mut entries = Vec::new();
+    if let Some(event_device) = event_device {
+        entries.push(("eventDevice", gvariant_string(&event_device)));
+    }
+    build_gvariant_dict(entries)
+}
+
+fn build_gvariant_dict(entries: Vec<(&str, String)>) -> String {
+    if entries.is_empty() {
+        return "{}".to_string();
+    }
+
+    let items = entries
+        .into_iter()
+        .map(|(key, value)| format!("'{}': <{}>", key, value))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", items.join(", "))
+}
+
+fn gvariant_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn swipe_direction_to_bridge_arg(direction: audb_protocol::SwipeDirection) -> &'static str {
+    match direction {
+        audb_protocol::SwipeDirection::Left => "rl",
+        audb_protocol::SwipeDirection::Right => "lr",
+        audb_protocol::SwipeDirection::Up => "du",
+        audb_protocol::SwipeDirection::Down => "ud",
+    }
+}
+
 /// Escape single quotes for shell command (simple implementation)
 fn escape_single_quote(s: &str) -> String {
     s.replace('\'', "'\\''")
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", escape_single_quote(s))
 }
 
 /// Execute Uninstall command
@@ -1352,4 +1263,70 @@ async fn execute_open(
 
     info!("URL opened successfully");
     Ok(vec![format!("Opened: {}", url)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_bridge_tap_command_without_options() {
+        let command = build_bridge_tap_command(600, 1000, None, None);
+
+        assert_eq!(
+            command,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket gdbus call --session --dest 'ru.kotdath.AudbBridge' --object-path '/ru/kotdath/AudbBridge' --method 'ru.kotdath.AudbBridge.Tap' '600' '1000' '{}'"
+        );
+    }
+
+    #[test]
+    fn build_bridge_tap_command_with_options() {
+        let command = build_bridge_tap_command(600, 1000, Some("auto".to_string()), Some(120));
+
+        assert_eq!(
+            command,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket gdbus call --session --dest 'ru.kotdath.AudbBridge' --object-path '/ru/kotdath/AudbBridge' --method 'ru.kotdath.AudbBridge.Tap' '600' '1000' '{'\\''eventDevice'\\'': <'\\''auto'\\''>, '\\''durationMs'\\'': <120>}'"
+        );
+    }
+
+    #[test]
+    fn build_bridge_swipe_direction_command() {
+        let command = build_bridge_swipe_command(
+            audb_protocol::SwipeMode::Direction(audb_protocol::SwipeDirection::Up),
+            None,
+        );
+
+        assert_eq!(
+            command,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket gdbus call --session --dest 'ru.kotdath.AudbBridge' --object-path '/ru/kotdath/AudbBridge' --method 'ru.kotdath.AudbBridge.SwipeDirection' 'du' '{}'"
+        );
+    }
+
+    #[test]
+    fn build_bridge_swipe_coords_command_with_options() {
+        let command = build_bridge_swipe_command(
+            audb_protocol::SwipeMode::Coords {
+                x1: 10,
+                y1: 20,
+                x2: 30,
+                y2: 40,
+            },
+            Some("/dev/input/event4".to_string()),
+        );
+
+        assert_eq!(
+            command,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket gdbus call --session --dest 'ru.kotdath.AudbBridge' --object-path '/ru/kotdath/AudbBridge' --method 'ru.kotdath.AudbBridge.Swipe' '10' '20' '30' '40' '{'\\''eventDevice'\\'': <'\\''/dev/input/event4'\\''>}'"
+        );
+    }
+
+    #[test]
+    fn test_build_bridge_key_command() {
+        let command = build_bridge_key_command("home");
+
+        assert_eq!(
+            command,
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket gdbus call --session --dest 'ru.kotdath.AudbBridge' --object-path '/ru/kotdath/AudbBridge' --method 'ru.kotdath.AudbBridge.Key' 'home'"
+        );
+    }
 }
