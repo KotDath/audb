@@ -36,6 +36,8 @@ public:
     bool swipe(int x1, int y1, int x2, int y2, const QVariantMap &options);
     bool swipeDirection(const QString &direction, const QVariantMap &options);
     bool key(const QString &keyName);
+    bool setClipboardText(const QString &text);
+    QString clipboardText() const;
     Q_INVOKABLE QString screenshot(const QString &outputPath);
 
 signals:

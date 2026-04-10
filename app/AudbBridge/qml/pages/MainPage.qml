@@ -69,6 +69,14 @@ Page {
                 EnterKey.onClicked: storePassword()
             }
 
+            TextField {
+                id: pasteProbeField
+                width: parent.width
+                label: qsTr("Paste probe")
+                placeholderText: qsTr("Paste text here")
+                inputMethodHints: Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+            }
+
             Button {
                 id: setPasswordButton
                 width: parent.width

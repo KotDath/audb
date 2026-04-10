@@ -142,6 +142,12 @@ enum Commands {
         key_name: String,
     },
 
+    /// Read or write device clipboard text through AudbBridge
+    Clipboard {
+        #[command(subcommand)]
+        action: ClipboardCommands,
+    },
+
     /// Take screenshot of device
     Screenshot {
         /// Output file path (defaults to screenshot_TIMESTAMP.png)
@@ -217,8 +223,30 @@ enum DeviceCommands {
         #[arg(short, long)]
         active: bool,
     },
-    /// Add a new device interactively
-    Add,
+    /// Add a new device
+    Add {
+        /// Device display name
+        #[arg(long)]
+        name: Option<String>,
+        /// Host IP address
+        #[arg(long)]
+        host: Option<String>,
+        /// SSH port
+        #[arg(long)]
+        port: Option<u16>,
+        /// SSH private key path
+        #[arg(long)]
+        auth: Option<String>,
+        /// Cached devel-su password for root-capable commands
+        #[arg(long)]
+        root_password: Option<String>,
+        /// Device architecture: aurora-arm or aurora-arm64
+        #[arg(long)]
+        arch: Option<String>,
+        /// Add the device even if SSH connection test fails
+        #[arg(long)]
+        add_anyway: bool,
+    },
     /// Change cached and device-side devel-su password
     SetRootPassword {
         /// Device identifier (name, ID, IP address, or index). Uses current selection if omitted.
@@ -299,6 +327,22 @@ enum PackageCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ClipboardCommands {
+    /// Set clipboard text
+    Set {
+        /// Text to put into the device clipboard
+        text: String,
+    },
+    /// Set clipboard text and tap the visible keyboard paste suggestion
+    Paste {
+        /// Text to paste into the active text field
+        text: String,
+    },
+    /// Get clipboard text
+    Get,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -311,7 +355,28 @@ async fn main() {
             DeviceCommands::List { active } => {
                 audb_core::features::device::list::execute(active).await
             }
-            DeviceCommands::Add => audb_core::features::device::add::execute().await,
+            DeviceCommands::Add {
+                name,
+                host,
+                port,
+                auth,
+                root_password,
+                arch,
+                add_anyway,
+            } => {
+                audb_core::features::device::add::execute(
+                    audb_core::features::device::add::AddDeviceOptions {
+                        name,
+                        host,
+                        port,
+                        auth,
+                        root_password,
+                        arch,
+                        add_anyway,
+                    },
+                )
+                .await
+            }
             DeviceCommands::SetRootPassword {
                 identifier,
                 new_password,
@@ -395,6 +460,15 @@ async fn main() {
             hold,
         } => execute_swipe_command(device_override, args, event, steps, duration, hold).await,
         Commands::Key { key_name } => execute_key_command(device_override, key_name).await,
+        Commands::Clipboard { action } => match action {
+            ClipboardCommands::Set { text } => {
+                execute_clipboard_set_command(device_override, text).await
+            }
+            ClipboardCommands::Paste { text } => {
+                execute_clipboard_paste_command(device_override, text).await
+            }
+            ClipboardCommands::Get => execute_clipboard_get_command(device_override).await,
+        },
         Commands::Screenshot { output } => {
             execute_screenshot_command(device_override, output).await
         }
@@ -1103,6 +1177,30 @@ async fn execute_key_command(device_override: Option<String>, key_name: String) 
     let device = get_device(device_override)?;
 
     execute_command(Command::Key { device, key_name }).await
+}
+
+async fn execute_clipboard_set_command(
+    device_override: Option<String>,
+    text: String,
+) -> Result<()> {
+    let device = get_device(device_override)?;
+
+    execute_command(Command::ClipboardSet { device, text }).await
+}
+
+async fn execute_clipboard_paste_command(
+    device_override: Option<String>,
+    text: String,
+) -> Result<()> {
+    let device = get_device(device_override)?;
+
+    execute_command(Command::ClipboardPaste { device, text }).await
+}
+
+async fn execute_clipboard_get_command(device_override: Option<String>) -> Result<()> {
+    let device = get_device(device_override)?;
+
+    execute_command(Command::ClipboardGet { device }).await
 }
 
 /// Execute Screenshot command with special binary handling

@@ -43,6 +43,16 @@ bool BridgeAdaptor::Key(const QString &keyName)
     return m_service->key(keyName);
 }
 
+bool BridgeAdaptor::SetClipboardText(const QString &text)
+{
+    return m_service->setClipboardText(text);
+}
+
+QString BridgeAdaptor::GetClipboardText() const
+{
+    return m_service->clipboardText();
+}
+
 QString BridgeAdaptor::Screenshot(const QString &outputPath)
 {
     return m_service->screenshot(outputPath);

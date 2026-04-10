@@ -32,6 +32,8 @@ const SCROLL_START_Y_RATIO: f64 = 0.78;
 const SCROLL_END_Y_RATIO: f64 = 0.22;
 const EDGE_START_Y_RATIO: f64 = 0.985;
 const EDGE_END_Y_RATIO: f64 = 0.06;
+const KEYBOARD_PASTE_TAP_HOLD_MS: u32 = 160;
+const KEYBOARD_PORTRAIT_ROWS_WITH_HANDLER: f64 = 5.0;
 
 #[derive(Clone, Default)]
 struct ManagedEmulatorState {
@@ -406,6 +408,39 @@ impl EmulatorManager {
         Ok(vec!["swipe via QMP multitouch".to_string()])
     }
 
+    pub async fn paste_clipboard(
+        &self,
+        device: &Device,
+        pool: &ConnectionPool,
+    ) -> Result<Vec<String>> {
+        self.ensure_runtime(device, pool).await?;
+        let geometry = self.resolve_geometry(device, pool).await?;
+        let keyboard_height = query_keyboard_height(pool, &device.id).await?;
+        let (x, y) = geometry.clipboard_button_center(keyboard_height)?;
+        let (abs_x, abs_y) = geometry.pixel_to_abs(x, y)?;
+
+        qmp_send_events(
+            &emulator_config(device)?.qmp_socket,
+            vec![
+                qmp_mtt("begin", 0, 1001, "x", abs_x),
+                qmp_btn_touch(true),
+                qmp_mtt("data", 0, 1001, "x", abs_x),
+                qmp_mtt("data", 0, 1001, "y", abs_y),
+            ],
+        )?;
+        std::thread::sleep(Duration::from_millis(KEYBOARD_PASTE_TAP_HOLD_MS as u64));
+        qmp_send_events(
+            &emulator_config(device)?.qmp_socket,
+            vec![qmp_mtt("end", 0, -1, "x", abs_x)],
+        )?;
+        std::thread::sleep(Duration::from_millis(DEFAULT_TAP_SETTLE_MS));
+
+        Ok(vec![format!(
+            "clipboard button tapped at ({}, {}) via QMP multitouch",
+            x, y
+        )])
+    }
+
     pub async fn screenshot(&self, device: &Device, pool: &ConnectionPool) -> Result<Vec<u8>> {
         self.ensure_runtime(device, pool).await?;
         let config = emulator_config(device)?;
@@ -638,6 +673,25 @@ impl ResolvedGeometry {
             .round() as u32;
         Ok((abs_x, abs_y))
     }
+
+    fn clipboard_button_center(&self, keyboard_height: f64) -> Result<(u32, u32)> {
+        if keyboard_height <= 0.0 {
+            return Err(anyhow!(
+                "keyboard height is zero; focus a text field and open the keyboard before paste"
+            ));
+        }
+
+        let keyboard_height = keyboard_height.min(self.visible_height as f64);
+        let key_height = keyboard_height / KEYBOARD_PORTRAIT_ROWS_WITH_HANDLER;
+        let x = (key_height / 2.0)
+            .round()
+            .clamp(0.0, (self.visible_width - 1) as f64) as u32;
+        let y = ((self.visible_height as f64 - keyboard_height) + key_height / 2.0)
+            .round()
+            .clamp(0.0, (self.visible_height - 1) as f64) as u32;
+
+        Ok((x, y))
+    }
 }
 
 impl From<Orientation> for ScreenOrientationInfo {
@@ -775,6 +829,18 @@ async fn query_orientation(pool: &ConnectionPool, device_id: &str) -> Result<Ori
     Ok(orientation)
 }
 
+async fn query_keyboard_height(pool: &ConnectionPool, device_id: &str) -> Result<f64> {
+    let output = pool
+        .execute_command(
+            device_id,
+            "gdbus call --session --dest org.maliit.server --object-path /com/jolla/keyboard --method org.freedesktop.DBus.Properties.Get com.jolla.keyboard keyboardHeight",
+            false,
+        )
+        .await?;
+    let text = output.join(" ");
+    parse_first_float(&text).ok_or_else(|| anyhow!("failed to parse keyboard height from {}", text))
+}
+
 fn parse_dimensions_from_text(text: &str) -> Option<(u32, u32)> {
     let int32_values: Vec<u32> = text
         .split_whitespace()
@@ -823,6 +889,12 @@ fn parse_dimensions_from_text(text: &str) -> Option<(u32, u32)> {
         [width, height] if *width >= 100 && *height >= 100 => Some((*width, *height)),
         _ => None,
     })
+}
+
+fn parse_first_float(text: &str) -> Option<f64> {
+    text.split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+        .filter(|part| !part.is_empty())
+        .find_map(|part| part.parse::<f64>().ok())
 }
 
 fn swipe_coords(mode: SwipeMode, geometry: ResolvedGeometry) -> Result<(u32, u32, u32, u32)> {
@@ -998,5 +1070,35 @@ fn qmp_read_message(reader: &mut BufReader<StdUnixStream>) -> Result<Value> {
             continue;
         }
         return Ok(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_keyboard_height_from_gdbus_output() {
+        assert_eq!(
+            parse_first_float("(471.6666259765625,)"),
+            Some(471.6666259765625)
+        );
+    }
+
+    #[test]
+    fn clipboard_button_center_uses_keyboard_height() {
+        let geometry = ResolvedGeometry {
+            native_width: 720,
+            native_height: 1600,
+            visible_width: 720,
+            visible_height: 1600,
+            orientation: Orientation::Portrait,
+            abs_max: 32767,
+        };
+
+        assert_eq!(
+            geometry.clipboard_button_center(471.6666259765625).unwrap(),
+            (47, 1176)
+        );
     }
 }

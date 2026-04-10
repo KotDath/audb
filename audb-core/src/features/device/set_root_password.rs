@@ -18,28 +18,30 @@ pub async fn execute(identifier: Option<String>, new_password: String) -> Result
     };
     let mut device = DeviceStore::find(&identifier)?;
 
-    if device.root_password.is_empty() {
-        return Err(anyhow!(
-            "Root password not configured for {}. Update devices.json or set it when adding the device first.",
-            device.display_name()
-        ));
-    }
-
     let mut session = SshClient::connect(&device.host, device.port, &device.auth_path())
         .with_context(|| format!("Failed to connect to {}", device.display_name()))?;
 
-    let command = format!(
-        "busctl --system call org.nemo.passwordmanager /org/nemo/passwordmanager org.nemo.passwordmanager setPassword s '{}'",
-        escape_single_quote(&new_password)
-    );
-    SshClient::exec_as_devel_su(&mut session, &command, &device.root_password).with_context(
-        || {
+    if device.root_password.is_empty() {
+        SshClient::exec_as_devel_su(&mut session, "true", &new_password).with_context(|| {
             format!(
-                "Failed to change devel-su password on {} using cached rootPassword",
+                "Failed to validate devel-su password on {}",
                 device.display_name()
             )
-        },
-    )?;
+        })?;
+    } else {
+        let command = format!(
+            "busctl --system call org.nemo.passwordmanager /org/nemo/passwordmanager org.nemo.passwordmanager setPassword s '{}'",
+            escape_single_quote(&new_password)
+        );
+        SshClient::exec_as_devel_su(&mut session, &command, &device.root_password).with_context(
+            || {
+                format!(
+                    "Failed to change devel-su password on {} using cached rootPassword",
+                    device.display_name()
+                )
+            },
+        )?;
+    }
 
     device.root_password = new_password;
     DeviceStore::update(device.clone())?;

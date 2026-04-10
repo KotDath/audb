@@ -6,6 +6,7 @@
 #include <auroraapp.h>
 
 #include <QCoreApplication>
+#include <QClipboard>
 #include <QEventLoop>
 #include <QDebug>
 #include <QDBusConnection>
@@ -724,6 +725,30 @@ bool BridgeService::key(const QString &keyName)
         QStringLiteral("--ymax"), QString::number(screenSize.height())
     };
     return runPrivilegedHelper(arguments);
+}
+
+bool BridgeService::setClipboardText(const QString &text)
+{
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    if (!clipboard) {
+        setStatusMessage(QStringLiteral("Clipboard is not available."));
+        emit stateChanged();
+        return false;
+    }
+
+    clipboard->setText(text, QClipboard::Clipboard);
+    setStatusMessage(QStringLiteral("Clipboard text updated."));
+    emit stateChanged();
+    return clipboard->text(QClipboard::Clipboard) == text;
+}
+
+QString BridgeService::clipboardText() const
+{
+    QClipboard *clipboard = QGuiApplication::clipboard();
+    if (!clipboard) {
+        return {};
+    }
+    return clipboard->text(QClipboard::Clipboard);
 }
 
 QString BridgeService::screenshot(const QString &outputPath)

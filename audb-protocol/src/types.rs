@@ -60,6 +60,12 @@ pub enum Command {
         /// Key name (back, home, power, volumeup, volumedown, etc.)
         key_name: String,
     },
+    /// Set clipboard text through AudbBridge
+    ClipboardSet { device: String, text: String },
+    /// Set clipboard text and trigger the visible keyboard paste action
+    ClipboardPaste { device: String, text: String },
+    /// Get clipboard text through AudbBridge
+    ClipboardGet { device: String },
     /// Take screenshot of device
     Screenshot { device: String },
     /// Launch application on device

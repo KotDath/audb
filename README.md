@@ -128,6 +128,8 @@ audb device list --active
 
 # Add new device interactively
 audb device add
+audb device add --name KVADRA_T --host 192.168.2.44 --port 22 --auth ~/.ssh/strix_halo --root-password "<password>" --arch aurora-arm64
+audb device set-root-password KVADRA_T --new-password "<password>"
 
 # Remove device (by index, IP, or name)
 audb device remove 0
@@ -209,9 +211,15 @@ audb key home
 audb key back
 audb key volumeup    # or vol+
 audb key volumedown  # or vol-
+
+# Clipboard text
+audb clipboard set "text to paste"
+audb clipboard paste "text to paste"  # active field + visible keyboard required
+audb clipboard get
 ```
 
-**Note:** Tap and swipe automatically handle screen rotation through AudbBridge.
+**Note:** Tap and swipe automatically handle screen rotation through AudbBridge. QEMU
+emulator coordinates use the actual screenshot pixel size saved by `audb screenshot`.
 
 ### Screenshots
 

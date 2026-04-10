@@ -18,6 +18,8 @@ const BRIDGE_OBJECT_PATH: &str = "/ru/kotdath/AudbBridge";
 const BRIDGE_INTERFACE: &str = "ru.kotdath.AudbBridge";
 const BRIDGE_SESSION_ENV: &str =
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/dbus/user_bus_socket";
+const KEYBOARD_PASTE_TAP_HOLD_MS: u32 = 160;
+const KEYBOARD_PORTRAIT_ROWS_WITH_HANDLER: f64 = 5.0;
 
 /// Get the path to the Unix socket
 pub fn socket_path() -> PathBuf {
@@ -404,6 +406,61 @@ async fn process_command(
                 }
             }
         }
+
+        Command::ClipboardSet { device, text } => {
+            match execute_clipboard_set(pool, &device, &text).await {
+                Ok(output) => CommandResult::Success {
+                    output: CommandOutput::Lines(output),
+                },
+                Err(e) => {
+                    let kind = if e.to_string().contains("not found") {
+                        audb_protocol::ErrorKind::DeviceNotFound
+                    } else {
+                        audb_protocol::ErrorKind::CommandFailed
+                    };
+                    CommandResult::Error {
+                        message: e.to_string(),
+                        kind,
+                    }
+                }
+            }
+        }
+
+        Command::ClipboardPaste { device, text } => {
+            match execute_clipboard_paste(pool, emulator_manager, &device, &text).await {
+                Ok(output) => CommandResult::Success {
+                    output: CommandOutput::Lines(output),
+                },
+                Err(e) => {
+                    let kind = if e.to_string().contains("not found") {
+                        audb_protocol::ErrorKind::DeviceNotFound
+                    } else {
+                        audb_protocol::ErrorKind::CommandFailed
+                    };
+                    CommandResult::Error {
+                        message: e.to_string(),
+                        kind,
+                    }
+                }
+            }
+        }
+
+        Command::ClipboardGet { device } => match execute_clipboard_get(pool, &device).await {
+            Ok(output) => CommandResult::Success {
+                output: CommandOutput::Lines(output),
+            },
+            Err(e) => {
+                let kind = if e.to_string().contains("not found") {
+                    audb_protocol::ErrorKind::DeviceNotFound
+                } else {
+                    audb_protocol::ErrorKind::CommandFailed
+                };
+                CommandResult::Error {
+                    message: e.to_string(),
+                    kind,
+                }
+            }
+        },
 
         Command::Screenshot { device } => {
             match execute_screenshot(pool, emulator_manager, &device).await {
@@ -842,6 +899,71 @@ async fn execute_key(
     }
 }
 
+async fn execute_clipboard_set(
+    pool: &ConnectionPool,
+    device_ref: &str,
+    text: &str,
+) -> Result<Vec<String>> {
+    let device = resolve_device(pool, device_ref).await?;
+    let command = build_bridge_clipboard_set_command(text);
+    info!(
+        "Setting clipboard text on device {} via AudbBridge",
+        device.display_name()
+    );
+    let output = pool.execute_command(&device.id, &command, false).await?;
+
+    if output.iter().any(|line| line.contains("(true,)")) {
+        Ok(vec!["clipboard text set via AudbBridge".to_string()])
+    } else {
+        Ok(output)
+    }
+}
+
+async fn execute_clipboard_paste(
+    pool: &ConnectionPool,
+    emulator_manager: &EmulatorManager,
+    device_ref: &str,
+    text: &str,
+) -> Result<Vec<String>> {
+    let device = resolve_device(pool, device_ref).await?;
+    let command = build_bridge_clipboard_set_command(text);
+    info!(
+        "Setting clipboard text on device {} via AudbBridge before paste",
+        device.display_name()
+    );
+    let output = pool.execute_command(&device.id, &command, false).await?;
+    if !output.iter().any(|line| line.contains("(true,)")) {
+        return Ok(output);
+    }
+
+    let mut result = vec!["clipboard text set via AudbBridge".to_string()];
+    if device.kind == DeviceKind::QemuEmulator {
+        result.extend(emulator_manager.paste_clipboard(&device, pool).await?);
+    } else {
+        let (width, height) = query_display_size(pool, &device.id).await?;
+        let keyboard_height = query_keyboard_height(pool, &device.id).await?;
+        let (x, y) = clipboard_button_center(width, height, keyboard_height)?;
+        let tap_command = build_bridge_tap_command(x, y, None, Some(KEYBOARD_PASTE_TAP_HOLD_MS));
+        pool.execute_command(&device.id, &tap_command, false)
+            .await?;
+        result.push(format!(
+            "clipboard button tapped at ({}, {}) via AudbBridge",
+            x, y
+        ));
+    }
+    Ok(result)
+}
+
+async fn execute_clipboard_get(pool: &ConnectionPool, device_ref: &str) -> Result<Vec<String>> {
+    let device = resolve_device(pool, device_ref).await?;
+    let command = build_bridge_clipboard_get_command();
+    info!(
+        "Reading clipboard text on device {} via AudbBridge",
+        device.display_name()
+    );
+    pool.execute_command(&device.id, &command, false).await
+}
+
 /// Execute Screenshot command
 async fn execute_screenshot(
     pool: &ConnectionPool,
@@ -862,23 +984,13 @@ async fn execute_screenshot(
         timestamp
     );
 
-    // Execute D-Bus screenshot command (needs root)
-    let dbus_command = format!(
-        "dbus-send --session --print-reply \
-         --dest=org.nemomobile.lipstick \
-         /org/nemomobile/lipstick/screenshot \
-         org.nemomobile.lipstick.saveScreenshot \
-         string:\"{}\"",
-        remote_filename
-    );
-
-    pool.execute_command(&device.id, &dbus_command, true)
+    let screenshot_command = build_bridge_screenshot_command(&remote_filename);
+    pool.execute_command(&device.id, &screenshot_command, false)
         .await?;
 
-    // Read screenshot file as base64 (needs root)
     let read_command = format!("base64 {}", remote_filename);
     let base64_lines = pool
-        .execute_command(&device.id, &read_command, true)
+        .execute_command(&device.id, &read_command, false)
         .await?;
     let base64_data = base64_lines.join("").replace(['\n', '\r'], "");
 
@@ -890,7 +1002,7 @@ async fn execute_screenshot(
 
     // Cleanup remote file
     let cleanup_cmd = format!("rm -f {}", remote_filename);
-    pool.execute_command(&device.id, &cleanup_cmd, true)
+    pool.execute_command(&device.id, &cleanup_cmd, false)
         .await
         .ok();
 
@@ -1093,6 +1205,18 @@ fn build_bridge_key_command(key_name: &str) -> String {
     build_bridge_command("Key", &[key_name.to_string()])
 }
 
+fn build_bridge_clipboard_set_command(text: &str) -> String {
+    build_bridge_command("SetClipboardText", &[text.to_string()])
+}
+
+fn build_bridge_clipboard_get_command() -> String {
+    build_bridge_command("GetClipboardText", &[])
+}
+
+fn build_bridge_screenshot_command(output_path: &str) -> String {
+    build_bridge_command("Screenshot", &[output_path.to_string()])
+}
+
 fn build_bridge_command(method: &str, arguments: &[String]) -> String {
     let mut parts = vec![
         BRIDGE_SESSION_ENV.to_string(),
@@ -1166,6 +1290,118 @@ fn escape_single_quote(s: &str) -> String {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", escape_single_quote(s))
+}
+
+async fn query_display_size(pool: &ConnectionPool, device_id: &str) -> Result<(u16, u16)> {
+    let screen_grab_output = pool
+        .execute_command(
+            device_id,
+            "dbus-send --session --print-reply --dest=ru.auroraos.ScreenGrab1.Backend /ru/auroraos/ScreenGrab1/Backend ru.auroraos.ScreenGrab1.Backend.GetScreenInfo",
+            false,
+        )
+        .await
+        .unwrap_or_default()
+        .join(" ");
+
+    if let Some(size) = parse_dimensions_from_text(&screen_grab_output) {
+        return Ok(size);
+    }
+
+    let resolution_output = pool
+        .execute_command(
+            device_id,
+            "gdbus call --system --dest ru.omp.deviceinfo --object-path /ru/omp/deviceinfo/Features --method ru.omp.deviceinfo.Features.getScreenResolution",
+            false,
+        )
+        .await?;
+    let resolution_text = resolution_output.join(" ");
+    parse_dimensions_from_text(&resolution_text)
+        .ok_or_else(|| anyhow!("failed to resolve display size from {}", resolution_text))
+}
+
+async fn query_keyboard_height(pool: &ConnectionPool, device_id: &str) -> Result<f64> {
+    let output = pool
+        .execute_command(
+            device_id,
+            "gdbus call --session --dest org.maliit.server --object-path /com/jolla/keyboard --method org.freedesktop.DBus.Properties.Get com.jolla.keyboard keyboardHeight",
+            false,
+        )
+        .await?;
+    let text = output.join(" ");
+    parse_first_float(&text).ok_or_else(|| anyhow!("failed to parse keyboard height from {}", text))
+}
+
+fn clipboard_button_center(width: u16, height: u16, keyboard_height: f64) -> Result<(u16, u16)> {
+    if keyboard_height <= 0.0 {
+        return Err(anyhow!(
+            "keyboard height is zero; focus a text field and open the keyboard before paste"
+        ));
+    }
+
+    let keyboard_height = keyboard_height.min(height as f64);
+    let key_height = keyboard_height / KEYBOARD_PORTRAIT_ROWS_WITH_HANDLER;
+    let x = (key_height / 2.0).round().clamp(0.0, (width - 1) as f64) as u16;
+    let y = ((height as f64 - keyboard_height) + key_height / 2.0)
+        .round()
+        .clamp(0.0, (height - 1) as f64) as u16;
+
+    Ok((x, y))
+}
+
+fn parse_dimensions_from_text(text: &str) -> Option<(u16, u16)> {
+    let int32_values: Vec<u16> = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter_map(|window| match window {
+            ["int32", value] => value.parse::<u16>().ok(),
+            _ => None,
+        })
+        .collect();
+    if let [width, height, ..] = int32_values.as_slice() {
+        if *width >= 100 && *height >= 100 {
+            return Some((*width, *height));
+        }
+    }
+
+    for token in text.split(|c: char| c.is_whitespace() || ",;()[]{}<>\"'".contains(c)) {
+        if let Some((width, height)) = token.split_once('x') {
+            if let (Ok(width), Ok(height)) = (width.parse::<u16>(), height.parse::<u16>()) {
+                if width >= 100 && height >= 100 {
+                    return Some((width, height));
+                }
+            }
+        }
+    }
+
+    let mut ints = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u16>() {
+                ints.push(value);
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        if let Ok(value) = current.parse::<u16>() {
+            ints.push(value);
+        }
+    }
+
+    ints.windows(2).find_map(|pair| match pair {
+        [width, height] if *width >= 100 && *height >= 100 => Some((*width, *height)),
+        _ => None,
+    })
+}
+
+fn parse_first_float(text: &str) -> Option<f64> {
+    text.split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+        .filter(|part| !part.is_empty())
+        .find_map(|part| part.parse::<f64>().ok())
 }
 
 /// Execute Uninstall command
