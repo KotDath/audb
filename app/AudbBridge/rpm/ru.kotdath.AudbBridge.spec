@@ -12,6 +12,8 @@ BuildRequires:  pkgconfig(Qt5Core)
 BuildRequires:  pkgconfig(Qt5DBus)
 BuildRequires:  pkgconfig(Qt5Qml)
 BuildRequires:  pkgconfig(Qt5Quick)
+BuildRequires:  pkgconfig(streamcamera)
+BuildRequires:  pkgconfig(streamcamera-qt5)
 
 %description
 AudbBridge for audb tap/swipe/other actions. 

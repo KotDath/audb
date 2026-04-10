@@ -52,7 +52,7 @@ impl OutputLevel {
 ///
 /// # Example
 /// ```
-/// use audb::tools::macros::{print_msg, OutputLevel};
+/// use audb_core::tools::macros::{print_msg, OutputLevel};
 ///
 /// print_msg(OutputLevel::Info, "Starting operation");
 /// print_msg(OutputLevel::Success, &format!("Completed {} items", 42));

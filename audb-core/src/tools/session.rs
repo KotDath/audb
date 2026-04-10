@@ -2,12 +2,7 @@
 ///
 /// This module provides a high-level interface for connecting to and executing
 /// commands on Aurora OS devices, eliminating code duplication across features.
-
-use crate::tools::{
-    errors::DeviceError,
-    ssh::SshClient,
-    types::Device,
-};
+use crate::tools::{errors::DeviceError, ssh::SshClient, types::Device};
 use anyhow::{Context, Result};
 use russh::client::Handle;
 use std::path::Path;
@@ -19,12 +14,12 @@ use std::path::Path;
 ///
 /// # Example
 /// ```no_run
-/// use audb::tools::session::DeviceSession;
-/// use audb::tools::types::Device;
+/// use audb_core::tools::session::DeviceSession;
+/// use audb_core::tools::types::Device;
 ///
-/// # async fn example(device: Device) -> anyhow::Result<()> {
-/// let mut session = DeviceSession::connect(&device).await?;
-/// let output = session.exec("uname -a").await?;
+/// # fn example(device: Device) -> anyhow::Result<()> {
+/// let mut session = DeviceSession::connect(&device)?;
+/// let output = session.exec("uname -a")?;
 /// println!("System info: {:?}", output);
 /// # Ok(())
 /// # }
@@ -109,14 +104,13 @@ impl DeviceSession {
     /// # Errors
     /// Returns an error if file upload fails
     pub fn upload_file(&mut self, local_path: &Path, remote_path: &Path) -> Result<()> {
-        SshClient::upload(&mut self.session, local_path, remote_path)
-            .with_context(|| {
-                format!(
-                    "Failed to upload {} to {}",
-                    local_path.display(),
-                    remote_path.display()
-                )
-            })
+        SshClient::upload(&mut self.session, local_path, remote_path).with_context(|| {
+            format!(
+                "Failed to upload {} to {}",
+                local_path.display(),
+                remote_path.display()
+            )
+        })
     }
 
     /// Read remote file contents as base64 string

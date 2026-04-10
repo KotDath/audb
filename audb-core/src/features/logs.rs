@@ -34,14 +34,14 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    let mut session = DeviceSession::connect(&device)
-        .context("Failed to connect to device")?;
+    let mut session = DeviceSession::connect(&device).context("Failed to connect to device")?;
 
     // Build and execute journalctl command
     let command = build_journalctl_command(&args)?;
     print_info(format!("Retrieving logs from {}...", device.display_name()));
 
-    let output = session.exec_as_root(&command)
+    let output = session
+        .exec_as_root(&command)
         .context("Failed to retrieve logs. Root access required.")?;
 
     // Print logs
@@ -69,13 +69,9 @@ async fn execute_clear_logs(force: bool) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    let mut session = DeviceSession::connect(&device)
-        .context("Failed to connect to device")?;
+    let mut session = DeviceSession::connect(&device).context("Failed to connect to device")?;
 
-    print_info(format!(
-        "Clearing logs on {}...",
-        device.display_name()
-    ));
+    print_info(format!("Clearing logs on {}...", device.display_name()));
 
     let command = "journalctl --rotate && journalctl --vacuum-time=1s";
     session
@@ -97,9 +93,7 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
 
     // Validate that kernel and unit are mutually exclusive
     if args.kernel && args.unit.is_some() {
-        return Err(anyhow!(
-            "Cannot specify both --kernel and --unit"
-        ));
+        return Err(anyhow!("Cannot specify both --kernel and --unit"));
     }
 
     Ok(())

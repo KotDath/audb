@@ -11,7 +11,7 @@
 ///
 /// # Example
 /// ```
-/// use audb::tools::shell_escape::escape_single_quote;
+/// use audb_core::tools::shell_escape::escape_single_quote;
 ///
 /// let password = "my'password";
 /// let escaped = escape_single_quote(password);

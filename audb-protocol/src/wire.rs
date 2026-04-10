@@ -45,8 +45,7 @@ pub async fn recv_message<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Command, Request, Response, CommandResult, CommandOutput};
-    use tokio::io::DuplexStream;
+    use crate::types::{Command, CommandOutput, CommandResult, Request, Response};
 
     #[tokio::test]
     async fn test_send_recv_request() {

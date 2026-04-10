@@ -6,6 +6,8 @@ find_package (Qt5 COMPONENTS Core DBus Network Qml Gui Quick LinguistTools REQUI
 include(FindPkgConfig)
 pkg_search_module(AURORA auroraapp REQUIRED)
 pkg_search_module(AURORA auroraapp_i18n REQUIRED)
+pkg_check_modules(STREAMCAMERA QUIET IMPORTED_TARGET streamcamera)
+pkg_check_modules(STREAMCAMERA_QT5 QUIET IMPORTED_TARGET streamcamera-qt5)
 
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -36,6 +38,11 @@ add_executable(${PROJECT_NAME} ${SOURCES} ${QmFiles})
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     $<$<OR:$<CONFIG:Debug>,$<CONFIG:RelWithDebInfo>>:QT_QML_DEBUG>
 )
+
+if (STREAMCAMERA_FOUND)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE AUDB_HAS_STREAMCAMERA=1)
+endif()
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     $<BUILD_INTERFACE:
     ${AURORA_INCLUDE_DIRS}
@@ -45,6 +52,14 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt5::Quick
     ${AURORA_LDFLAGS}
 )
+
+if (STREAMCAMERA_FOUND)
+    target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::STREAMCAMERA)
+endif()
+
+if (STREAMCAMERA_QT5_FOUND)
+    target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::STREAMCAMERA_QT5)
+endif()
 
 install(TARGETS ${PROJECT_NAME}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}

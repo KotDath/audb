@@ -49,6 +49,9 @@ constexpr double kEdgeEndX = 0.35;
 constexpr double kEdgeEndY = 0.30;
 constexpr double kSwipeCenterX = 0.50;
 constexpr double kSwipeCenterY = 0.50;
+constexpr double kScrollStartY = 0.78;
+constexpr double kScrollEndY = 0.22;
+constexpr double kLongEdgeEndY = 0.06;
 
 struct TouchConfig
 {
@@ -411,6 +414,10 @@ QRect gestureRectForDirection(const QString &direction, int orientation, const T
     const int rightInner = static_cast<int>(std::lround(width * (1.0 - kEdgeEndX)));
     const int topInner = static_cast<int>(std::lround(height * kEdgeEndY));
     const int bottomInner = static_cast<int>(std::lround(height * (1.0 - kEdgeEndY)));
+    const int scrollTop = static_cast<int>(std::lround(height * kScrollEndY));
+    const int scrollBottom = static_cast<int>(std::lround(height * kScrollStartY));
+    const int longTopInner = static_cast<int>(std::lround(height * kLongEdgeEndY));
+    const int longBottomInner = static_cast<int>(std::lround(height * (1.0 - kLongEdgeEndY)));
 
     if (direction == QStringLiteral("lr")) {
         return QRect(leftEdge, centerY, leftInner - leftEdge, 0);
@@ -419,9 +426,15 @@ QRect gestureRectForDirection(const QString &direction, int orientation, const T
         return QRect(rightEdge, centerY, rightInner - rightEdge, 0);
     }
     if (direction == QStringLiteral("du")) {
-        return QRect(centerX, bottomEdge, 0, topInner - bottomEdge);
+        return QRect(centerX, scrollBottom, 0, scrollTop - scrollBottom);
     }
-    return QRect(centerX, topEdge, 0, bottomInner - topEdge);
+    if (direction == QStringLiteral("ud")) {
+        return QRect(centerX, scrollTop, 0, scrollBottom - scrollTop);
+    }
+    if (direction == QStringLiteral("longdu")) {
+        return QRect(centerX, bottomEdge, 0, longTopInner - bottomEdge);
+    }
+    return QRect(centerX, topEdge, 0, longBottomInner - topEdge);
 }
 
 bool runSystemShell(const QString &command, QTextStream &err)
@@ -639,7 +652,7 @@ void addCommonOptions(QCommandLineParser &parser)
     parser.addOption({QStringLiteral("y1"), QStringLiteral("Swipe start Y."), QStringLiteral("y1"), QStringLiteral("0")});
     parser.addOption({QStringLiteral("x2"), QStringLiteral("Swipe end X."), QStringLiteral("x2"), QStringLiteral("0")});
     parser.addOption({QStringLiteral("y2"), QStringLiteral("Swipe end Y."), QStringLiteral("y2"), QStringLiteral("0")});
-    parser.addOption({QStringLiteral("direction"), QStringLiteral("Swipe direction: lr, rl, du, ud."), QStringLiteral("direction")});
+    parser.addOption({QStringLiteral("direction"), QStringLiteral("Swipe direction: lr, rl, du, ud, longdu, longud."), QStringLiteral("direction")});
     parser.addOption({QStringLiteral("event-device"), QStringLiteral("Direct event device path or auto."), QStringLiteral("path")});
     parser.addOption({QStringLiteral("duration-ms"), QStringLiteral("Tap duration in milliseconds."), QStringLiteral("ms"), QString::number(kDefaultDownMs)});
     parser.addOption({QStringLiteral("steps"), QStringLiteral("Swipe move step count."), QStringLiteral("count"), QString::number(kDefaultSwipeSteps)});

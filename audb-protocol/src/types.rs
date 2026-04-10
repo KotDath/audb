@@ -47,6 +47,12 @@ pub enum Command {
         mode: SwipeMode,
         /// Optional: direct evdev device path for fast mode
         event_device: Option<String>,
+        /// Optional: explicit number of movement frames
+        steps: Option<u32>,
+        /// Optional: total gesture duration
+        duration_ms: Option<u32>,
+        /// Optional: time to hold the finger before movement
+        hold_ms: Option<u32>,
     },
     /// Send key event (back, home, power, volume, etc.)
     Key {
@@ -63,7 +69,10 @@ pub enum Command {
     /// Retrieve device logs
     Logs { device: String, args: LogsArgs },
     /// Uninstall package from device
-    Uninstall { device: String, package_name: String },
+    Uninstall {
+        device: String,
+        package_name: String,
+    },
     /// List installed packages on device
     Packages {
         device: String,
@@ -79,10 +88,7 @@ pub enum Command {
         data: Vec<u8>,
     },
     /// Pull file from device
-    Pull {
-        device: String,
-        remote_path: String,
-    },
+    Pull { device: String, remote_path: String },
     /// Get device information
     Info {
         device: String,
@@ -95,6 +101,12 @@ pub enum Command {
     KillServer,
     /// Force reconnection to device(s)
     Reconnect { device: Option<String> },
+    /// Start emulator runtime
+    EmulatorStart { device: Option<String> },
+    /// Stop emulator runtime
+    EmulatorStop { device: Option<String> },
+    /// Show emulator runtime status
+    EmulatorStatus { device: Option<String> },
     /// Open URL on device (browser, file, etc.)
     Open {
         device: String,
@@ -117,6 +129,8 @@ pub enum SwipeDirection {
     Right,
     Up,
     Down,
+    LongUp,
+    LongDown,
 }
 
 /// Log retrieval arguments
@@ -146,6 +160,7 @@ pub enum CommandOutput {
     Binary(Vec<u8>),
     Status(ServerStatus),
     DeviceInfo(DeviceInfo),
+    EmulatorStatus(EmulatorStatus),
     Unit,
 }
 
@@ -187,20 +202,83 @@ pub struct ServerStatus {
 /// Device connection status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceStatus {
+    pub id: String,
     pub name: Option<String>,
     pub host: String,
     pub port: u16,
+    pub arch: DeviceArchInfo,
+    pub kind: DeviceKindInfo,
     pub state: ConnectionStateInfo,
     pub stats: ConnectionStats,
+    pub emulator: Option<EmulatorStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceArchInfo {
+    AuroraArm,
+    AuroraArm64,
+    AuroraX86_64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceKindInfo {
+    Physical,
+    QemuEmulator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmulatorStatus {
+    pub lifecycle: EmulatorLifecycleStateInfo,
+    pub ssh_ready: bool,
+    pub qmp_ready: bool,
+    pub qmp_input_ready: bool,
+    pub qmp_screendump_ready: bool,
+    pub geometry: Option<DisplayGeometryInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayGeometryInfo {
+    pub native_width: u32,
+    pub native_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub orientation: ScreenOrientationInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenOrientationInfo {
+    Portrait,
+    Landscape,
+    InvertedPortrait,
+    InvertedLandscape,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmulatorLifecycleStateInfo {
+    Stopped,
+    Starting,
+    Running,
+    Errored,
 }
 
 /// Connection state information for reporting
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConnectionStateInfo {
     Disconnected,
-    Connecting { attempt: u32 },
-    Connected { duration_secs: u64 },
-    Errored { error: String, retry_in_secs: Option<u64> },
+    Connecting {
+        attempt: u32,
+    },
+    Connected {
+        duration_secs: u64,
+    },
+    Errored {
+        error: String,
+        retry_in_secs: Option<u64>,
+    },
     Disabled,
 }
 

@@ -7,7 +7,7 @@ Name=AudbBridge
 Name[ru]=AudbBridge
 
 [X-Application]
-Permissions=
+Permissions=ScreenCapture
 Sandboxing=Disabled
 OrganizationName=ru.kotdath
 ApplicationName=AudbBridge

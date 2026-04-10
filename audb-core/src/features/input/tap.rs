@@ -5,17 +5,17 @@
 
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::features::input::scripts::ScriptManager;
-use crate::tools::{
-    macros::print_info,
-    session::DeviceSession,
-    types::DeviceIdentifier,
-};
+use crate::tools::{macros::print_info, session::DeviceSession, types::DeviceIdentifier};
 use anyhow::{anyhow, Context, Result};
 
 pub async fn execute(x: u16, y: u16) -> Result<()> {
     // Validate coordinates
     if x > 4096 || y > 4096 {
-        return Err(anyhow!("Coordinates out of range: ({}, {}). Max: 4096x4096", x, y));
+        return Err(anyhow!(
+            "Coordinates out of range: ({}, {}). Max: 4096x4096",
+            x,
+            y
+        ));
     }
 
     // Get device and establish session
@@ -23,11 +23,15 @@ pub async fn execute(x: u16, y: u16) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    print_info(format!("Tapping at ({}, {}) on device {}", x, y, device.display_name()));
+    print_info(format!(
+        "Tapping at ({}, {}) on device {}",
+        x,
+        y,
+        device.display_name()
+    ));
     print_info(format!("Connecting to {}:{}...", device.host, device.port));
 
-    let mut session = DeviceSession::connect(&device)
-        .context("Failed to connect to device")?;
+    let mut session = DeviceSession::connect(&device).context("Failed to connect to device")?;
 
     // Ensure tap script is present on device
     ScriptManager::ensure_tap_script_with_session(&mut session)?;
@@ -38,8 +42,11 @@ pub async fn execute(x: u16, y: u16) -> Result<()> {
 
     print_info("Executing tap with devel-su...");
 
-    let output = session.exec_as_root(&tap_command)
-        .context("Tap requires root access. Set root password using: audb device add")?;
+    let output = session
+        .exec_as_root(&tap_command)
+        .context(
+            "Tap requires root access. Configure or update the cached password with: audb device set-root-password --new-password <value>",
+        )?;
 
     // Display output
     for line in &output {

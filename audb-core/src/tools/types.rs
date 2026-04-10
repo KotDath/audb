@@ -1,22 +1,26 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
+    pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
     pub auth: String,
-    /// Root password for devel-su (stored for potential future use)
-    /// NOTE: Root automation is not yet implemented - see ssh.rs::exec_as_devel_su
+    /// Cached current devel-su password used for root-capable commands
     #[serde(default = "default_root_password")]
     pub root_password: String,
-    pub platform: Platform,
+    pub arch: DeviceArch,
+    pub kind: DeviceKind,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emulator: Option<QemuEmulatorConfig>,
 }
 
 fn default_port() -> u16 {
@@ -33,24 +37,65 @@ fn default_root_password() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Platform {
+pub enum DeviceArch {
     AuroraArm,
     AuroraArm64,
+    AuroraX86_64,
 }
 
-impl std::fmt::Display for Platform {
+impl std::fmt::Display for DeviceArch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Platform::AuroraArm => write!(f, "aurora-arm"),
-            Platform::AuroraArm64 => write!(f, "aurora-arm64"),
+            DeviceArch::AuroraArm => write!(f, "aurora-arm"),
+            DeviceArch::AuroraArm64 => write!(f, "aurora-arm64"),
+            DeviceArch::AuroraX86_64 => write!(f, "aurora-x86_64"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeviceKind {
+    Physical,
+    QemuEmulator,
+}
+
+impl std::fmt::Display for DeviceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceKind::Physical => write!(f, "physical"),
+            DeviceKind::QemuEmulator => write!(f, "qemu-emulator"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QemuEmulatorConfig {
+    pub sdk_root: String,
+    pub release: String,
+    pub base_image: String,
+    pub overlay_image: String,
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub ssh_key: String,
+    pub qmp_socket: String,
+    pub pidfile: String,
+    pub vm_name: String,
+    pub mac: String,
+    pub memory_mb: u32,
+    pub cpus: u32,
+    pub framebuffer_width: u32,
+    pub framebuffer_height: u32,
+    pub abs_max: u32,
+    pub display_profile: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DevicesConfig {
-    pub aurora_devices: Vec<Device>,
+    pub schema_version: u32,
+    pub devices: Vec<Device>,
 }
 
 pub enum DeviceIdentifier {
@@ -78,9 +123,29 @@ impl Device {
         self.name.clone().unwrap_or_else(|| self.host.clone())
     }
 
+    pub fn is_emulator(&self) -> bool {
+        self.kind == DeviceKind::QemuEmulator
+    }
+
     pub fn auth_path(&self) -> PathBuf {
         PathBuf::from(shellexpand::tilde(&self.auth).to_string())
     }
+
+    pub fn emulator_config(&self) -> Option<&QemuEmulatorConfig> {
+        self.emulator.as_ref()
+    }
+}
+
+pub fn generate_device_id(kind: &DeviceKind) -> String {
+    let prefix = match kind {
+        DeviceKind::Physical => "physical",
+        DeviceKind::QemuEmulator => "emulator",
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{:x}", prefix, now)
 }
 
 /// Log level for journalctl filtering (Android/iOS style + journalctl native)

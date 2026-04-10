@@ -1,7 +1,7 @@
 use crate::features::config::device_store::DeviceStore;
 use crate::tools::macros::print_info;
 use crate::tools::ssh::SshClient;
-use crate::tools::types::{Device, Platform};
+use crate::tools::types::{generate_device_id, Device, DeviceArch, DeviceKind};
 use crate::tools::validation::{validate_ip_address, validate_port, validate_ssh_key_exists};
 use anyhow::{anyhow, Result};
 use dialoguer::{Confirm, Input, Password, Select};
@@ -71,26 +71,29 @@ pub async fn execute() -> Result<()> {
     // Platform selection
     let platforms = vec!["aurora-arm", "aurora-arm64"];
     let selection = Select::new()
-        .with_prompt("Platform")
+        .with_prompt("Architecture")
         .items(&platforms)
         .default(0)
         .interact()?;
 
-    let platform = match selection {
-        0 => Platform::AuroraArm,
-        1 => Platform::AuroraArm64,
-        _ => return Err(anyhow!("Invalid platform selection")),
+    let arch = match selection {
+        0 => DeviceArch::AuroraArm,
+        1 => DeviceArch::AuroraArm64,
+        _ => return Err(anyhow!("Invalid architecture selection")),
     };
 
     // Create device
     let device = Device {
+        id: generate_device_id(&DeviceKind::Physical),
         name,
         host: host.clone(),
         port,
         auth: auth.clone(),
         root_password: root_password.clone(),
-        platform,
+        arch,
+        kind: DeviceKind::Physical,
         enabled: true,
+        emulator: None,
     };
 
     // Test defaultuser SSH connection

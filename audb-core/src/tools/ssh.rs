@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use russh::client::Handle;
 use russh::client::{self};
 use russh::keys::ssh_key;
@@ -6,13 +7,12 @@ use russh::{ChannelMsg, Preferred};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use std::borrow::Cow;
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use anyhow::{anyhow, Result};
 
 use crate::tools::shell_escape::escape_single_quote;
 
@@ -23,26 +23,22 @@ pub struct SshClient {}
 impl client::Handler for SshClient {
     type Error = russh::Error;
 
-    async fn check_server_key(&mut self, _server_public_key: &ssh_key::PublicKey) -> Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
         Ok(true)
     }
 }
 
 impl SshClient {
-    pub fn connect(
-        host: &str,
-        port: u16,
-        key_path: &Path,
-    ) -> Result<Handle<SshClient>> {
+    pub fn connect(host: &str, port: u16, key_path: &Path) -> Result<Handle<SshClient>> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::_connect(host, port, key_path))
         })
     }
 
-    pub fn exec(
-        session: &mut Handle<SshClient>,
-        command: &str,
-    ) -> Result<Vec<String>> {
+    pub fn exec(session: &mut Handle<SshClient>, command: &str) -> Result<Vec<String>> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(Self::_exec(session, command))
         })
@@ -63,7 +59,7 @@ impl SshClient {
     ) -> Result<Vec<String>> {
         if password.is_empty() {
             return Err(anyhow!(
-                "Root password not configured. Use 'audb device add' to set the root password."
+                "Root password not configured. Set device.rootPassword in config or use 'audb device set-root-password --new-password <value>' once a valid current password is cached."
             ));
         }
 
@@ -104,7 +100,11 @@ impl SshClient {
         remote_path: &Path,
     ) -> Result<()> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::_upload(session, local_path, remote_path))
+            tokio::runtime::Handle::current().block_on(Self::_upload(
+                session,
+                local_path,
+                remote_path,
+            ))
         })
     }
 
@@ -114,28 +114,22 @@ impl SshClient {
         local_path: &Path,
     ) -> Result<()> {
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(Self::_download(session, remote_path, local_path))
+            tokio::runtime::Handle::current().block_on(Self::_download(
+                session,
+                remote_path,
+                local_path,
+            ))
         })
     }
 
-    pub fn test_connection(
-        host: &str,
-        port: u16,
-        key_path: &Path,
-    ) -> bool {
+    pub fn test_connection(host: &str, port: u16, key_path: &Path) -> bool {
         match Self::connect(host, port, key_path) {
-            Ok(mut session) => {
-                Self::exec(&mut session, "echo test").is_ok()
-            }
+            Ok(mut session) => Self::exec(&mut session, "echo test").is_ok(),
             Err(_) => false,
         }
     }
 
-    async fn _connect(
-        host: &str,
-        port: u16,
-        key_path: &Path,
-    ) -> Result<Handle<SshClient>> {
+    async fn _connect(host: &str, port: u16, key_path: &Path) -> Result<Handle<SshClient>> {
         Self::_connect_with_user(DEFAULT_USER, host, port, key_path).await
     }
 
@@ -160,13 +154,18 @@ impl SshClient {
         };
         let config = Arc::new(config);
         let sh = SshClient {};
-        let mut session = match tokio::time::timeout(timeout_connect, client::connect(config, (host, port), sh)).await?
-        {
-            Ok(session) => session,
-            Err(err) => return Err(anyhow!("Connection error: {}", err)),
-        };
+        let mut session =
+            match tokio::time::timeout(timeout_connect, client::connect(config, (host, port), sh))
+                .await?
+            {
+                Ok(session) => session,
+                Err(err) => return Err(anyhow!("Connection error: {}", err)),
+            };
         let secret_key = Arc::new(russh::keys::load_secret_key(key_path, None)?);
-        let key_pair = PrivateKeyWithHashAlg::new(secret_key, session.best_supported_rsa_hash().await?.flatten());
+        let key_pair = PrivateKeyWithHashAlg::new(
+            secret_key,
+            session.best_supported_rsa_hash().await?.flatten(),
+        );
         let result = session.authenticate_publickey(user, key_pair).await?;
         if !result.success() {
             return Err(anyhow!("Failed to authenticate via SSH as {}", user));
@@ -174,10 +173,7 @@ impl SshClient {
         Ok(session)
     }
 
-    async fn _exec(
-        session: &mut Handle<SshClient>,
-        command: &str,
-    ) -> Result<Vec<String>> {
+    async fn _exec(session: &mut Handle<SshClient>, command: &str) -> Result<Vec<String>> {
         let mut code = None;
         let mut stdout: Vec<String> = vec![];
         let mut stderr: Vec<String> = vec![];
@@ -193,7 +189,7 @@ impl SshClient {
                         Ok(out_line) => {
                             let line = out_line.trim().to_string();
                             stdout.push(line)
-                        },
+                        }
                         Err(_) => return Err(anyhow!("Failed to process SSH connection data")),
                     };
                 }
@@ -204,7 +200,7 @@ impl SshClient {
                             Ok(err_line) => {
                                 let line = err_line.trim().to_string();
                                 stderr.push(line)
-                            },
+                            }
                             Err(_) => return Err(anyhow!("Failed to process SSH stderr data")),
                         };
                     }
@@ -256,7 +252,6 @@ impl SshClient {
         Ok(())
     }
 
-
     async fn _download(
         session: &mut Handle<SshClient>,
         remote_path: &Path,
@@ -265,17 +260,22 @@ impl SshClient {
         let sftp_session = Self::_sftp_session(session).await?;
 
         let mut sftp_file = sftp_session
-            .open_with_flags(
-                remote_path.to_string_lossy().to_string(),
-                OpenFlags::READ,
-            )
+            .open_with_flags(remote_path.to_string_lossy().to_string(), OpenFlags::READ)
             .await
-            .map_err(|e| anyhow!("Failed to open remote file {}: {}", remote_path.display(), e))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to open remote file {}: {}",
+                    remote_path.display(),
+                    e
+                )
+            })?;
 
         // Read file contents
         use tokio::io::AsyncReadExt;
         let mut data = Vec::new();
-        sftp_file.read_to_end(&mut data).await
+        sftp_file
+            .read_to_end(&mut data)
+            .await
             .map_err(|e| anyhow!("Failed to read remote file: {}", e))?;
 
         // Write to local file
@@ -287,7 +287,9 @@ impl SshClient {
 
     async fn _sftp_session(session: &mut Handle<SshClient>) -> Result<SftpSession> {
         let channel = session.channel_open_session().await?;
-        channel.request_subsystem(true, "sftp").await
+        channel
+            .request_subsystem(true, "sftp")
+            .await
             .map_err(|e| anyhow!("Failed to request SFTP subsystem: {}", e))?;
         Ok(SftpSession::new(channel.into_stream()).await?)
     }

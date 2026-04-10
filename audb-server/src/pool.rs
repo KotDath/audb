@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::connection::{ConnectionState, DeviceConnection};
@@ -13,10 +13,7 @@ use crate::connection::{ConnectionState, DeviceConnection};
 /// Types of operations that can be requested
 enum DeviceOperation {
     /// Execute a shell command
-    Command {
-        command: String,
-        as_root: bool,
-    },
+    Command { command: String, as_root: bool },
     /// Upload a file via SFTP
     Upload {
         local_path: std::path::PathBuf,
@@ -62,12 +59,12 @@ impl ConnectionPool {
 
     /// Add a device to the pool and start its command processor
     pub async fn add_device(&self, device: Device) {
-        let host = device.host.clone();
+        let device_id = device.id.clone();
 
         // Add to connections map
         {
             let mut connections = self.connections.lock().await;
-            connections.insert(host.clone(), DeviceConnection::new(device.clone()));
+            connections.insert(device_id.clone(), DeviceConnection::new(device.clone()));
         }
 
         // Create command queue for this device
@@ -75,26 +72,41 @@ impl ConnectionPool {
 
         {
             let mut queues = self.command_queues.lock().await;
-            queues.insert(host.clone(), tx);
+            queues.insert(device_id.clone(), tx);
         }
 
         // Spawn command processor task for this device
         let connections = Arc::clone(&self.connections);
         tokio::spawn(async move {
-            device_command_processor(host, device, rx, connections).await;
+            device_command_processor(device_id, device, rx, connections).await;
         });
+    }
+
+    pub async fn ensure_device(&self, device: Device) {
+        let exists = {
+            let mut connections = self.connections.lock().await;
+            if let Some(conn) = connections.get_mut(&device.id) {
+                conn.device = device.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if !exists {
+            self.add_device(device).await;
+        }
     }
 
     /// Execute a command on a device (queued execution)
     pub async fn execute_command(
         &self,
-        host: &str,
+        device_id: &str,
         command: &str,
         as_root: bool,
     ) -> Result<Vec<String>> {
         let result = self
             .send_operation(
-                host,
+                device_id,
                 DeviceOperation::Command {
                     command: command.to_string(),
                     as_root,
@@ -111,13 +123,13 @@ impl ConnectionPool {
     /// Upload a file to a device
     pub async fn upload_file(
         &self,
-        host: &str,
+        device_id: &str,
         local_path: &Path,
         remote_path: &Path,
     ) -> Result<()> {
         let result = self
             .send_operation(
-                host,
+                device_id,
                 DeviceOperation::Upload {
                     local_path: local_path.to_path_buf(),
                     remote_path: remote_path.to_path_buf(),
@@ -134,13 +146,13 @@ impl ConnectionPool {
     /// Download a file from a device
     pub async fn download_file(
         &self,
-        host: &str,
+        device_id: &str,
         remote_path: &Path,
         local_path: &Path,
     ) -> Result<()> {
         let result = self
             .send_operation(
-                host,
+                device_id,
                 DeviceOperation::Download {
                     remote_path: remote_path.to_path_buf(),
                     local_path: local_path.to_path_buf(),
@@ -157,16 +169,16 @@ impl ConnectionPool {
     /// Send an operation to a device's command queue
     async fn send_operation(
         &self,
-        host: &str,
+        device_id: &str,
         operation: DeviceOperation,
     ) -> Result<OperationResult> {
         // Get the command queue for this device
         let tx = {
             let queues = self.command_queues.lock().await;
             queues
-                .get(host)
+                .get(device_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("Device {} not found", host))?
+                .ok_or_else(|| anyhow!("Device {} not found", device_id))?
         };
 
         // Create oneshot channel for response
@@ -180,40 +192,50 @@ impl ConnectionPool {
 
         tx.send(request)
             .await
-            .map_err(|_| anyhow!("Device {} command queue closed", host))?;
+            .map_err(|_| anyhow!("Device {} command queue closed", device_id))?;
 
         // Wait for response
         response_rx
             .await
-            .map_err(|_| anyhow!("Device {} command processor died", host))?
+            .map_err(|_| anyhow!("Device {} command processor died", device_id))?
     }
 
     /// Get list of all devices
+    #[allow(dead_code)]
     pub async fn list_devices(&self) -> Vec<(String, ConnectionState)> {
         let connections = self.connections.lock().await;
         connections
             .iter()
-            .map(|(host, conn)| (host.clone(), conn.state.clone()))
+            .map(|(device_id, conn)| (device_id.clone(), conn.state.clone()))
             .collect()
     }
 
     /// Get device connection info
-    pub async fn get_device_info(&self, host: &str) -> Result<DeviceConnection> {
+    pub async fn get_device_info(&self, device_id: &str) -> Result<DeviceConnection> {
         let connections = self.connections.lock().await;
         connections
-            .get(host)
+            .get(device_id)
             .cloned()
-            .ok_or_else(|| anyhow!("Device {} not found", host))
+            .ok_or_else(|| anyhow!("Device {} not found", device_id))
     }
 
-    /// Get device by host
+    pub async fn reset_device(&self, device_id: &str) -> Result<()> {
+        let mut connections = self.connections.lock().await;
+        let conn = connections
+            .get_mut(device_id)
+            .ok_or_else(|| anyhow!("Device {} not found", device_id))?;
+        conn.state = ConnectionState::Disconnected;
+        conn.stats.last_error = None;
+        Ok(())
+    }
+
     #[allow(dead_code)]
-    pub async fn get_device(&self, host: &str) -> Result<Device> {
+    pub async fn get_device(&self, device_id: &str) -> Result<Device> {
         let connections = self.connections.lock().await;
         connections
-            .get(host)
+            .get(device_id)
             .map(|conn| conn.device.clone())
-            .ok_or_else(|| anyhow!("Device {} not found", host))
+            .ok_or_else(|| anyhow!("Device {} not found", device_id))
     }
 }
 
@@ -229,12 +251,12 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// Ensures commands to the same device execute serially
 /// Maintains a persistent SSH connection with auto-reconnect
 async fn device_command_processor(
-    host: String,
-    device: Device,
+    device_id: String,
+    initial_device: Device,
     mut rx: mpsc::Receiver<DeviceCommandRequest>,
     connections: Arc<Mutex<HashMap<String, DeviceConnection>>>,
 ) {
-    info!("Started command processor for device: {}", host);
+    info!("Started command processor for device: {}", device_id);
 
     // Persistent SSH session - stored here, not in DeviceConnection
     // because Handle<SshClient> is not Clone
@@ -244,21 +266,27 @@ async fn device_command_processor(
     let mut current_backoff_ms: u64 = INITIAL_BACKOFF_MS;
 
     while let Some(request) = rx.recv().await {
-        debug!("Processing operation for {}", host);
+        debug!("Processing operation for {}", device_id);
+        let device = current_device(&connections, &device_id)
+            .await
+            .unwrap_or_else(|| initial_device.clone());
 
         // Check if we need a health check (only if connected)
         if session.is_some() {
             if let Some(last_check) = last_health_check {
                 if last_check.elapsed() > HEALTH_CHECK_INTERVAL {
-                    debug!("Running health check for {}", host);
+                    debug!("Running health check for {}", device_id);
                     if let Some(ref mut sess) = session {
                         match SshClient::exec(sess, "echo 1") {
                             Ok(_) => {
-                                debug!("Health check passed for {}", host);
+                                debug!("Health check passed for {}", device_id);
                                 last_health_check = Some(Instant::now());
                             }
                             Err(e) => {
-                                warn!("Health check failed for {}: {}, will reconnect", host, e);
+                                warn!(
+                                    "Health check failed for {}: {}, will reconnect",
+                                    device_id, e
+                                );
                                 session = None;
                                 connected_since = None;
                             }
@@ -270,7 +298,7 @@ async fn device_command_processor(
 
         // Try to establish connection if not connected
         if session.is_none() {
-            let connect_result = establish_connection(&host, &device, &connections).await;
+            let connect_result = establish_connection(&device_id, &device, &connections).await;
             match connect_result {
                 Ok(sess) => {
                     session = Some(sess);
@@ -280,21 +308,21 @@ async fn device_command_processor(
 
                     // Update state to connected
                     let mut conns = connections.lock().await;
-                    if let Some(conn) = conns.get_mut(&host) {
+                    if let Some(conn) = conns.get_mut(&device_id) {
                         conn.state = ConnectionState::Connected {
                             since: connected_since.unwrap(),
                         };
                     }
-                    info!("Established persistent SSH connection to {}", host);
+                    info!("Established persistent SSH connection to {}", device_id);
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {}: {}", host, e);
+                    warn!("Failed to connect to {}: {}", device_id, e);
 
                     // Update state to errored with next retry time
                     let next_retry = Instant::now() + Duration::from_millis(current_backoff_ms);
                     {
                         let mut conns = connections.lock().await;
-                        if let Some(conn) = conns.get_mut(&host) {
+                        if let Some(conn) = conns.get_mut(&device_id) {
                             conn.state = ConnectionState::Errored {
                                 error: e.to_string(),
                                 next_retry: Some(next_retry),
@@ -326,7 +354,7 @@ async fn device_command_processor(
             Ok(_) => {
                 // Update stats
                 let mut conns = connections.lock().await;
-                if let Some(conn) = conns.get_mut(&host) {
+                if let Some(conn) = conns.get_mut(&device_id) {
                     conn.stats.successful_commands += 1;
                     if let Some(since) = connected_since {
                         conn.state = ConnectionState::Connected { since };
@@ -338,7 +366,7 @@ async fn device_command_processor(
 
                 // Update stats but don't disconnect - let health check handle real disconnections
                 let mut conns = connections.lock().await;
-                if let Some(conn) = conns.get_mut(&host) {
+                if let Some(conn) = conns.get_mut(&device_id) {
                     conn.stats.failed_commands += 1;
                     conn.stats.last_error = Some(error_str.clone());
                     // Keep state as connected - health check will detect real disconnections
@@ -348,23 +376,23 @@ async fn device_command_processor(
 
         // Send response back
         if request.response_tx.send(result).is_err() {
-            warn!("Command response channel closed for {}", host);
+            warn!("Command response channel closed for {}", device_id);
         }
     }
 
-    info!("Command processor stopped for device: {}", host);
+    info!("Command processor stopped for device: {}", device_id);
 }
 
 /// Establish a new SSH connection to a device
 async fn establish_connection(
-    host: &str,
+    device_id: &str,
     device: &Device,
     connections: &Arc<Mutex<HashMap<String, DeviceConnection>>>,
 ) -> Result<Handle<SshClient>> {
     // Update state to connecting
     {
         let mut conns = connections.lock().await;
-        if let Some(conn) = conns.get_mut(host) {
+        if let Some(conn) = conns.get_mut(device_id) {
             conn.state = ConnectionState::Connecting {
                 attempt: conn.stats.connect_attempts as u32 + 1,
                 next_retry: Instant::now(),
@@ -375,6 +403,14 @@ async fn establish_connection(
 
     // Establish SSH connection
     SshClient::connect(&device.host, device.port, &device.auth_path())
+}
+
+async fn current_device(
+    connections: &Arc<Mutex<HashMap<String, DeviceConnection>>>,
+    device_id: &str,
+) -> Option<Device> {
+    let connections = connections.lock().await;
+    connections.get(device_id).map(|conn| conn.device.clone())
 }
 
 /// Execute an operation on an existing SSH session

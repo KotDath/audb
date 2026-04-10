@@ -23,7 +23,11 @@ pub async fn execute(rpm_path: &str) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    print_info(format!("Installing {} on device {}", file_name, device.display_name()));
+    print_info(format!(
+        "Installing {} on device {}",
+        file_name,
+        device.display_name()
+    ));
 
     // Connect to device
     print_info(format!("Connecting to {}:{}...", device.host, device.port));
@@ -31,7 +35,11 @@ pub async fn execute(rpm_path: &str) -> Result<()> {
 
     // Upload RPM to Downloads directory (APM requires access to user's Downloads)
     let remote_path = PathBuf::from(format!("/home/defaultuser/Downloads/{}", file_name));
-    print_info(format!("Uploading {} to {}...", file_name, remote_path.display()));
+    print_info(format!(
+        "Uploading {} to {}...",
+        file_name,
+        remote_path.display()
+    ));
     SshClient::upload(&mut session, &local_path, &remote_path)?;
 
     // Install via gdbus (runs as defaultuser, APM handles permissions via D-Bus)

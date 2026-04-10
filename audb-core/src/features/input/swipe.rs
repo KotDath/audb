@@ -5,11 +5,7 @@
 
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
 use crate::features::input::scripts::ScriptManager;
-use crate::tools::{
-    macros::print_info,
-    session::DeviceSession,
-    types::DeviceIdentifier,
-};
+use crate::tools::{macros::print_info, session::DeviceSession, types::DeviceIdentifier};
 use anyhow::{anyhow, Context, Result};
 
 pub enum SwipeMode {
@@ -28,10 +24,10 @@ pub enum SwipeDirection {
 impl SwipeDirection {
     pub fn to_script_arg(&self) -> &'static str {
         match self {
-            SwipeDirection::Left => "rl",   // right-to-left
-            SwipeDirection::Right => "lr",  // left-to-right
-            SwipeDirection::Up => "du",     // down-to-up
-            SwipeDirection::Down => "ud",   // up-to-down
+            SwipeDirection::Left => "rl",  // right-to-left
+            SwipeDirection::Right => "lr", // left-to-right
+            SwipeDirection::Up => "du",    // down-to-up
+            SwipeDirection::Down => "ud",  // up-to-down
         }
     }
 }
@@ -53,17 +49,26 @@ pub async fn execute(mode: SwipeMode) -> Result<()> {
 
     match &mode {
         SwipeMode::Coords { x1, y1, x2, y2 } => {
-            print_info(format!("Swiping from ({},{}) to ({},{}) on device {}",
-                x1, y1, x2, y2, device.display_name()));
+            print_info(format!(
+                "Swiping from ({},{}) to ({},{}) on device {}",
+                x1,
+                y1,
+                x2,
+                y2,
+                device.display_name()
+            ));
         }
         SwipeMode::Direction(dir) => {
-            print_info(format!("Swiping {:?} on device {}", dir, device.display_name()));
+            print_info(format!(
+                "Swiping {:?} on device {}",
+                dir,
+                device.display_name()
+            ));
         }
     }
 
     print_info(format!("Connecting to {}:{}...", device.host, device.port));
-    let mut session = DeviceSession::connect(&device)
-        .context("Failed to connect to device")?;
+    let mut session = DeviceSession::connect(&device).context("Failed to connect to device")?;
 
     // Ensure swipe script is present on device
     ScriptManager::ensure_swipe_script_with_session(&mut session)?;
@@ -82,8 +87,11 @@ pub async fn execute(mode: SwipeMode) -> Result<()> {
     // Execute swipe command using devel-su for root access
     print_info("Executing swipe with devel-su...");
 
-    let output = session.exec_as_root(&swipe_command)
-        .context("Swipe requires root access. Set root password using: audb device add")?;
+    let output = session
+        .exec_as_root(&swipe_command)
+        .context(
+            "Swipe requires root access. Configure or update the cached password with: audb device set-root-password --new-password <value>",
+        )?;
 
     // Display output
     for line in &output {

@@ -8,11 +8,7 @@
 // Note: The app_instance_id is typically the same as the app name
 
 use crate::features::config::{device_store::DeviceStore, state::DeviceState};
-use crate::tools::{
-    macros::print_info,
-    session::DeviceSession,
-    types::DeviceIdentifier,
-};
+use crate::tools::{macros::print_info, session::DeviceSession, types::DeviceIdentifier};
 use anyhow::{anyhow, Context, Result};
 
 pub async fn execute(app_name: &str) -> Result<()> {
@@ -24,11 +20,14 @@ pub async fn execute(app_name: &str) -> Result<()> {
     let device_id = DeviceIdentifier::Host(current_host);
     let device = DeviceStore::find(&device_id)?;
 
-    print_info(format!("Stopping {} on device {}", app_name, device.display_name()));
+    print_info(format!(
+        "Stopping {} on device {}",
+        app_name,
+        device.display_name()
+    ));
     print_info(format!("Connecting to {}:{}...", device.host, device.port));
 
-    let mut session = DeviceSession::connect(&device)
-        .context("Failed to connect to device")?;
+    let mut session = DeviceSession::connect(&device).context("Failed to connect to device")?;
 
     // Build D-Bus command to terminate app using RuntimeManager
     // Note: Terminate takes appInstanceId, which is the same as appId
@@ -41,7 +40,8 @@ pub async fn execute(app_name: &str) -> Result<()> {
 
     print_info("Stopping application...");
 
-    let output = session.exec(&stop_command)
+    let output = session
+        .exec(&stop_command)
         .context("Failed to stop application")?;
 
     // Display output (usually empty on success)

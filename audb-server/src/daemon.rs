@@ -85,7 +85,9 @@ pub fn is_server_running() -> Result<bool> {
 
     // Read PID from file
     let pid_str = fs::read_to_string(&pid_file)?;
-    let pid: i32 = pid_str.trim().parse()
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow!("Invalid PID in file"))?;
 
     // Check if process with that PID is running
@@ -99,6 +101,5 @@ fn is_process_running(pid: i32) -> bool {
     use nix::unistd::Pid;
 
     // Send signal 0 (null signal) to check if process exists
-    kill(Pid::from_raw(pid), Signal::SIGCONT).is_ok()
-        || kill(Pid::from_raw(pid), None).is_ok()
+    kill(Pid::from_raw(pid), Signal::SIGCONT).is_ok() || kill(Pid::from_raw(pid), None).is_ok()
 }

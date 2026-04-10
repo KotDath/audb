@@ -1,10 +1,12 @@
 mod connection;
 mod daemon;
+mod emulator;
 mod pool;
 mod socket_server;
 
 use anyhow::Result;
 use clap::Parser;
+use emulator::EmulatorManager;
 use pool::ConnectionPool;
 use std::sync::Arc;
 use tracing::info;
@@ -48,6 +50,7 @@ fn main() -> Result<()> {
 async fn run_server() -> Result<()> {
     // Create connection pool
     let pool = Arc::new(ConnectionPool::new());
+    let emulator_manager = Arc::new(EmulatorManager::new());
 
     // Load devices from config and add to pool
     if let Ok(devices) = audb_core::features::config::device_store::DeviceStore::list_enabled() {
@@ -60,7 +63,7 @@ async fn run_server() -> Result<()> {
     let shutdown_signal = setup_signal_handlers()?;
 
     // Start Unix socket server with connection pool
-    socket_server::start_server(pool, shutdown_signal).await?;
+    socket_server::start_server(pool, emulator_manager, shutdown_signal).await?;
 
     info!("Server shutdown complete");
     Ok(())
@@ -72,10 +75,10 @@ fn setup_signal_handlers() -> Result<tokio::sync::mpsc::Receiver<()>> {
     tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
 
-        let mut sigterm = signal(SignalKind::terminate())
-            .expect("Failed to register SIGTERM handler");
-        let mut sigint = signal(SignalKind::interrupt())
-            .expect("Failed to register SIGINT handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+        let mut sigint =
+            signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
 
         tokio::select! {
             _ = sigterm.recv() => {

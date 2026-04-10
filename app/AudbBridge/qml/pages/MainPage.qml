@@ -102,6 +102,15 @@ Page {
                 text: qsTr("Test swipe up")
                 onClicked: bridgeService.runSwipeUpTest()
             }
+
+            Button {
+                width: parent.width
+                text: qsTr("Test screenshot")
+                onClicked: {
+                    var path = bridgeService.screenshot("/home/defaultuser/Pictures/Screenshots/test_audb.png")
+                    console.log("Screenshot saved to:", path)
+                }
+            }
         }
     }
 }

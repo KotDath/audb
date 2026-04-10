@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::tools::{session::DeviceSession, ssh::SshClient};
+use anyhow::Result;
 use russh::client::Handle;
 use std::path::Path;
 
@@ -37,16 +37,11 @@ impl ScriptManager {
         );
 
         let result = session.exec(&check_cmd)?;
-        let current_size: usize = result
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let current_size: usize = result.first().and_then(|s| s.parse().ok()).unwrap_or(0);
 
         if current_size != expected_size {
             // Upload needed
-            let temp_file = std::env::temp_dir().join(
-                Path::new(remote_path).file_name().unwrap()
-            );
+            let temp_file = std::env::temp_dir().join(Path::new(remote_path).file_name().unwrap());
             std::fs::write(&temp_file, script_content)?;
 
             session.upload_file(&temp_file, Path::new(remote_path))?;
@@ -86,16 +81,11 @@ impl ScriptManager {
         );
 
         let result = SshClient::exec(session, &check_cmd)?;
-        let current_size: usize = result
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let current_size: usize = result.first().and_then(|s| s.parse().ok()).unwrap_or(0);
 
         if current_size != expected_size {
             // Upload needed
-            let temp_file = std::env::temp_dir().join(
-                Path::new(remote_path).file_name().unwrap()
-            );
+            let temp_file = std::env::temp_dir().join(Path::new(remote_path).file_name().unwrap());
             std::fs::write(&temp_file, script_content)?;
 
             SshClient::upload(session, &temp_file, Path::new(remote_path))?;

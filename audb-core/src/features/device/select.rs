@@ -7,15 +7,22 @@ pub async fn execute(identifier: &str) -> Result<()> {
     let device = DeviceStore::find(&device_id)?;
 
     if !device.enabled {
-        return Err(anyhow!("Device is disabled. Cannot select disabled devices."));
+        return Err(anyhow!(
+            "Device is disabled. Cannot select disabled devices."
+        ));
     }
 
-    DeviceState::set_current(&device.host)?;
+    DeviceState::set_current(&device.id)?;
 
-    println!("\x1b[1m\x1b[32msuccess\x1b[0m: Selected device: {}", device.display_name());
+    println!(
+        "\x1b[1m\x1b[32msuccess\x1b[0m: Selected device: {}",
+        device.display_name()
+    );
+    println!("  ID: {}", device.id);
     println!("  Host: {}", device.host);
     println!("  Port: {}", device.port);
-    println!("  Platform: {}", device.platform);
+    println!("  Arch: {}", device.arch);
+    println!("  Kind: {}", device.kind);
 
     Ok(())
 }

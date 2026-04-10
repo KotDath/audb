@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
-use audb_protocol::{recv_message, send_message, Command, CommandOutput, CommandResult, Request, Response};
+use audb_protocol::{
+    recv_message, send_message, Command, CommandOutput, CommandResult, Request, Response,
+};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio::net::UnixStream;
@@ -37,6 +39,12 @@ enum Commands {
     Package {
         #[command(subcommand)]
         action: PackageCommands,
+    },
+
+    /// Manage custom QEMU emulator lifecycle
+    Emulator {
+        #[command(subcommand)]
+        action: EmulatorCommands,
     },
 
     /// Select active device
@@ -117,6 +125,15 @@ enum Commands {
         /// Direct evdev device for fast mode (e.g., /dev/input/event4 or "auto")
         #[arg(long)]
         event: Option<String>,
+        /// Number of move frames for emulator QMP gestures
+        #[arg(long)]
+        steps: Option<u32>,
+        /// Total swipe duration in milliseconds for emulator QMP gestures
+        #[arg(long)]
+        duration: Option<u32>,
+        /// Hold time in milliseconds before movement for emulator QMP gestures
+        #[arg(long)]
+        hold: Option<u32>,
     },
 
     /// Send key event (power, home, back, volume, etc.)
@@ -202,10 +219,47 @@ enum DeviceCommands {
     },
     /// Add a new device interactively
     Add,
+    /// Change cached and device-side devel-su password
+    SetRootPassword {
+        /// Device identifier (name, ID, IP address, or index). Uses current selection if omitted.
+        identifier: Option<String>,
+        /// New devel-su password to set on the device
+        #[arg(long)]
+        new_password: String,
+    },
     /// Remove a device
     Remove {
         /// Device identifier (name, IP address, or index)
         identifier: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmulatorCommands {
+    /// Create and register a new emulator device
+    Create {
+        /// Registry name for the emulator device
+        name: String,
+    },
+    /// Start emulator runtime
+    Start {
+        /// Emulator device identifier (uses current selection if omitted)
+        device: Option<String>,
+    },
+    /// Stop emulator runtime
+    Stop {
+        /// Emulator device identifier (uses current selection if omitted)
+        device: Option<String>,
+    },
+    /// Show emulator runtime status
+    Status {
+        /// Emulator device identifier (uses current selection if omitted)
+        device: Option<String>,
+    },
+    /// Migrate a legacy emulator entry to per-device runtime paths
+    Migrate {
+        /// Emulator device identifier (uses current selection if omitted)
+        device: Option<String>,
     },
 }
 
@@ -257,8 +311,13 @@ async fn main() {
             DeviceCommands::List { active } => {
                 audb_core::features::device::list::execute(active).await
             }
-            DeviceCommands::Add => {
-                audb_core::features::device::add::execute().await
+            DeviceCommands::Add => audb_core::features::device::add::execute().await,
+            DeviceCommands::SetRootPassword {
+                identifier,
+                new_password,
+            } => {
+                audb_core::features::device::set_root_password::execute(identifier, new_password)
+                    .await
             }
             DeviceCommands::Remove { identifier } => {
                 audb_core::features::device::remove::execute(&identifier).await
@@ -276,11 +335,28 @@ async fn main() {
             PackageCommands::List { filter } => {
                 execute_packages_command(device_override, filter).await
             }
-            PackageCommands::Sign { rpm_path, key, cert } => {
-                execute_sign_command(rpm_path, key, cert).await
+            PackageCommands::Sign {
+                rpm_path,
+                key,
+                cert,
+            } => execute_sign_command(rpm_path, key, cert).await,
+            PackageCommands::Validate { rpm_path } => execute_validate_command(rpm_path).await,
+        },
+        Commands::Emulator { action } => match action {
+            EmulatorCommands::Create { name } => {
+                audb_core::features::emulator::create::execute(name).await
             }
-            PackageCommands::Validate { rpm_path } => {
-                execute_validate_command(rpm_path).await
+            EmulatorCommands::Start { device } => {
+                execute_command(Command::EmulatorStart { device }).await
+            }
+            EmulatorCommands::Stop { device } => {
+                execute_command(Command::EmulatorStop { device }).await
+            }
+            EmulatorCommands::Status { device } => {
+                execute_command(Command::EmulatorStatus { device }).await
+            }
+            EmulatorCommands::Migrate { device } => {
+                audb_core::features::emulator::migrate::execute(device).await
             }
         },
 
@@ -289,18 +365,10 @@ async fn main() {
         }
 
         // Server management commands
-        Commands::Ping => {
-            execute_command(Command::Ping).await
-        }
-        Commands::StartServer { foreground } => {
-            start_server(foreground).await
-        }
-        Commands::KillServer => {
-            kill_server().await
-        }
-        Commands::ServerStatus => {
-            execute_command(Command::ServerStatus).await
-        }
+        Commands::Ping => execute_command(Command::Ping).await,
+        Commands::StartServer { foreground } => start_server(foreground).await,
+        Commands::KillServer => kill_server().await,
+        Commands::ServerStatus => execute_command(Command::ServerStatus).await,
 
         // Device commands (through server)
         Commands::Shell { root, command } => {
@@ -312,27 +380,26 @@ async fn main() {
         Commands::Pull { remote, output } => {
             execute_pull_command(device_override, remote, output).await
         }
-        Commands::Info { category } => {
-            execute_info_command(device_override, category).await
-        }
-        Commands::Tap { x, y, event, duration } => {
-            execute_tap_command(device_override, x, y, event, duration).await
-        }
-        Commands::Swipe { args, event } => {
-            execute_swipe_command(device_override, args, event).await
-        }
-        Commands::Key { key_name } => {
-            execute_key_command(device_override, key_name).await
-        }
+        Commands::Info { category } => execute_info_command(device_override, category).await,
+        Commands::Tap {
+            x,
+            y,
+            event,
+            duration,
+        } => execute_tap_command(device_override, x, y, event, duration).await,
+        Commands::Swipe {
+            args,
+            event,
+            steps,
+            duration,
+            hold,
+        } => execute_swipe_command(device_override, args, event, steps, duration, hold).await,
+        Commands::Key { key_name } => execute_key_command(device_override, key_name).await,
         Commands::Screenshot { output } => {
             execute_screenshot_command(device_override, output).await
         }
-        Commands::Launch { app_name } => {
-            execute_launch_command(device_override, app_name).await
-        }
-        Commands::Stop { app_name } => {
-            execute_stop_command(device_override, app_name).await
-        }
+        Commands::Launch { app_name } => execute_launch_command(device_override, app_name).await,
+        Commands::Stop { app_name } => execute_stop_command(device_override, app_name).await,
         Commands::Logs {
             lines,
             priority,
@@ -343,14 +410,21 @@ async fn main() {
             force,
             kernel,
         } => {
-            execute_logs_command(device_override, lines, priority, unit, grep, since, clear, force, kernel).await
+            execute_logs_command(
+                device_override,
+                lines,
+                priority,
+                unit,
+                grep,
+                since,
+                clear,
+                force,
+                kernel,
+            )
+            .await
         }
-        Commands::Reconnect { device } => {
-            execute_command(Command::Reconnect { device }).await
-        }
-        Commands::Open { url } => {
-            execute_open_command(device_override, url).await
-        }
+        Commands::Reconnect { device } => execute_command(Command::Reconnect { device }).await,
+        Commands::Open { url } => execute_open_command(device_override, url).await,
     };
 
     if let Err(e) = result {
@@ -359,7 +433,11 @@ async fn main() {
 }
 
 /// Execute shell command through server
-async fn execute_shell_command(device_override: Option<String>, as_root: bool, command_parts: Vec<String>) -> Result<()> {
+async fn execute_shell_command(
+    device_override: Option<String>,
+    as_root: bool,
+    command_parts: Vec<String>,
+) -> Result<()> {
     let device = get_device(device_override)?;
     let command = command_parts.join(" ");
 
@@ -367,7 +445,8 @@ async fn execute_shell_command(device_override: Option<String>, as_root: bool, c
         device,
         root: as_root,
         command,
-    }).await
+    })
+    .await
 }
 
 /// Execute a command by sending it to the server
@@ -417,22 +496,43 @@ fn handle_response(response: Response) -> Result<()> {
                     println!("\nDevices ({}):", status.devices.len());
                     for device in status.devices {
                         let state_str = match &device.state {
-                            audb_protocol::ConnectionStateInfo::Disconnected => "disconnected".to_string(),
-                            audb_protocol::ConnectionStateInfo::Connecting { attempt } => format!("connecting (attempt {})", attempt),
-                            audb_protocol::ConnectionStateInfo::Connected { duration_secs } => format!("connected ({}s)", duration_secs),
-                            audb_protocol::ConnectionStateInfo::Errored { error, .. } => format!("error: {}", error),
+                            audb_protocol::ConnectionStateInfo::Disconnected => {
+                                "disconnected".to_string()
+                            }
+                            audb_protocol::ConnectionStateInfo::Connecting { attempt } => {
+                                format!("connecting (attempt {})", attempt)
+                            }
+                            audb_protocol::ConnectionStateInfo::Connected { duration_secs } => {
+                                format!("connected ({}s)", duration_secs)
+                            }
+                            audb_protocol::ConnectionStateInfo::Errored { error, .. } => {
+                                format!("error: {}", error)
+                            }
                             audb_protocol::ConnectionStateInfo::Disabled => "disabled".to_string(),
                         };
-                        println!("  {} ({}:{}) - {}",
+                        println!(
+                            "  {} [{} {}] ({}:{}) - {}",
                             device.name.unwrap_or_else(|| "unnamed".to_string()),
+                            format_device_kind(&device.kind),
+                            format_device_arch(&device.arch),
                             device.host,
                             device.port,
                             state_str
                         );
+                        if let Some(emulator) = &device.emulator {
+                            println!(
+                                "    Emulator: lifecycle={}, ssh={}, qmp={}, input={}, screendump={}",
+                                format_emulator_lifecycle(&emulator.lifecycle),
+                                yes_no(emulator.ssh_ready),
+                                yes_no(emulator.qmp_ready),
+                                yes_no(emulator.qmp_input_ready),
+                                yes_no(emulator.qmp_screendump_ready)
+                            );
+                        }
                         if device.stats.failed_commands > 0 || device.stats.last_error.is_some() {
-                            println!("    Commands: {} ok, {} failed",
-                                device.stats.successful_commands,
-                                device.stats.failed_commands
+                            println!(
+                                "    Commands: {} ok, {} failed",
+                                device.stats.successful_commands, device.stats.failed_commands
                             );
                             if let Some(ref err) = device.stats.last_error {
                                 println!("    Last error: {}", err);
@@ -444,6 +544,9 @@ fn handle_response(response: Response) -> Result<()> {
                     // This is handled specially in execute_info_command
                     print_device_info(&info, None);
                 }
+                CommandOutput::EmulatorStatus(status) => {
+                    print_emulator_status(&status);
+                }
                 CommandOutput::Unit => {
                     // No output
                 }
@@ -453,11 +556,78 @@ fn handle_response(response: Response) -> Result<()> {
         CommandResult::Error { message, kind } => {
             // Improve error message for disconnected device
             if message.contains("deadline has elapsed") || message.contains("Channel send error") {
-                Err(anyhow!("Device disconnected or unreachable. Check 'audb device list' for status."))
+                Err(anyhow!(
+                    "Device disconnected or unreachable. Check 'audb device list' for status."
+                ))
             } else {
                 Err(anyhow!("{:?}: {}", kind, message))
             }
         }
+    }
+}
+
+fn format_device_kind(kind: &audb_protocol::DeviceKindInfo) -> &'static str {
+    match kind {
+        audb_protocol::DeviceKindInfo::Physical => "physical",
+        audb_protocol::DeviceKindInfo::QemuEmulator => "qemu-emulator",
+    }
+}
+
+fn format_device_arch(arch: &audb_protocol::DeviceArchInfo) -> &'static str {
+    match arch {
+        audb_protocol::DeviceArchInfo::AuroraArm => "aurora-arm",
+        audb_protocol::DeviceArchInfo::AuroraArm64 => "aurora-arm64",
+        audb_protocol::DeviceArchInfo::AuroraX86_64 => "aurora-x86_64",
+    }
+}
+
+fn format_emulator_lifecycle(
+    lifecycle: &audb_protocol::EmulatorLifecycleStateInfo,
+) -> &'static str {
+    match lifecycle {
+        audb_protocol::EmulatorLifecycleStateInfo::Stopped => "stopped",
+        audb_protocol::EmulatorLifecycleStateInfo::Starting => "starting",
+        audb_protocol::EmulatorLifecycleStateInfo::Running => "running",
+        audb_protocol::EmulatorLifecycleStateInfo::Errored => "errored",
+    }
+}
+
+fn format_orientation(orientation: &audb_protocol::ScreenOrientationInfo) -> &'static str {
+    match orientation {
+        audb_protocol::ScreenOrientationInfo::Portrait => "portrait",
+        audb_protocol::ScreenOrientationInfo::Landscape => "landscape",
+        audb_protocol::ScreenOrientationInfo::InvertedPortrait => "inverted-portrait",
+        audb_protocol::ScreenOrientationInfo::InvertedLandscape => "inverted-landscape",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "ok"
+    } else {
+        "fail"
+    }
+}
+
+fn print_emulator_status(status: &audb_protocol::EmulatorStatus) {
+    println!("Emulator:");
+    println!(
+        "  Lifecycle: {}",
+        format_emulator_lifecycle(&status.lifecycle)
+    );
+    println!("  SSH: {}", yes_no(status.ssh_ready));
+    println!("  QMP: {}", yes_no(status.qmp_ready));
+    println!("  QMP input: {}", yes_no(status.qmp_input_ready));
+    println!("  QMP screendump: {}", yes_no(status.qmp_screendump_ready));
+    if let Some(geometry) = &status.geometry {
+        println!(
+            "  Geometry: native={}x{}, visible={}x{}, orientation={}",
+            geometry.native_width,
+            geometry.native_height,
+            geometry.visible_width,
+            geometry.visible_height,
+            format_orientation(&geometry.orientation)
+        );
     }
 }
 
@@ -470,9 +640,13 @@ fn socket_path() -> PathBuf {
 /// Connect to the server via Unix socket
 async fn connect_to_server() -> Result<UnixStream> {
     let socket_path = socket_path();
-    UnixStream::connect(&socket_path)
-        .await
-        .map_err(|e| anyhow!("Failed to connect to server at {}: {}", socket_path.display(), e))
+    UnixStream::connect(&socket_path).await.map_err(|e| {
+        anyhow!(
+            "Failed to connect to server at {}: {}",
+            socket_path.display(),
+            e
+        )
+    })
 }
 
 /// Check if the server is running
@@ -517,7 +691,8 @@ async fn start_server(foreground: bool) -> Result<()> {
             return Err(anyhow!("Server exited with error"));
         }
     } else {
-        // Spawn in background
+        // Start the server in its built-in daemon mode so it persists
+        // cleanly between CLI invocations.
         cmd.spawn()?;
     }
 
@@ -603,47 +778,61 @@ async fn execute_install_command(device_override: Option<String>, rpm_path: Stri
         device,
         rpm_path,
         rpm_data,
-    }).await
+    })
+    .await
 }
 
 /// Execute Uninstall command
-async fn execute_uninstall_command(device_override: Option<String>, package_name: String) -> Result<()> {
+async fn execute_uninstall_command(
+    device_override: Option<String>,
+    package_name: String,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     execute_command(Command::Uninstall {
         device,
         package_name,
-    }).await
+    })
+    .await
 }
 
 /// Execute Packages command
-async fn execute_packages_command(device_override: Option<String>, filter: Option<String>) -> Result<()> {
+async fn execute_packages_command(
+    device_override: Option<String>,
+    filter: Option<String>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
-    execute_command(Command::Packages {
-        device,
-        filter,
-    }).await
+    execute_command(Command::Packages { device, filter }).await
 }
 
 /// Execute Push command
-async fn execute_push_command(device_override: Option<String>, local: String, remote: String) -> Result<()> {
+async fn execute_push_command(
+    device_override: Option<String>,
+    local: String,
+    remote: String,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     // Read local file
-    let data = std::fs::read(&local)
-        .map_err(|e| anyhow!("Failed to read local file {}: {}", local, e))?;
+    let data =
+        std::fs::read(&local).map_err(|e| anyhow!("Failed to read local file {}: {}", local, e))?;
 
     execute_command(Command::Push {
         device,
         local_path: local,
         remote_path: remote,
         data,
-    }).await
+    })
+    .await
 }
 
 /// Execute Pull command
-async fn execute_pull_command(device_override: Option<String>, remote: String, output: Option<String>) -> Result<()> {
+async fn execute_pull_command(
+    device_override: Option<String>,
+    remote: String,
+    output: Option<String>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     // Ensure server is running
@@ -668,7 +857,9 @@ async fn execute_pull_command(device_override: Option<String>, remote: String, o
 
     // Handle pull response specially (binary data)
     match response.result {
-        CommandResult::Success { output: CommandOutput::Binary(data) } => {
+        CommandResult::Success {
+            output: CommandOutput::Binary(data),
+        } => {
             // Determine output filename
             let filename = output.unwrap_or_else(|| {
                 std::path::Path::new(&remote)
@@ -682,17 +873,16 @@ async fn execute_pull_command(device_override: Option<String>, remote: String, o
             println!("{}: {} bytes pulled to {}", remote, data.len(), filename);
             Ok(())
         }
-        CommandResult::Success { output: _ } => {
-            Err(anyhow!("Unexpected output format for pull"))
-        }
-        CommandResult::Error { message, kind } => {
-            Err(anyhow!("{:?}: {}", kind, message))
-        }
+        CommandResult::Success { output: _ } => Err(anyhow!("Unexpected output format for pull")),
+        CommandResult::Error { message, kind } => Err(anyhow!("{:?}: {}", kind, message)),
     }
 }
 
 /// Execute Info command
-async fn execute_info_command(device_override: Option<String>, category: Option<String>) -> Result<()> {
+async fn execute_info_command(
+    device_override: Option<String>,
+    category: Option<String>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     // Ensure server is running
@@ -717,16 +907,14 @@ async fn execute_info_command(device_override: Option<String>, category: Option<
 
     // Handle response
     match response.result {
-        CommandResult::Success { output: CommandOutput::DeviceInfo(info) } => {
+        CommandResult::Success {
+            output: CommandOutput::DeviceInfo(info),
+        } => {
             print_device_info(&info, category.as_deref());
             Ok(())
         }
-        CommandResult::Success { output: _ } => {
-            Err(anyhow!("Unexpected output format for info"))
-        }
-        CommandResult::Error { message, kind } => {
-            Err(anyhow!("{:?}: {}", kind, message))
-        }
+        CommandResult::Success { output: _ } => Err(anyhow!("Unexpected output format for info")),
+        CommandResult::Error { message, kind } => Err(anyhow!("{:?}: {}", kind, message)),
     }
 }
 
@@ -760,13 +948,24 @@ fn print_device_info(info: &audb_protocol::DeviceInfo, category: Option<&str>) {
         }
         Some("storage") | Some("disk") => {
             println!("Storage:");
-            println!("  Internal Total: {} MB ({:.1} GB)", info.internal_storage_total_mb, info.internal_storage_total_mb as f64 / 1024.0);
-            println!("  Internal Free: {} MB ({:.1} GB)", info.internal_storage_free_mb, info.internal_storage_free_mb as f64 / 1024.0);
+            println!(
+                "  Internal Total: {} MB ({:.1} GB)",
+                info.internal_storage_total_mb,
+                info.internal_storage_total_mb as f64 / 1024.0
+            );
+            println!(
+                "  Internal Free: {} MB ({:.1} GB)",
+                info.internal_storage_free_mb,
+                info.internal_storage_free_mb as f64 / 1024.0
+            );
         }
         Some("features") | Some("hw") => {
             println!("Features:");
             println!("  NFC: {}", if info.has_nfc { "Yes" } else { "No" });
-            println!("  Bluetooth: {}", if info.has_bluetooth { "Yes" } else { "No" });
+            println!(
+                "  Bluetooth: {}",
+                if info.has_bluetooth { "Yes" } else { "No" }
+            );
             println!("  WLAN: {}", if info.has_wlan { "Yes" } else { "No" });
             println!("  GNSS: {}", if info.has_gnss { "Yes" } else { "No" });
             println!();
@@ -792,9 +991,11 @@ fn print_device_info(info: &audb_protocol::DeviceInfo, category: Option<&str>) {
             println!("  Free: {} MB", info.ram_free_mb);
             println!();
             println!("Storage:");
-            println!("  Internal: {:.1} GB / {:.1} GB free", 
+            println!(
+                "  Internal: {:.1} GB / {:.1} GB free",
                 info.internal_storage_total_mb as f64 / 1024.0,
-                info.internal_storage_free_mb as f64 / 1024.0);
+                info.internal_storage_free_mb as f64 / 1024.0
+            );
             println!();
             println!("Battery:");
             println!("  Level: {}%", info.battery_level);
@@ -802,7 +1003,10 @@ fn print_device_info(info: &audb_protocol::DeviceInfo, category: Option<&str>) {
             println!();
             println!("Features:");
             println!("  NFC: {}", if info.has_nfc { "Yes" } else { "No" });
-            println!("  Bluetooth: {}", if info.has_bluetooth { "Yes" } else { "No" });
+            println!(
+                "  Bluetooth: {}",
+                if info.has_bluetooth { "Yes" } else { "No" }
+            );
             println!("  WLAN: {}", if info.has_wlan { "Yes" } else { "No" });
             println!("  GNSS: {}", if info.has_gnss { "Yes" } else { "No" });
             println!();
@@ -814,7 +1018,13 @@ fn print_device_info(info: &audb_protocol::DeviceInfo, category: Option<&str>) {
 }
 
 /// Execute Tap command
-async fn execute_tap_command(device_override: Option<String>, x: u16, y: u16, event: Option<String>, duration: Option<u32>) -> Result<()> {
+async fn execute_tap_command(
+    device_override: Option<String>,
+    x: u16,
+    y: u16,
+    event: Option<String>,
+    duration: Option<u32>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     execute_command(Command::Tap {
@@ -823,11 +1033,19 @@ async fn execute_tap_command(device_override: Option<String>, x: u16, y: u16, ev
         y,
         event_device: event,
         duration_ms: duration,
-    }).await
+    })
+    .await
 }
 
 /// Execute Swipe command
-async fn execute_swipe_command(device_override: Option<String>, args: Vec<String>, event: Option<String>) -> Result<()> {
+async fn execute_swipe_command(
+    device_override: Option<String>,
+    args: Vec<String>,
+    event: Option<String>,
+    steps: Option<u32>,
+    duration_ms: Option<u32>,
+    hold_ms: Option<u32>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     // Parse swipe arguments
@@ -838,39 +1056,60 @@ async fn execute_swipe_command(device_override: Option<String>, args: Vec<String
             "right" => audb_protocol::SwipeDirection::Right,
             "up" => audb_protocol::SwipeDirection::Up,
             "down" => audb_protocol::SwipeDirection::Down,
-            _ => return Err(anyhow!("Invalid swipe direction: {}. Use: left, right, up, or down", args[0])),
+            "longup" => audb_protocol::SwipeDirection::LongUp,
+            "longdown" => audb_protocol::SwipeDirection::LongDown,
+            _ => {
+                return Err(anyhow!(
+                    "Invalid swipe direction: {}. Use: left, right, up, down, longup, or longdown",
+                    args[0]
+                ))
+            }
         };
         audb_protocol::SwipeMode::Direction(direction)
     } else if args.len() == 4 {
         // Coordinates mode
-        let x1 = args[0].parse().map_err(|_| anyhow!("Invalid x1 coordinate: {}", args[0]))?;
-        let y1 = args[1].parse().map_err(|_| anyhow!("Invalid y1 coordinate: {}", args[1]))?;
-        let x2 = args[2].parse().map_err(|_| anyhow!("Invalid x2 coordinate: {}", args[2]))?;
-        let y2 = args[3].parse().map_err(|_| anyhow!("Invalid y2 coordinate: {}", args[3]))?;
+        let x1 = args[0]
+            .parse()
+            .map_err(|_| anyhow!("Invalid x1 coordinate: {}", args[0]))?;
+        let y1 = args[1]
+            .parse()
+            .map_err(|_| anyhow!("Invalid y1 coordinate: {}", args[1]))?;
+        let x2 = args[2]
+            .parse()
+            .map_err(|_| anyhow!("Invalid x2 coordinate: {}", args[2]))?;
+        let y2 = args[3]
+            .parse()
+            .map_err(|_| anyhow!("Invalid y2 coordinate: {}", args[3]))?;
         audb_protocol::SwipeMode::Coords { x1, y1, x2, y2 }
     } else {
-        return Err(anyhow!("Invalid swipe arguments. Use: <direction> OR <x1> <y1> <x2> <y2>"));
+        return Err(anyhow!(
+            "Invalid swipe arguments. Use: <direction> OR <x1> <y1> <x2> <y2>"
+        ));
     };
 
     execute_command(Command::Swipe {
         device,
         mode,
         event_device: event,
-    }).await
+        steps,
+        duration_ms,
+        hold_ms,
+    })
+    .await
 }
 
 /// Execute Key command
 async fn execute_key_command(device_override: Option<String>, key_name: String) -> Result<()> {
     let device = get_device(device_override)?;
 
-    execute_command(Command::Key {
-        device,
-        key_name,
-    }).await
+    execute_command(Command::Key { device, key_name }).await
 }
 
 /// Execute Screenshot command with special binary handling
-async fn execute_screenshot_command(device_override: Option<String>, output: Option<String>) -> Result<()> {
+async fn execute_screenshot_command(
+    device_override: Option<String>,
+    output: Option<String>,
+) -> Result<()> {
     let device = get_device(device_override)?;
 
     // Ensure server is running
@@ -882,9 +1121,7 @@ async fn execute_screenshot_command(device_override: Option<String>, output: Opt
     // Send screenshot command
     let request = Request {
         id: generate_request_id(),
-        command: Command::Screenshot {
-            device,
-        },
+        command: Command::Screenshot { device },
     };
 
     send_message(&mut stream, &request).await?;
@@ -894,7 +1131,9 @@ async fn execute_screenshot_command(device_override: Option<String>, output: Opt
 
     // Handle screenshot response specially
     match response.result {
-        CommandResult::Success { output: CommandOutput::Binary(data) } => {
+        CommandResult::Success {
+            output: CommandOutput::Binary(data),
+        } => {
             // Generate output filename
             let filename = output.unwrap_or_else(|| {
                 let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -909,9 +1148,7 @@ async fn execute_screenshot_command(device_override: Option<String>, output: Opt
         CommandResult::Success { output: _ } => {
             Err(anyhow!("Unexpected output format for screenshot"))
         }
-        CommandResult::Error { message, kind } => {
-            Err(anyhow!("{:?}: {}", kind, message))
-        }
+        CommandResult::Error { message, kind } => Err(anyhow!("{:?}: {}", kind, message)),
     }
 }
 
@@ -919,20 +1156,14 @@ async fn execute_screenshot_command(device_override: Option<String>, output: Opt
 async fn execute_launch_command(device_override: Option<String>, app_name: String) -> Result<()> {
     let device = get_device(device_override)?;
 
-    execute_command(Command::Launch {
-        device,
-        app_name,
-    }).await
+    execute_command(Command::Launch { device, app_name }).await
 }
 
 /// Execute Stop command
 async fn execute_stop_command(device_override: Option<String>, app_name: String) -> Result<()> {
     let device = get_device(device_override)?;
 
-    execute_command(Command::Stop {
-        device,
-        app_name,
-    }).await
+    execute_command(Command::Stop { device, app_name }).await
 }
 
 /// Execute Logs command
@@ -960,10 +1191,7 @@ async fn execute_logs_command(
         kernel,
     };
 
-    execute_command(Command::Logs {
-        device,
-        args,
-    }).await
+    execute_command(Command::Logs { device, args }).await
 }
 
 /// Kill the server daemon
@@ -977,12 +1205,16 @@ async fn kill_server() -> Result<()> {
             println!("Server is not running");
             return Ok(());
         }
-        return Err(anyhow!("Server appears to be running but PID file not found"));
+        return Err(anyhow!(
+            "Server appears to be running but PID file not found"
+        ));
     }
 
     // Read PID from file
     let pid_str = std::fs::read_to_string(&pid_file)?;
-    let pid: i32 = pid_str.trim().parse()
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow!("Invalid PID in file: {}", pid_str.trim()))?;
 
     // Send SIGTERM to the process
@@ -1003,21 +1235,21 @@ async fn kill_server() -> Result<()> {
                 std::fs::remove_file(socket_path()).ok();
                 Ok(())
             } else {
-                Err(anyhow!("Failed to kill server (PID {}): errno {}", pid, errno))
+                Err(anyhow!(
+                    "Failed to kill server (PID {}): errno {}",
+                    pid,
+                    errno
+                ))
             }
         }
     }
 }
 
-
 /// Execute Open command
 async fn execute_open_command(device_override: Option<String>, url: String) -> Result<()> {
     let device = get_device(device_override)?;
 
-    execute_command(Command::Open {
-        device,
-        url,
-    }).await
+    execute_command(Command::Open { device, url }).await
 }
 
 /// URLs for Aurora OS signing keys
@@ -1037,24 +1269,27 @@ fn get_cache_dir() -> Result<PathBuf> {
 /// Download file from URL to path
 fn download_file(url: &str, path: &std::path::Path) -> Result<()> {
     use std::process::Command as ProcessCommand;
-    
+
     println!("Downloading {}...", url);
-    
+
     let output = ProcessCommand::new("curl")
         .args(["-fsSL", "-o", &path.to_string_lossy(), url])
         .output()
         .map_err(|e| anyhow!("Failed to run curl: {}", e))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("Failed to download {}: {}", url, stderr.trim()));
     }
-    
+
     Ok(())
 }
 
 /// Get signing keys (from custom path, cache, or download)
-fn get_signing_keys(custom_key: Option<String>, custom_cert: Option<String>) -> Result<(PathBuf, PathBuf)> {
+fn get_signing_keys(
+    custom_key: Option<String>,
+    custom_cert: Option<String>,
+) -> Result<(PathBuf, PathBuf)> {
     let key_path = if let Some(key) = custom_key {
         let path = PathBuf::from(&key);
         if !path.exists() {
@@ -1064,13 +1299,13 @@ fn get_signing_keys(custom_key: Option<String>, custom_cert: Option<String>) -> 
     } else {
         let cache_dir = get_cache_dir()?;
         let cached_key = cache_dir.join("regular_key.pem");
-        
+
         if !cached_key.exists() {
             download_file(KEY_URL, &cached_key)?;
         }
         cached_key
     };
-    
+
     let cert_path = if let Some(cert) = custom_cert {
         let path = PathBuf::from(&cert);
         if !path.exists() {
@@ -1080,41 +1315,48 @@ fn get_signing_keys(custom_key: Option<String>, custom_cert: Option<String>) -> 
     } else {
         let cache_dir = get_cache_dir()?;
         let cached_cert = cache_dir.join("regular_cert.pem");
-        
+
         if !cached_cert.exists() {
             download_file(CERT_URL, &cached_cert)?;
         }
         cached_cert
     };
-    
+
     Ok((key_path, cert_path))
 }
 
 /// Execute Sign command (local, uses Docker)
-async fn execute_sign_command(rpm_path: String, custom_key: Option<String>, custom_cert: Option<String>) -> Result<()> {
-    use std::process::Command as ProcessCommand;
+async fn execute_sign_command(
+    rpm_path: String,
+    custom_key: Option<String>,
+    custom_cert: Option<String>,
+) -> Result<()> {
     use std::path::Path;
+    use std::process::Command as ProcessCommand;
 
     let rpm_path = Path::new(&rpm_path);
-    
+
     // Validate RPM file exists
     if !rpm_path.exists() {
         return Err(anyhow!("RPM file not found: {}", rpm_path.display()));
     }
-    
+
     if !rpm_path.is_file() {
         return Err(anyhow!("Not a file: {}", rpm_path.display()));
     }
 
     // Get absolute path
-    let rpm_path = rpm_path.canonicalize()
+    let rpm_path = rpm_path
+        .canonicalize()
         .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
-    
-    let rpm_name = rpm_path.file_name()
+
+    let rpm_name = rpm_path
+        .file_name()
         .ok_or_else(|| anyhow!("Invalid RPM path"))?
         .to_string_lossy();
-    
-    let project_dir = rpm_path.parent()
+
+    let project_dir = rpm_path
+        .parent()
         .ok_or_else(|| anyhow!("Invalid RPM path"))?;
 
     // Get signing keys (auto-download if needed)
@@ -1123,15 +1365,14 @@ async fn execute_sign_command(rpm_path: String, custom_key: Option<String>, cust
     // Copy keys to project directory temporarily
     let temp_cert = project_dir.join("regular_cert.pem");
     let temp_key = project_dir.join("regular_key.pem");
-    
+
     std::fs::copy(&cert_path, &temp_cert)
         .map_err(|e| anyhow!("Failed to copy certificate: {}", e))?;
-    std::fs::copy(&key_path, &temp_key)
-        .map_err(|e| anyhow!("Failed to copy key: {}", e))?;
+    std::fs::copy(&key_path, &temp_key).map_err(|e| anyhow!("Failed to copy key: {}", e))?;
 
     // Find Aurora SDK Docker image
     let docker_image = find_aurora_docker_image()?;
-    
+
     println!("Signing {} with Aurora SDK...", rpm_name);
 
     // Generate unique container name
@@ -1187,17 +1428,21 @@ fn find_aurora_docker_image() -> Result<String> {
         .map_err(|e| anyhow!("Failed to list Docker images: {}", e))?;
 
     if !output.status.success() {
-        return Err(anyhow!("Docker command failed. Is Docker installed and running?"));
+        return Err(anyhow!(
+            "Docker command failed. Is Docker installed and running?"
+        ));
     }
 
     let images = String::from_utf8_lossy(&output.stdout);
-    
+
     // Look for Aurora SDK image patterns (prioritize build-tools)
     let mut candidates: Vec<&str> = Vec::new();
-    
+
     for line in images.lines() {
         let lower = line.to_lowercase();
-        if lower.contains("aurora") && (lower.contains("build") || lower.contains("sdk") || lower.contains("engine")) {
+        if lower.contains("aurora")
+            && (lower.contains("build") || lower.contains("sdk") || lower.contains("engine"))
+        {
             candidates.push(line);
         }
     }
@@ -1208,7 +1453,7 @@ fn find_aurora_docker_image() -> Result<String> {
             return Ok(candidate.to_string());
         }
     }
-    
+
     // Fall back to any Aurora image
     if let Some(candidate) = candidates.first() {
         return Ok(candidate.to_string());
@@ -1221,37 +1466,39 @@ fn find_aurora_docker_image() -> Result<String> {
     ))
 }
 
-
 /// Execute Validate command (local, uses Docker)
 async fn execute_validate_command(rpm_path: String) -> Result<()> {
-    use std::process::Command as ProcessCommand;
     use std::path::Path;
+    use std::process::Command as ProcessCommand;
 
     let rpm_path = Path::new(&rpm_path);
-    
+
     // Validate RPM file exists
     if !rpm_path.exists() {
         return Err(anyhow!("RPM file not found: {}", rpm_path.display()));
     }
-    
+
     if !rpm_path.is_file() {
         return Err(anyhow!("Not a file: {}", rpm_path.display()));
     }
 
     // Get absolute path
-    let rpm_path = rpm_path.canonicalize()
+    let rpm_path = rpm_path
+        .canonicalize()
         .map_err(|e| anyhow!("Failed to resolve path: {}", e))?;
-    
-    let rpm_name = rpm_path.file_name()
+
+    let rpm_name = rpm_path
+        .file_name()
         .ok_or_else(|| anyhow!("Invalid RPM path"))?
         .to_string_lossy();
-    
-    let project_dir = rpm_path.parent()
+
+    let project_dir = rpm_path
+        .parent()
         .ok_or_else(|| anyhow!("Invalid RPM path"))?;
 
     // Find Aurora SDK Docker image
     let docker_image = find_aurora_docker_image()?;
-    
+
     println!("Validating {} with Aurora SDK...", rpm_name);
 
     // Generate unique container name
@@ -1262,10 +1509,13 @@ async fn execute_validate_command(rpm_path: String) -> Result<()> {
         .args([
             "run",
             "--rm",
-            "--name", &container_name,
-            "-v", &format!("{}:/project", project_dir.display()),
+            "--name",
+            &container_name,
+            "-v",
+            &format!("{}:/project", project_dir.display()),
             &docker_image,
-            "/bin/bash", "-c",
+            "/bin/bash",
+            "-c",
             &format!("rpm-validator -p regular /project/{}", rpm_name),
         ])
         .output();
@@ -1274,7 +1524,7 @@ async fn execute_validate_command(rpm_path: String) -> Result<()> {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            
+
             // Print output
             if !stdout.is_empty() {
                 println!("{}", stdout);
@@ -1290,7 +1540,10 @@ async fn execute_validate_command(rpm_path: String) -> Result<()> {
                 println!("Validation passed: no errors found");
                 Ok(())
             } else {
-                Err(anyhow!("Validation failed with exit code: {:?}", output.status.code()))
+                Err(anyhow!(
+                    "Validation failed with exit code: {:?}",
+                    output.status.code()
+                ))
             }
         }
         Err(e) => Err(anyhow!("Failed to run Docker: {}", e)),

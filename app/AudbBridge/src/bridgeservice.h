@@ -4,6 +4,7 @@
 #include "privilegedexecutor.h"
 
 #include <QObject>
+#include <QQmlEngine>
 #include <QSize>
 #include <QVariantMap>
 
@@ -29,12 +30,13 @@ public:
     Q_INVOKABLE bool selfTest();
     Q_INVOKABLE bool runTapTest();
     Q_INVOKABLE bool runSwipeUpTest();
+    Q_INVOKABLE void setScreenshotGrabber(QObject *grabber);
 
     bool tap(int x, int y, const QVariantMap &options);
     bool swipe(int x1, int y1, int x2, int y2, const QVariantMap &options);
     bool swipeDirection(const QString &direction, const QVariantMap &options);
     bool key(const QString &keyName);
-    QString screenshot(const QString &outputPath);
+    Q_INVOKABLE QString screenshot(const QString &outputPath);
 
 signals:
     void stateChanged();
@@ -44,11 +46,17 @@ private:
     int currentOrientation() const;
     QString effectivePasswordStatus() const;
     bool runPrivilegedHelper(const QStringList &arguments);
+    bool tryScreenshotViaStreamCamera(const QString &finalPath, QString *errorMessage);
+    bool tryScreenshotViaQml(const QString &finalPath, QString *errorMessage);
+    bool tryScreenshotViaScreenGrab(const QString &finalPath, QString *errorMessage);
+    QString screenshotViaDbus(const QString &finalPath);
     QString defaultScreenshotPath() const;
     void setStatusMessage(const QString &message);
     bool applyHelperResult(const HelperCommandResult &result);
 
     PasswordStore m_passwordStore;
     PrivilegedExecutor m_executor;
+    QQmlEngine *m_qmlEngine = nullptr;
+    QObject *m_screenshotGrabber = nullptr;
     QString m_statusMessage;
 };
