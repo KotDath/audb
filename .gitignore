@@ -25,3 +25,6 @@ app/**/*.user
 
 # Aurora SDK / Qt Creator build output
 app/build-*/
+
+# Local notes and third-party artifacts
+thirdparty/
