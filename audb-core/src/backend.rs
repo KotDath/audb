@@ -293,8 +293,22 @@ impl EmulatorBackend {
                 )
                 .await?,
             )),
-            Command::LocationTrackAction { action, index } => Ok(CommandOutput::Json(
-                crate::emulator_api::track_action(&mut self.transport, &action, index).await?,
+            Command::LocationTrackAction {
+                action,
+                index,
+                looped,
+                speed,
+                default_interval,
+            } => Ok(CommandOutput::Json(
+                crate::emulator_api::track_action(
+                    &mut self.transport,
+                    &action,
+                    index,
+                    looped,
+                    speed,
+                    default_interval,
+                )
+                .await?,
             )),
             Command::SensorList => Ok(CommandOutput::Json(crate::emulator_api::sensor_list())),
             Command::SensorEnable { sensor, enabled } => Ok(CommandOutput::Json(

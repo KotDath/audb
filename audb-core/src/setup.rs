@@ -4,6 +4,7 @@ use crate::config::EmulatorConfig;
 use crate::error::{CoreError, CoreResult};
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -51,11 +52,13 @@ fn script_marker(path: &Path) -> CoreResult<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(path)?;
-    if bytes.starts_with(b"\x7fELF") {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic)?;
+    if magic == *b"\x7fELF" {
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Some(fs::read_to_string(path)?))
 }
 
 fn is_our_wrapper(path: &Path) -> CoreResult<bool> {

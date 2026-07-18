@@ -46,7 +46,11 @@ impl QmpClient {
 
     pub async fn execute(&mut self, command: &str, arguments: Option<Value>) -> CoreResult<Value> {
         self.ensure_connected().await?;
-        self.execute_connected(command, arguments).await
+        let result = self.execute_connected(command, arguments).await;
+        if result.is_err() {
+            self.disconnect();
+        }
+        result
     }
 
     async fn execute_connected(

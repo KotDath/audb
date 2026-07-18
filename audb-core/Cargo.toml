@@ -15,22 +15,14 @@ russh = "0.54.5"
 russh-sftp = "2.1.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-dialoguer = { version = "0.11", features = ["password"] }
-shellexpand = "3.1"
 directories = "5.0"
-anyhow = "1.0"
-base64 = "0.22"
 chrono = "0.4"
 thiserror = "2.0"
-colored = "2.0"
 audb-protocol = { version = "0.1.0", path = "../audb-protocol" }
-libc = "0.2"
 regex = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
-png = "0.17"
-async-trait = "0.1"
 
 [lib]
 name = "audb_core"

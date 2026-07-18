@@ -154,7 +154,7 @@ pub async fn proxy_set(
     {
         return Err(CoreError::invalid("Invalid proxy host or port"));
     }
-    let config = format!("<{{'Method': <'manual'>, 'Servers': <['http://{host}:{port}']}}>");
+    let config = format!("<{{'Method': <'manual'>, 'Servers': <['http://{host}:{port}']>}}>");
     connman(
         transport,
         "org.sailfishos.connman.GlobalProxy",
@@ -306,6 +306,9 @@ pub async fn track_action(
     transport: &mut EmulatorTransport,
     action: &str,
     index: Option<i32>,
+    looped: Option<bool>,
+    speed: Option<i32>,
+    default_interval: Option<bool>,
 ) -> CoreResult<Value> {
     let (method, args) = match action {
         "start" => ("startTrack", String::new()),
@@ -327,11 +330,37 @@ pub async fn track_action(
         }
     };
     geo(transport, method, &args).await?;
-    Ok(if action == "goto" {
+    let mut result = if action == "goto" {
         json!({"track":"goto","index":index})
     } else {
         json!({"track":action})
-    })
+    };
+    if let Some(value) = looped {
+        geo(
+            transport,
+            "setTrackLooped",
+            if value { "true" } else { "false" },
+        )
+        .await?;
+        result["loop"] = json!(value);
+    }
+    if let Some(value) = default_interval {
+        geo(
+            transport,
+            "setTrackIntervalMode",
+            if value { "true" } else { "false" },
+        )
+        .await?;
+        result["defaultInterval"] = json!(value);
+    }
+    if let Some(value) = speed {
+        if value <= 0 {
+            return Err(CoreError::invalid("track speed must be > 0"));
+        }
+        geo(transport, "setTrackSpeed", &value.to_string()).await?;
+        result["speed"] = json!(value);
+    }
+    Ok(result)
 }
 
 const SENSORS: [&str; 9] = [

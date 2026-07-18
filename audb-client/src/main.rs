@@ -418,7 +418,27 @@ enum PackageCommand {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let json_requested = std::env::args_os().any(|value| value == "--json");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return;
+        }
+        Err(parse_error) if json_requested => {
+            emit_error(
+                true,
+                &error(ErrorCode::InvalidArgument, parse_error.to_string()),
+            );
+            std::process::exit(1);
+        }
+        Err(parse_error) => parse_error.exit(),
+    };
     let json_mode = cli.json;
     match run(cli).await {
         Ok(()) => {}
@@ -818,8 +838,11 @@ fn map_location(command: LocationCommand) -> Result<Command, AudbError> {
                         "location track load requires a JSON file",
                     )
                 })?;
-                let positions: Vec<TrackPosition> =
+                let document: Value =
                     serde_json::from_slice(&std::fs::read(path).map_err(internal)?)
+                        .map_err(internal)?;
+                let positions: Vec<TrackPosition> =
+                    serde_json::from_value(document.get("positions").cloned().unwrap_or(document))
                         .map_err(internal)?;
                 Command::LocationTrackLoad {
                     positions,
@@ -834,6 +857,9 @@ fn map_location(command: LocationCommand) -> Result<Command, AudbError> {
                         .map(|v| v.parse::<i32>())
                         .transpose()
                         .map_err(internal)?,
+                    looped: looped.map(|v| parse_on_off(&v)).transpose()?,
+                    speed,
+                    default_interval: default_interval.map(|v| parse_on_off(&v)).transpose()?,
                 }
             }
         }

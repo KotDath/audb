@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +231,9 @@ pub enum Command {
     LocationTrackAction {
         action: String,
         index: Option<i32>,
+        looped: Option<bool>,
+        speed: Option<i32>,
+        default_interval: Option<bool>,
     },
     SensorList,
     SensorEnable {
