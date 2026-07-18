@@ -327,13 +327,16 @@ enum ProxyCommand {
 #[derive(Subcommand)]
 enum LocationCommand {
     Set {
+        #[arg(allow_hyphen_values = true)]
         latitude: f64,
+        #[arg(allow_hyphen_values = true)]
         longitude: f64,
-        #[arg(default_value_t = 0.0)]
+        #[arg(default_value_t = 0.0, allow_hyphen_values = true)]
         altitude: f64,
     },
     Track {
         action: String,
+        #[arg(allow_hyphen_values = true)]
         value: Option<String>,
         #[arg(long = "loop")]
         looped: Option<String>,
@@ -355,12 +358,16 @@ enum SensorCommand {
     },
     SetVector {
         sensor: String,
-        x: i32,
-        y: i32,
-        z: i32,
+        #[arg(allow_hyphen_values = true)]
+        x: f64,
+        #[arg(allow_hyphen_values = true)]
+        y: f64,
+        #[arg(allow_hyphen_values = true)]
+        z: f64,
     },
     SetScalar {
         sensor: String,
+        #[arg(allow_hyphen_values = true)]
         value: i32,
     },
 }
@@ -1025,5 +1032,20 @@ mod tests {
         assert!(
             matches!(cli.command, Commands::Shell(ShellArgs { cmdline, .. }) if cmdline == ["journalctl", "--no-pager"])
         );
+    }
+
+    #[test]
+    fn parses_negative_location_and_sensor_values() {
+        assert!(Cli::try_parse_from(["audb", "location", "set", "-33.8", "-151.2", "-5"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "audb",
+            "sensor",
+            "set-vector",
+            "accelerometer",
+            "100",
+            "-200",
+            "-980",
+        ])
+        .is_ok());
     }
 }

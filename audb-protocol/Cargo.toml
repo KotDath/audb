@@ -16,6 +16,9 @@ anyhow = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-util", "net"] }
 
+[dev-dependencies]
+tokio.workspace = true
+
 [lib]
 name = "audb_protocol"
 path = "src/lib.rs"

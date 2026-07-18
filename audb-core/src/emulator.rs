@@ -70,16 +70,39 @@ pub async fn start(config: &EmulatorConfig, timeout: Duration) -> CoreResult<Val
             json!({"running": true, "alreadyRunning": true, "qmpSocket": config.qmp_socket}),
         );
     }
-    sfdk(config, &["emulator", "start"], timeout, true)?;
+    let mut launcher = Command::new(config.sfdk())
+        .args(["emulator", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| CoreError::runtime(format!("Cannot run sfdk: {e}")))?;
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if is_running(config).await {
+            if launcher.try_wait().ok().flatten().is_none() {
+                // Some SDK versions keep the launcher attached to the running QEMU. QMP is
+                // the authoritative readiness signal, so do not retain that waiter forever.
+                let _ = launcher.kill();
+            }
             return Ok(
                 json!({"running": true, "alreadyRunning": false, "qmpSocket": config.qmp_socket}),
             );
         }
+        if let Some(status) = launcher
+            .try_wait()
+            .map_err(|e| CoreError::runtime(e.to_string()))?
+        {
+            if !status.success() {
+                return Err(CoreError::runtime(format!(
+                    "sfdk emulator start failed with {status}"
+                )));
+            }
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let _ = launcher.kill();
     Err(CoreError::new(
         audb_protocol::ErrorCode::EmulatorOff,
         format!("QMP socket not ready: {}", config.qmp_socket.display()),

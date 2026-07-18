@@ -69,7 +69,16 @@ async fn serve(mut stream: UnixStream, backend: Arc<Mutex<EmulatorBackend>>) -> 
                 output: CommandOutput::Empty,
             }
         } else {
-            match backend.lock().await.execute(request.command).await {
+            let execution = async { backend.lock().await.execute(request.command).await };
+            tokio::pin!(execution);
+            let executed = tokio::select! {
+                result = &mut execution => result,
+                disconnected = wait_for_disconnect(&stream) => {
+                    disconnected?;
+                    return Ok(());
+                }
+            };
+            match executed {
                 Ok(output) => CommandResult::Success { output },
                 Err(error) => {
                     let data = error.data.clone();
@@ -92,6 +101,19 @@ async fn serve(mut stream: UnixStream, backend: Arc<Mutex<EmulatorBackend>>) -> 
                 std::process::exit(0);
             });
             return Ok(());
+        }
+    }
+}
+
+async fn wait_for_disconnect(stream: &UnixStream) -> Result<()> {
+    let mut byte = [0_u8; 1];
+    loop {
+        stream.readable().await?;
+        match stream.try_read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => return Err(anyhow!("pipelined daemon requests are not supported")),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error.into()),
         }
     }
 }

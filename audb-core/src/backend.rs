@@ -82,9 +82,31 @@ impl EmulatorBackend {
                     .await?,
             )),
             Command::Open { url } => {
-                let response = self.transport.exec(&format!("gdbus call --session --dest org.sailfishos.fileservice --object-path / --method org.sailfishos.fileservice.openUrl {}", shell_quote(&url)), false).await?;
+                let mode = if url.starts_with("file:") {
+                    "--file"
+                } else {
+                    "--scheme"
+                };
+                let quoted = shell_quote(&url);
+                let response = self
+                    .transport
+                    .exec(
+                        &format!(
+                            "action=$(lca-tool {mode} --printdefault {quoted}); \
+                             if test -z \"$action\"; then echo __AUDB_NO_DEFAULT__; \
+                             else lca-tool {mode} --triggerdefault {quoted} >/dev/null && printf '%s' \"$action\"; fi"
+                        ),
+                        false,
+                    )
+                    .await?;
+                if response == "__AUDB_NO_DEFAULT__" {
+                    return Err(CoreError::new(
+                        audb_protocol::ErrorCode::CapabilityUnavailable,
+                        format!("No Aurora application is registered to open {url}"),
+                    ));
+                }
                 Ok(CommandOutput::Json(
-                    json!({"url":url,"opened":true,"response":response}),
+                    json!({"url":url,"opened":true,"handler":response}),
                 ))
             }
             Command::Info { category } => Ok(CommandOutput::Json(

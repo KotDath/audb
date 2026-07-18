@@ -40,7 +40,10 @@ impl EmulatorTransport {
 
     async fn connect_as(&self, user: &str) -> CoreResult<Handle<ClientHandler>> {
         let config = client::Config {
-            inactivity_timeout: Some(Duration::from_secs(60)),
+            // The daemon intentionally keeps SSH sessions between CLI invocations.  A short
+            // client-side inactivity timeout made the first command after an idle minute fail
+            // with `Channel send error`; let the server own session lifetime instead.
+            inactivity_timeout: None,
             preferred: Preferred {
                 kex: Cow::Owned(vec![
                     russh::kex::CURVE25519_PRE_RFC_8731,
@@ -100,15 +103,17 @@ impl EmulatorTransport {
     }
 
     pub async fn exec(&mut self, command: &str, root: bool) -> CoreResult<String> {
-        let result = exec_session(self.session(root).await?, command).await;
-        if result.is_err() {
-            if root {
-                self.root = None
-            } else {
-                self.user = None
-            }
+        let first = exec_session(self.session(root).await?, command).await;
+        if first.is_ok() {
+            return first;
         }
-        result
+
+        self.clear_session(root);
+        let retry = exec_session(self.session(root).await?, command).await;
+        if retry.is_err() {
+            self.clear_session(root);
+        }
+        retry
     }
 
     pub async fn ping(&mut self) -> bool {
@@ -151,6 +156,14 @@ impl EmulatorTransport {
     pub fn disconnect(&mut self) {
         self.user = None;
         self.root = None;
+    }
+
+    fn clear_session(&mut self, root: bool) {
+        if root {
+            self.root = None;
+        } else {
+            self.user = None;
+        }
     }
 }
 

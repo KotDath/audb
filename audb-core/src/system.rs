@@ -18,7 +18,9 @@ fn variant(raw: &str) -> String {
         .split(',')
         .next()
         .unwrap_or_default()
-        .trim()
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
         .into()
 }
 async fn device_info(t: &mut EmulatorTransport, method: &str) -> CoreResult<String> {
@@ -40,7 +42,16 @@ pub async fn info(t: &mut EmulatorTransport, category: Option<&str>) -> CoreResu
         result.insert("device".into(),json!({"model":variant(&device_info(t,"getDeviceModel").await?),"osVersion":variant(&device_info(t,"getOsVersion").await?),"screen":variant(&device_info(t,"getScreenResolution").await?)}));
     }
     if category.is_none() || category == Some("cpu") {
-        result.insert("cpu".into(),json!({"model":variant(&device_info(t,"getCpuModel").await?),"cores":variant(&device_info(t,"getNumberCpuCores").await?).parse::<u64>().unwrap_or(0),"maxClockMhz":variant(&device_info(t,"getMaxCpuClockSpeed").await?).parse::<u64>().unwrap_or(0)}));
+        let mut model = variant(&device_info(t, "getCpuModel").await?);
+        if model.is_empty() {
+            model = t
+                .exec(
+                    "awk -F ': ' '/^model name/{print $2; exit}' /proc/cpuinfo",
+                    false,
+                )
+                .await?;
+        }
+        result.insert("cpu".into(),json!({"model":model,"cores":variant(&device_info(t,"getNumberCpuCores").await?).parse::<u64>().unwrap_or(0),"maxClockMhz":variant(&device_info(t,"getMaxCpuClockSpeed").await?).parse::<u64>().unwrap_or(0)}));
     }
     if category.is_none() || category == Some("memory") {
         let total = variant(&device_info(t, "getRamTotalSize").await?)
@@ -113,8 +124,10 @@ pub async fn logs(t: &mut EmulatorTransport, o: LogsOptions) -> CoreResult<Strin
         p.push("-k".into())
     }
     p.extend(["-n".into(), o.lines.min(100_000).to_string()]);
-    if let Some(v) = o.priority.as_deref().and_then(priority) {
-        p.extend(["-p".into(), v.into()])
+    if let Some(raw) = o.priority.as_deref() {
+        let value = priority(raw)
+            .ok_or_else(|| CoreError::invalid(format!("Unknown log priority: {raw}")))?;
+        p.extend(["-p".into(), value.into()])
     }
     if let Some(v) = o.unit {
         p.extend(["-u".into(), shell_quote(&v)])
@@ -125,7 +138,7 @@ pub async fn logs(t: &mut EmulatorTransport, o: LogsOptions) -> CoreResult<Strin
     p.extend(["--no-pager".into(), "--no-hostname".into()]);
     let mut cmd = p.join(" ");
     if let Some(v) = o.grep {
-        cmd.push_str(&format!(" | grep {}", shell_quote(&v)))
+        cmd.push_str(&format!(" | grep {} || true", shell_quote(&v)))
     }
     t.exec(&cmd, true).await
 }
@@ -207,6 +220,8 @@ mod tests {
     #[test]
     fn variants() {
         assert_eq!(variant("(42,)"), "42");
+        assert_eq!(variant("(uint32 2,)"), "2");
+        assert_eq!(variant("(uint64 4116619264,)"), "4116619264");
         assert_eq!(priority("E"), Some("err"));
     }
 }

@@ -244,9 +244,9 @@ pub enum Command {
     },
     SensorVector {
         sensor: String,
-        x: i32,
-        y: i32,
-        z: i32,
+        x: f64,
+        y: f64,
+        z: f64,
     },
     SensorScalar {
         sensor: String,

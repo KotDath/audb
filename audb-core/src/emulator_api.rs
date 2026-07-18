@@ -16,7 +16,9 @@ async fn dbus(
     let suffix = if args.is_empty() {
         String::new()
     } else {
-        format!(" {args}")
+        // End gdbus option parsing before positional D-Bus values so negative numbers are not
+        // mistaken for command-line flags.
+        format!(" -- {args}")
     };
     transport.exec(&format!("gdbus call --system --dest {destination} --object-path {object} --method {interface}.{method}{suffix}"), root).await
 }
@@ -61,6 +63,10 @@ async fn connman(
 pub async fn network_status(transport: &mut EmulatorTransport) -> CoreResult<Value> {
     let manager = connman(transport, "net.connman.Manager", "GetProperties", "", false).await?;
     let services = connman(transport, "net.connman.Manager", "GetServices", "", false).await?;
+    let emulated_offline = transport
+        .exec("test -e /run/audb-offline && echo true || echo false", true)
+        .await?
+        == "true";
     let nameservers: Vec<Value> = Regex::new(r"(?s)'Nameservers':\s*<\[([^]]*)\]>")
         .unwrap()
         .captures(&services)
@@ -79,7 +85,7 @@ pub async fn network_status(transport: &mut EmulatorTransport) -> CoreResult<Val
         .and_then(|c| c.get(1))
         .and_then(|m| property_string(m.as_str(), "Method"));
     Ok(
-        json!({"state":property_string(&manager,"State"),"offline":property_bool(&manager,"OfflineMode"),"service":{"type":property_string(&services,"Type"),"name":property_string(&services,"Name"),"state":property_string(&services,"State"),"interface":property_string(&services,"Interface"),"address":section_string(&services,"IPv4","Address"),"netmask":section_string(&services,"IPv4","Netmask"),"gateway":section_string(&services,"IPv4","Gateway"),"nameservers":nameservers,"proxyMethod":proxy}}),
+        json!({"state":if emulated_offline {Some("offline".to_string())} else {property_string(&manager,"State")},"offline":emulated_offline || property_bool(&manager,"OfflineMode").unwrap_or(false),"service":{"type":property_string(&services,"Type"),"name":property_string(&services,"Name"),"state":property_string(&services,"State"),"interface":property_string(&services,"Interface"),"address":section_string(&services,"IPv4","Address"),"netmask":section_string(&services,"IPv4","Netmask"),"gateway":section_string(&services,"IPv4","Gateway"),"nameservers":nameservers,"proxyMethod":proxy}}),
     )
 }
 
@@ -197,20 +203,26 @@ pub async fn proxy_clear(transport: &mut EmulatorTransport) -> CoreResult<Value>
     proxy_get(transport).await
 }
 pub async fn offline(transport: &mut EmulatorTransport, enabled: bool) -> CoreResult<Value> {
-    let value = if enabled { "true" } else { "false" };
-    connman(
-        transport,
-        "net.connman.Manager",
-        "SetProperty",
-        &format!(
-            "{} {}",
-            shell_quote("OfflineMode"),
-            shell_quote(&format!("<{value}>"))
-        ),
-        true,
-    )
-    .await?;
-    Ok(json!({"offlineRequested":enabled}))
+    // ConnMan's OfflineMode removes eth0 and therefore destroys the SSH control plane used by
+    // the emulator backend. Isolate guest traffic in a dedicated chain while always allowing
+    // SSH replies; this gives applications an offline network without making `offline off`
+    // impossible to execute.
+    let command = if enabled {
+        "iptables -w -N AUDB_OFFLINE 2>/dev/null || true; \
+         iptables -w -F AUDB_OFFLINE; \
+         iptables -w -A AUDB_OFFLINE -o lo -j RETURN; \
+         iptables -w -A AUDB_OFFLINE -p tcp --sport 22 -j RETURN; \
+         iptables -w -A AUDB_OFFLINE -j REJECT; \
+         iptables -w -C OUTPUT -j AUDB_OFFLINE 2>/dev/null || iptables -w -I OUTPUT 1 -j AUDB_OFFLINE; \
+         touch /run/audb-offline"
+    } else {
+        "iptables -w -D OUTPUT -j AUDB_OFFLINE 2>/dev/null || true; \
+         iptables -w -F AUDB_OFFLINE 2>/dev/null || true; \
+         iptables -w -X AUDB_OFFLINE 2>/dev/null || true; \
+         rm -f /run/audb-offline"
+    };
+    transport.exec(command, true).await?;
+    Ok(json!({"offlineRequested":enabled,"offline":enabled,"controlPlane":"ssh-preserved"}))
 }
 
 async fn geo(transport: &mut EmulatorTransport, method: &str, args: &str) -> CoreResult<String> {
@@ -421,21 +433,46 @@ pub async fn sensor_enable(
 pub async fn sensor_vector(
     transport: &mut EmulatorTransport,
     sensor: &str,
-    x: i32,
-    y: i32,
-    z: i32,
+    x: f64,
+    y: f64,
+    z: f64,
 ) -> CoreResult<Value> {
-    let method = match sensor {
-        "accelerometer" => "setAccelerometerValues",
-        "gyroscope" => "setGyroscopeValues",
-        "magnetometer" => "setMagnetometerValues",
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Err(CoreError::invalid("Sensor values must be finite"));
+    }
+    let (method, arguments) = match sensor {
+        "accelerometer" => {
+            if [x, y, z].iter().any(|value| {
+                value.fract() != 0.0 || *value < i32::MIN as f64 || *value > i32::MAX as f64
+            }) {
+                return Err(CoreError::invalid(
+                    "Accelerometer values must be 32-bit integers",
+                ));
+            }
+            (
+                "setAccelerometerValues",
+                format!("{} {} {}", x as i32, y as i32, z as i32),
+            )
+        }
+        "gyroscope" => ("setGyroscopeValues", format!("{x:.15} {y:.15} {z:.15}")),
+        "magnetometer" => {
+            if [x, y, z]
+                .iter()
+                .any(|value| !(-2.1473..=2.1473).contains(value))
+            {
+                return Err(CoreError::invalid(
+                    "Magnetometer values must be between -2.1473 and 2.1473",
+                ));
+            }
+            ("setMagnetometerValues", format!("{x:.15} {y:.15} {z:.15}"))
+        }
         _ => {
             return Err(CoreError::invalid(
                 "Vector values are supported for accelerometer, gyroscope and magnetometer",
             ))
         }
     };
-    sensor_call(transport, method, &format!("{x} {y} {z}")).await?;
+    sensor_call(transport, method, &arguments).await?;
     Ok(json!({"sensor":sensor,"x":x,"y":y,"z":z}))
 }
 pub async fn sensor_scalar(

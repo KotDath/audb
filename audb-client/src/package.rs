@@ -1,8 +1,8 @@
 use audb_core::{config::cache_dir, EmulatorConfig};
 use audb_protocol::{AudbError, ErrorCode};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 fn error(code: ErrorCode, message: impl Into<String>) -> AudbError {
@@ -24,6 +24,7 @@ fn check_rpm(path: &str) -> Result<PathBuf, AudbError> {
     Ok(path)
 }
 fn run(mut command: Command, timeout: Duration) -> Result<Output, AudbError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|e| error(ErrorCode::RuntimeError, e.to_string()))?;
@@ -130,6 +131,16 @@ fn keys(
         "Aurora package signing keys not found in SDK or audb cache",
     ))
 }
+
+fn staging_dir() -> Result<tempfile::TempDir, AudbError> {
+    let cache = cache_dir().map_err(|e| error(e.code, e.message))?;
+    std::fs::create_dir_all(&cache).map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
+    tempfile::Builder::new()
+        .prefix("package-")
+        .tempdir_in(cache)
+        .map_err(|e| error(ErrorCode::InternalError, e.to_string()))
+}
+
 pub fn sign(
     config: &EmulatorConfig,
     rpm: &str,
@@ -139,7 +150,7 @@ pub fn sign(
     let rpm = check_rpm(rpm)?;
     let (key, cert) = keys(config, key, cert)?;
     let image = image()?;
-    let temp = tempfile::tempdir().map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
+    let temp = staging_dir()?;
     let stage = temp.path().join("stage");
     std::fs::create_dir(&stage).map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
     let name = rpm.file_name().unwrap();
@@ -179,15 +190,18 @@ pub fn sign(
 pub fn validate(rpm: &str) -> Result<Value, AudbError> {
     let rpm = check_rpm(rpm)?;
     let image = image()?;
-    let dir = rpm.parent().unwrap_or(Path::new("."));
-    let name = rpm.file_name().unwrap().to_string_lossy();
+    let temp = staging_dir()?;
+    let name = rpm.file_name().unwrap();
+    std::fs::copy(&rpm, temp.path().join(name))
+        .map_err(|e| error(ErrorCode::InternalError, e.to_string()))?;
+    let name = name.to_string_lossy();
     let script = format!("rpm-validator -p regular /project/{name}");
     let mut c = Command::new("docker");
     c.args([
         "run",
         "--rm",
         "-v",
-        &format!("{}:/project", dir.display()),
+        &format!("{}:/project", temp.path().display()),
         &image,
         "/bin/bash",
         "-c",

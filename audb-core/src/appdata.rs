@@ -4,6 +4,7 @@ use crate::transport::{shell_quote, EmulatorTransport};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
+use std::time::Duration;
 
 fn component(value: &str, label: &str) -> CoreResult<()> {
     if value.is_empty()
@@ -173,6 +174,19 @@ pub async fn clear(t: &mut EmulatorTransport, package: &str, confirm: bool) -> C
         return Ok(json!({"package":package,"dryRun":true,"targets":targets,"removed":[]}));
     }
     let _ = app::stop(t, package).await;
+    let stopped = app::wait(
+        t,
+        package,
+        false,
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+    )
+    .await?;
+    if stopped["matched"] != true {
+        return Err(CoreError::runtime(format!(
+            "Application did not stop before clearing data: {package}"
+        )));
+    }
     let values: Vec<String> = targets
         .iter()
         .filter_map(|v| v["path"].as_str().map(shell_quote))
@@ -193,8 +207,38 @@ pub async fn list(
 ) -> CoreResult<Value> {
     let (root, target) = resolve(t, package, kind, path).await?;
     let q = shell_quote(&target);
-    let raw=t.exec(&format!("for p in {q}/* {q}/.[!.]* {q}/..?*; do test -e \"$p\" || test -L \"$p\" || continue; stat -c '%F\\t%s\\t%Y\\t%n' \"$p\"; done"),true).await?;
-    Ok(Value::Array(raw.lines().filter_map(|line|{let p:Vec<_>=line.splitn(4,'\t').collect();if p.len()!=4{return None}let name=Path::new(p[3]).file_name()?.to_string_lossy();let rel=Path::new(p[3]).strip_prefix(&root).ok()?.to_string_lossy().trim_start_matches('/').to_string();Some(json!({"name":name,"path":rel,"type":match p[0]{"directory"=>"directory","regular file"=>"file","symbolic link"=>"symlink",_=>"other"},"size":p[1].parse::<u64>().ok()?,"modified":p[2].parse::<f64>().ok()?}))}).collect()))
+    let raw=t.exec(&format!("for p in {q}/* {q}/.[!.]* {q}/..?*; do test -e \"$p\" || test -L \"$p\" || continue; stat -c '%F\t%s\t%Y\t%n' \"$p\"; done"),true).await?;
+    Ok(Value::Array(parse_listing(&raw, &root)))
+}
+
+fn parse_listing(raw: &str, root: &str) -> Vec<Value> {
+    raw.lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.splitn(4, '\t').collect();
+            if fields.len() != 4 {
+                return None;
+            }
+            let name = Path::new(fields[3]).file_name()?.to_string_lossy();
+            let relative = Path::new(fields[3])
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string();
+            Some(json!({
+                "name": name,
+                "path": relative,
+                "type": match fields[0] {
+                    "directory" => "directory",
+                    "regular file" => "file",
+                    "symbolic link" => "symlink",
+                    _ => "other",
+                },
+                "size": fields[1].parse::<u64>().ok()?,
+                "modified": fields[2].parse::<f64>().ok()?,
+            }))
+        })
+        .collect()
 }
 pub async fn pull(
     t: &mut EmulatorTransport,
@@ -278,5 +322,17 @@ mod tests {
         assert!(relative("../secret").is_err());
         assert!(relative("/etc/passwd").is_err());
         assert_eq!(relative("a/./b").unwrap(), "a/b");
+    }
+
+    #[test]
+    fn parses_tab_separated_stat_listing() {
+        let values = parse_listing(
+            "regular file\t42\t1234\t/home/defaultuser/data/check.db",
+            "/home/defaultuser/data",
+        );
+        assert_eq!(values[0]["name"], "check.db");
+        assert_eq!(values[0]["path"], "check.db");
+        assert_eq!(values[0]["type"], "file");
+        assert_eq!(values[0]["size"], 42);
     }
 }
