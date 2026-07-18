@@ -92,8 +92,8 @@ async fn serve(mut stream: UnixStream, backend: Arc<Mutex<EmulatorBackend>>) -> 
     }
 }
 
-pub async fn request(command: Command) -> Result<CommandOutput> {
-    let mut stream = connect_or_spawn().await?;
+pub async fn typed_request(command: Command) -> std::result::Result<CommandOutput, AudbError> {
+    let mut stream = connect_or_spawn().await.map_err(internal_error)?;
     let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     send_message(
         &mut stream,
@@ -103,17 +103,25 @@ pub async fn request(command: Command) -> Result<CommandOutput> {
             command,
         },
     )
-    .await?;
-    let response: Response = recv_message(&mut stream).await?;
-    if response.id != id {
-        return Err(anyhow!("Mismatched daemon response id"));
-    }
-    if response.protocol_version != PROTOCOL_VERSION {
-        return Err(anyhow!("Daemon protocol mismatch"));
+    .await
+    .map_err(internal_error)?;
+    let response: Response = recv_message(&mut stream).await.map_err(internal_error)?;
+    if response.id != id || response.protocol_version != PROTOCOL_VERSION {
+        return Err(AudbError {
+            code: ErrorCode::ProtocolMismatch,
+            message: "Invalid daemon response".into(),
+        });
     }
     match response.result {
         CommandResult::Success { output } => Ok(output),
-        CommandResult::Error { error, .. } => Err(anyhow!("{}: {}", error.code, error.message)),
+        CommandResult::Error { error, .. } => Err(error),
+    }
+}
+
+fn internal_error(error: impl std::fmt::Display) -> AudbError {
+    AudbError {
+        code: ErrorCode::InternalError,
+        message: error.to_string(),
     }
 }
 

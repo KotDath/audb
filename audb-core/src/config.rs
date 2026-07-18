@@ -23,6 +23,8 @@ pub struct EmulatorConfig {
     pub qmp_socket: PathBuf,
     pub sdk_root: PathBuf,
     pub emulator_name: String,
+    #[serde(skip)]
+    pub(crate) config_file: Option<PathBuf>,
 }
 
 impl Default for EmulatorConfig {
@@ -41,6 +43,7 @@ impl Default for EmulatorConfig {
             qmp_socket: PathBuf::from(DEFAULT_QMP_SOCKET),
             sdk_root,
             emulator_name: DEFAULT_EMULATOR_NAME.into(),
+            config_file: None,
         }
     }
 }
@@ -57,12 +60,14 @@ impl EmulatorConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let raw = fs::read_to_string(path)?;
-        serde_json::from_str(&raw).map_err(Into::into)
+        let raw = fs::read_to_string(&path)?;
+        let mut config: Self = serde_json::from_str(&raw)?;
+        config.config_file = Some(path);
+        Ok(config)
     }
 
     pub fn save(&self) -> CoreResult<()> {
-        let path = Self::config_path()?;
+        let path = self.storage_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -72,6 +77,18 @@ impl EmulatorConfig {
 
     pub fn qemu_bin(&self) -> PathBuf {
         self.sdk_root.join("share/qemu/bin/qemu-system-x86_64")
+    }
+
+    pub fn storage_path(&self) -> CoreResult<PathBuf> {
+        self.config_file
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(Self::config_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_config_file(&mut self, path: PathBuf) {
+        self.config_file = Some(path);
     }
     pub fn qemu_real(&self) -> PathBuf {
         self.sdk_root.join("share/qemu/bin/qemu-system-x86_64.real")

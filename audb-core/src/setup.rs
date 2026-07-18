@@ -142,7 +142,7 @@ pub fn status(config: &EmulatorConfig) -> CoreResult<Value> {
         "originalBinary": config.qemu_real(),
         "qmpSocket": config.qmp_socket,
         "pointingDeviceMode": if mouse_enabled(config) { "Mouse" } else { "Touchpad" },
-        "config": EmulatorConfig::config_path()?,
+        "config": config.storage_path()?,
     }))
 }
 
@@ -155,8 +155,7 @@ pub fn install(config: &EmulatorConfig) -> CoreResult<Value> {
             format!("QEMU binary not found: {}", qemu.display()),
         ));
     }
-    let wrapper_status;
-    if is_our_wrapper(&qemu)? {
+    let wrapper_status = if is_our_wrapper(&qemu)? {
         if !real.exists() {
             return Err(CoreError::runtime(
                 "audb wrapper exists but original QEMU binary is missing",
@@ -164,7 +163,7 @@ pub fn install(config: &EmulatorConfig) -> CoreResult<Value> {
         }
         fs::write(&qemu, wrapper(&config.qmp_socket))?;
         fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755))?;
-        wrapper_status = "updated";
+        "updated"
     } else {
         if script_marker(&qemu)?.is_some() {
             return Err(CoreError::runtime(format!(
@@ -184,8 +183,8 @@ pub fn install(config: &EmulatorConfig) -> CoreResult<Value> {
             return Err(error.into());
         }
         fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755))?;
-        wrapper_status = "installed";
-    }
+        "installed"
+    };
     let mouse_changed = set_mouse_mode(config)?;
     if let Some(parent) = config.qmp_socket.parent() {
         fs::create_dir_all(parent)?;
@@ -233,9 +232,12 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, EmulatorConfig) {
         let dir = tempdir().unwrap();
-        let mut config = EmulatorConfig::default();
-        config.sdk_root = dir.path().into();
-        config.qmp_socket = dir.path().join("run/qmp.sock");
+        let mut config = EmulatorConfig {
+            sdk_root: dir.path().into(),
+            qmp_socket: dir.path().join("run/qmp.sock"),
+            ..EmulatorConfig::default()
+        };
+        config.use_config_file(dir.path().join("config/emulator.json"));
         fs::create_dir_all(config.qemu_bin().parent().unwrap()).unwrap();
         fs::write(config.qemu_bin(), b"\x7fELFfake").unwrap();
         fs::create_dir_all(config.vmshare()).unwrap();

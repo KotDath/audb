@@ -1,407 +1,105 @@
-# audb - Aurora Debug Bridge
+# audb — Aurora Emulator Debug Bridge
 
-Development and debugging CLI tool for Aurora OS, similar to Android's ADB.
+`audb` is an emulator-only Aurora OS automation CLI. It provides the audb2 command set in one Rust binary and is designed for direct `execFile`/argv integration with automation clients such as claude-in-mobile.
 
-> ⚠️ **Beta Software**
-> 
-> This project is in beta. It may contain bugs or unexpected behavior.
-> If you encounter any issues, please report them in issues.
-
-## Features
-
-- **Device Management** - Add, remove, list, and select Aurora OS devices
-- **Package Management** - Install, uninstall, sign, and validate RPM packages
-- **Shell Access** - Execute commands on device (as user or root)
-- **File Transfer** - Push/pull files via SFTP
-- **Input Injection** - Tap, swipe, and key events via AudbBridge D-Bus helper app
-- **Screenshots** - Capture device screen
-- **App Control** - Launch and stop applications
-- **Logs** - View and filter system logs
-- **Device Info** - Get detailed hardware and software information
+Physical Aurora devices are intentionally not supported on `main` yet. The previous implementation is preserved in `backup/physical-devices-v0.1.0`.
 
 ## Requirements
 
-### Host Machine
+- Aurora SDK (default: `/home/kotdath/AuroraOS`, override with `AURORA_SDK_ROOT`)
+- Aurora SDK emulator `AuroraOS-5.2.0.180`
+- Rust toolchain for building
+- Docker and a local Aurora Build Tools image only for `package sign` and `package validate`
 
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| **Rust** | 1.70+ | For building from source |
-| **Docker** | Any | Required for `package sign` and `package validate` |
-| **Aurora Build Tools** | 5.2+ | Docker image for signing/validation |
+No helper application is installed on Aurora OS. Input uses QEMU QMP, screenshots use Lipstick's D-Bus API with QMP fallback, and guest operations use the SDK SSH key.
 
-### Target Device
-
-| Requirement | Notes |
-|-------------|-------|
-| **Aurora OS** | SSH access enabled |
-| **AudbBridge app** | Required for `tap`, `swipe`, `key` commands |
-| **Disabled sandbox** | AudbBridge package must be installed with `Sandboxing=Disabled` |
-| **devel-su access** | Root password must be configured inside AudbBridge |
-
-Install and prepare AudbBridge on device:
-```bash
-# Build/install the RPM from app/AudbBridge
-# Then launch AudbBridge on device and:
-# 1. Set devel-su password
-# 2. Run self-test
-```
-
-### Aurora SDK Docker Image
-
-For package signing and validation, you need the Aurora Build Tools Docker image.
-Download from [Aurora OS Developer Portal](https://developer.auroraos.ru/).
-
-Image names: `aurora-build-tools-*` or `aurora-os-build-engine-*`
-
-### Signing Keys
-
-Signing keys are automatically downloaded from Aurora OS developer portal on first use and cached in `~/.cache/audb/`.
-
-To use custom keys:
-```bash
-audb package sign app.rpm --key /path/to/key.pem --cert /path/to/cert.pem
-```
-
-## Installation
-
-### From crates.io
+## Build and setup
 
 ```bash
-cargo install audb-client audb-server
-```
-
-This installs both binaries:
-- `audb` - CLI client
-- `audb-server` - Background server daemon
-
-### From Source
-
-```bash
-git clone https://github.com/KotDath/audb
-cd audb
 cargo build --release
+target/release/audb install
+target/release/audb emulator start
+target/release/audb status
 ```
 
-Binaries will be at:
-- `target/release/audb` - CLI client
-- `target/release/audb-server` - Background server
+`audb install` is reversible and does not start or restart the emulator. It:
 
-### Add to PATH (from source)
+- wraps the SDK's `qemu-system-x86_64` and preserves the original as `.real`;
+- adds a QMP Unix socket and virtual multitouch/keyboard devices;
+- enables SDL mouse interaction and a visible host cursor;
+- migrates an existing audb2 wrapper safely.
+
+Use `audb uninstall` to restore the original QEMU binary and pointing-device files.
+
+## Automation contract
+
+Pass arguments without a shell and add global `--json` for one stable response document:
 
 ```bash
-# Option 1: Copy to /usr/local/bin
-sudo cp target/release/audb target/release/audb-server /usr/local/bin/
-
-# Option 2: Add to PATH in ~/.bashrc
-export PATH="$PATH:/path/to/audb/target/release"
+audb --json device current
+audb --json tap 180 400
+audb --json screenshot --output /tmp/screen.png
+audb --json app pid ru.example.App
 ```
 
-## Quick Start
+Success:
 
-```bash
-# 1. Add your device
-audb device add
-
-# 2. Select it as active
-audb select 0
-
-# 3. Install and open AudbBridge on the device
-#    Then set devel-su password and run self-test in the app
-
-# 4. Test connection
-audb ping
-
-# 5. Run a command
-audb shell uname -a
-```
-
-## Commands Reference
-
-### Device Management
-
-```bash
-# List all devices
-audb device list
-
-# List only connected devices
-audb device list --active
-
-# Add new device interactively
-audb device add
-
-# Remove device (by index, IP, or name)
-audb device remove 0
-audb device remove 192.168.2.15
-audb device remove my-device
-
-# Select active device
-audb select <identifier>
-```
-
-### Package Management
-
-```bash
-# Install RPM on device
-audb package install app.rpm
-
-# Uninstall package
-audb package uninstall ru.example.app
-
-# List installed packages
-audb package list
-audb package list --filter example
-
-# Sign RPM (local, uses Docker)
-audb package sign app.rpm
-
-# Validate RPM (local, uses Docker)
-audb package validate app.rpm
-```
-
-### Shell & File Operations
-
-```bash
-# Execute command
-audb shell ls -la /home/defaultuser
-
-# Execute as root
-audb shell --root cat /etc/passwd
-
-# Push file to device
-audb push local.txt /home/defaultuser/remote.txt
-
-# Pull file from device
-audb pull /home/defaultuser/file.txt
-audb pull /home/defaultuser/file.txt --output local.txt
-```
-
-### Input Injection
-
-`audb tap`, `audb swipe`, and `audb key` use the `ru.kotdath.AudbBridge` D-Bus service on the device.
-`python3` on the target device is no longer required for these commands.
-
-```bash
-# Tap at coordinates
-audb tap 360 720
-
-# Long press (500ms)
-audb tap 360 720 --duration 500
-
-# Fast tap (direct evdev, requires correct device)
-audb tap 360 720 --event auto
-audb tap 360 720 --event /dev/input/event4
-
-# Swipe by direction
-audb swipe left
-audb swipe right
-audb swipe up
-audb swipe down
-
-# Swipe by coordinates
-audb swipe 100 500 600 500
-
-# Fast swipe
-audb swipe left --event auto
-
-# Key events
-audb key power
-audb key home
-audb key back
-audb key volumeup    # or vol+
-audb key volumedown  # or vol-
-```
-
-**Note:** Tap and swipe automatically handle screen rotation through AudbBridge.
-
-### Screenshots
-
-```bash
-# Save with auto-generated name
-audb screenshot
-
-# Save to specific file
-audb screenshot --output screen.png
-```
-
-### Application Control
-
-```bash
-# Launch app
-audb launch ru.example.app
-
-# Stop app
-audb stop ru.example.app
-
-# Open URL
-audb open https://example.com
-audb open file:///home/defaultuser/doc.pdf
-```
-
-### Logs
-
-```bash
-# Last 100 lines
-audb logs
-
-# Last 500 lines
-audb logs -n 500
-
-# Filter by priority
-audb logs --priority err
-audb logs --priority warning
-
-# Filter by unit
-audb logs --unit lipstick
-
-# Grep pattern
-audb logs --grep "error"
-
-# Since time
-audb logs --since "1 hour ago"
-
-# Kernel messages
-audb logs --kernel
-
-# Clear logs
-audb logs --clear --force
-```
-
-### Device Info
-
-```bash
-# All info
-audb info
-
-# Specific category
-audb info device
-audb info cpu
-audb info memory
-audb info battery
-audb info storage
-audb info features
-```
-
-### Server Management
-
-```bash
-# Check server status
-audb server-status
-
-# Ping server
-audb ping
-
-# Start server manually
-audb start-server
-audb start-server --foreground
-
-# Stop server
-audb kill-server
-
-# Force reconnect
-audb reconnect
-audb reconnect <device>
-```
-
-### Global Options
-
-```bash
-# Use specific device for this command
-audb -d 192.168.2.15 shell uname -a
-audb --device my-device info
-```
-
-## Configuration
-
-### Device Storage
-
-`~/.config/audb/devices.json`:
 ```json
-{
-  "aurora-devices": [
-    {
-      "name": "My Device",
-      "host": "192.168.2.15",
-      "port": 22,
-      "auth": "/home/user/.ssh/id_rsa",
-      "rootPassword": "password",
-      "platform": "aurora-arm64",
-      "enabled": true
-    }
-  ]
-}
+{"ok":true,"deviceId":"emulator","data":{}}
 ```
 
-### Current Device
+Failure:
 
-`~/.config/audb/current_device` - stores selected device identifier
-
-### Server PID
-
-`~/.config/audb/server.pid` - server process ID
-
-## Architecture
-
-```
-┌─────────────┐     Unix Socket     ┌─────────────┐     SSH/SFTP     ┌────────────┐
-│  audb CLI   │ ◄─────────────────► │ audb-server │ ◄──────────────► │   Device   │
-└─────────────┘                     └─────────────┘                  └────────────┘
-                                                                    │
-                                                                    │ session D-Bus
-                                                                    ▼
-                                                            ┌──────────────────┐
-                                                            │   AudbBridge     │
-                                                            │  helper app      │
-                                                            └──────────────────┘
+```json
+{"ok":false,"deviceId":"emulator","error":{"code":"QMP_ERROR","message":"..."}}
 ```
 
-- **audb** - CLI client, sends commands to server
-- **audb-server** - Background daemon, manages SSH connections
-- **Connection Pool** - Persistent SSH sessions with auto-reconnect
-- **Health Check** - Automatic connection monitoring (60s interval)
-- **AudbBridge** - Aurora helper application with disabled sandbox, exposes privileged input methods over session D-Bus
+The public process starts a private daemon mode automatically. The daemon keeps SSH and QMP sessions alive, but there is no separate server binary or public server-management API.
 
-## Touchscreen Devices
+## Commands
 
-Known touchscreen event devices:
-- **R570**: `/dev/input/event3` (chsc_cap_touch)
-- **KVADRA_T**: `/dev/input/event5` (himax-touchscreen)
+```text
+tap, swipe, text, key, screenshot, status
+install, uninstall, setup-status
+emulator start|stop|status
+device list|current, select
+shell, push, pull, open, info, logs
+launch, stop, app ...
+display status|on|off|dim|lock|wake
+perf snapshot|monitor|visual-fps
+crash list|watch|clear
+sandbox paths|list|pull|sqlite
+network status|interfaces|traffic|proxy|offline
+location set|track
+sensor list|enable|disable|set-vector|set-scalar
+clipboard status|get|set|clear
+package list|install|uninstall|sign|validate
+```
 
-Use `--event auto` to auto-detect, or specify directly for faster input.
+Run `audb <command> --help` for arguments. `clipboard status` reports the known emulator limitation; mutating clipboard commands return `CAPABILITY_UNAVAILABLE`.
 
-## Troubleshooting
+Useful examples:
 
-### "No device selected"
 ```bash
-audb device list
-audb select 0
+audb tap 180 400
+audb swipe up
+audb swipe fast-left
+audb swipe edge-up
+audb text "Hello Aurora"
+audb screenshot --output screen.png
+
+audb app launch ru.example.App
+audb app wait-running ru.example.App --timeout 15
+audb display lock
+audb sandbox sqlite ru.example.App data database.sqlite "select * from items limit 10"
+audb network proxy set 127.0.0.1 8080
+audb location set 55.751244 37.618423
 ```
 
-### "Device disconnected"
-```bash
-audb reconnect
-# or check device status
-audb server-status
-```
+## Safety notes
 
-### "AudbBridge not available" (tap/swipe/key)
-```bash
-# On device:
-# 1. Install ru.kotdath.AudbBridge
-# 2. Launch the app
-# 3. Set devel-su password in the app
-# 4. Run self-test
-```
-
-### Server issues
-```bash
-audb kill-server
-audb ping  # auto-starts server
-```
-
-## Acknowledgments
-
-- Inspired by [aurora-cli](https://gitcode.com/keygenqt_vz/aurora-cli) by Vitaliy Zarubin
-
-## License
-
-MIT License
+- `-d/--device` accepts only `emulator`; device registry mutations return `UNSUPPORTED_IN_EMULATOR_ONLY`.
+- Sandbox paths are canonicalized in the guest and cannot escape an application's private roots.
+- SQLite accepts only read-only query prefixes and limits output to 1000 rows.
+- `app clear-data` requires either `--dry-run` or explicit `--confirm`.
+- `logs --clear` requires `--force`.
