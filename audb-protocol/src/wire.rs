@@ -45,8 +45,9 @@ pub async fn recv_message<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Command, Request, Response, CommandResult, CommandOutput};
-    use tokio::io::DuplexStream;
+    use crate::types::{
+        Command, CommandOutput, CommandResult, Request, Response, PROTOCOL_VERSION,
+    };
 
     #[tokio::test]
     async fn test_send_recv_request() {
@@ -55,6 +56,7 @@ mod tests {
         // Send request from client
         let request = Request {
             id: 42,
+            protocol_version: PROTOCOL_VERSION,
             command: Command::Ping,
         };
 
@@ -74,8 +76,9 @@ mod tests {
         // Send response from server
         let response = Response {
             id: 42,
+            protocol_version: PROTOCOL_VERSION,
             result: CommandResult::Success {
-                output: CommandOutput::Unit,
+                output: CommandOutput::Empty,
             },
         };
 

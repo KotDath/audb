@@ -1,9 +1,15 @@
-pub mod features;
-pub mod tools;
+pub mod app;
+pub mod backend;
+pub mod config;
+pub mod display;
+pub mod emulator;
+pub mod error;
+pub mod input;
+pub mod qmp;
+pub mod screenshot;
+pub mod setup;
+pub mod transport;
 
-// Re-export commonly used types
-pub use features::*;
-pub use tools::*;
-
-// Re-export specific types to crate root
-pub use tools::types::LogLevel;
+pub use backend::EmulatorBackend;
+pub use config::EmulatorConfig;
+pub use error::{CoreError, CoreResult};

@@ -25,6 +25,12 @@ thiserror = "2.0"
 colored = "2.0"
 audb-protocol = { version = "0.1.0", path = "../audb-protocol" }
 libc = "0.2"
+regex = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+png = "0.17"
+async-trait = "0.1"
 
 [lib]
 name = "audb_core"
