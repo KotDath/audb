@@ -45,6 +45,8 @@ pub enum CommandOutput {
 pub struct AudbError {
     pub code: ErrorCode,
     pub message: String,
+    #[serde(skip)]
+    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

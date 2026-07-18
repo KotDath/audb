@@ -9,6 +9,7 @@ fn error(code: ErrorCode, message: impl Into<String>) -> AudbError {
     AudbError {
         code,
         message: message.into(),
+        data: None,
     }
 }
 fn check_rpm(path: &str) -> Result<PathBuf, AudbError> {

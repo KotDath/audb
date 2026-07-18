@@ -1,4 +1,5 @@
 use audb_protocol::{AudbError, ErrorCode};
+use serde_json::Value;
 use thiserror::Error;
 
 pub type CoreResult<T> = Result<T, CoreError>;
@@ -8,6 +9,7 @@ pub type CoreResult<T> = Result<T, CoreError>;
 pub struct CoreError {
     pub code: ErrorCode,
     pub message: String,
+    pub data: Option<Value>,
 }
 
 impl CoreError {
@@ -15,7 +17,13 @@ impl CoreError {
         Self {
             code,
             message: message.into(),
+            data: None,
         }
+    }
+
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -40,6 +48,7 @@ impl From<CoreError> for AudbError {
         Self {
             code: value.code,
             message: value.message,
+            data: value.data,
         }
     }
 }

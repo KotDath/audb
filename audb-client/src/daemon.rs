@@ -60,6 +60,7 @@ async fn serve(mut stream: UnixStream, backend: Arc<Mutex<EmulatorBackend>>) -> 
                         "Protocol {} required, got {}",
                         PROTOCOL_VERSION, request.protocol_version
                     ),
+                    data: None,
                 },
                 data: None,
             }
@@ -70,10 +71,13 @@ async fn serve(mut stream: UnixStream, backend: Arc<Mutex<EmulatorBackend>>) -> 
         } else {
             match backend.lock().await.execute(request.command).await {
                 Ok(output) => CommandResult::Success { output },
-                Err(error) => CommandResult::Error {
-                    error: error.into(),
-                    data: None,
-                },
+                Err(error) => {
+                    let data = error.data.clone();
+                    CommandResult::Error {
+                        error: error.into(),
+                        data,
+                    }
+                }
             }
         };
         let response = Response {
@@ -110,11 +114,15 @@ pub async fn typed_request(command: Command) -> std::result::Result<CommandOutpu
         return Err(AudbError {
             code: ErrorCode::ProtocolMismatch,
             message: "Invalid daemon response".into(),
+            data: None,
         });
     }
     match response.result {
         CommandResult::Success { output } => Ok(output),
-        CommandResult::Error { error, .. } => Err(error),
+        CommandResult::Error { mut error, data } => {
+            error.data = data;
+            Err(error)
+        }
     }
 }
 
@@ -122,6 +130,7 @@ fn internal_error(error: impl std::fmt::Display) -> AudbError {
     AudbError {
         code: ErrorCode::InternalError,
         message: error.to_string(),
+        data: None,
     }
 }
 

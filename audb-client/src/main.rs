@@ -946,7 +946,11 @@ fn emit(json_mode: bool, value: Value, text: Option<String>) {
 }
 fn emit_error(json_mode: bool, error: &AudbError) {
     if json_mode {
-        println!("{}",serde_json::to_string(&json!({"ok":false,"deviceId":EMULATOR_ID,"error":{"code":error.code,"message":error.message}})).unwrap())
+        let mut document = json!({"ok":false,"deviceId":EMULATOR_ID,"error":{"code":error.code,"message":error.message}});
+        if let Some(data) = &error.data {
+            document["data"] = data.clone();
+        }
+        println!("{}", serde_json::to_string(&document).unwrap())
     } else {
         eprintln!("Error: {}", error.message)
     }
@@ -965,6 +969,7 @@ fn error(code: ErrorCode, message: impl Into<String>) -> AudbError {
     AudbError {
         code,
         message: message.into(),
+        data: None,
     }
 }
 fn internal(e: impl std::fmt::Display) -> AudbError {

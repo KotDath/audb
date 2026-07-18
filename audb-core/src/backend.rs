@@ -139,7 +139,7 @@ impl EmulatorBackend {
                     Err(CoreError::new(
                         audb_protocol::ErrorCode::AppWaitTimeout,
                         format!("Timed out waiting for {package}"),
-                    ))
+                    ).with_data(result))
                 } else {
                     Ok(CommandOutput::Json(result))
                 }
@@ -186,7 +186,7 @@ impl EmulatorBackend {
                     Err(CoreError::new(
                         audb_protocol::ErrorCode::DisplayStateTimeout,
                         "MCE did not reach the requested state",
-                    ))
+                    ).with_data(result))
                 } else {
                     Ok(CommandOutput::Json(result))
                 }
@@ -326,7 +326,7 @@ impl EmulatorBackend {
             Command::ClipboardUnavailable => Err(CoreError::new(
                 audb_protocol::ErrorCode::CapabilityUnavailable,
                 "Aurora emulator does not expose a reliable clipboard API",
-            )),
+            ).with_data(json!({"available":false,"reason":"Aurora emulator does not expose a reliable global clipboard API without an application-side helper"}))),
             Command::QmpStatus { .. }
             | Command::Tap { .. }
             | Command::Swipe { .. }
