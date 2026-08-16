@@ -24,7 +24,7 @@ target/release/audb status
 
 `audb install` is reversible and does not start or restart the emulator. It:
 
-- wraps the SDK's `qemu-system-x86_64` and preserves the original as `.real`;
+- wraps the SDK's QEMU binary matching the host architecture (`qemu-system-x86_64` on Linux, `qemu-system-aarch64` on Apple Silicon macOS) and preserves the original as `.real`;
 - adds a QMP Unix socket and virtual multitouch/keyboard devices;
 - enables SDL mouse interaction and a visible host cursor;
 - migrates an existing audb2 wrapper safely.

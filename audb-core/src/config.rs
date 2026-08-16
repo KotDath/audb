@@ -75,8 +75,16 @@ impl EmulatorConfig {
         Ok(())
     }
 
+    /// SDK ships a QEMU binary matching the host CPU architecture
+    /// (e.g. `qemu-system-aarch64` on Apple Silicon macOS).
+    pub fn qemu_binary_name() -> String {
+        format!("qemu-system-{}", std::env::consts::ARCH)
+    }
+
     pub fn qemu_bin(&self) -> PathBuf {
-        self.sdk_root.join("share/qemu/bin/qemu-system-x86_64")
+        self.sdk_root
+            .join("share/qemu/bin")
+            .join(Self::qemu_binary_name())
     }
 
     pub fn storage_path(&self) -> CoreResult<PathBuf> {
@@ -91,7 +99,9 @@ impl EmulatorConfig {
         self.config_file = Some(path);
     }
     pub fn qemu_real(&self) -> PathBuf {
-        self.sdk_root.join("share/qemu/bin/qemu-system-x86_64.real")
+        self.sdk_root
+            .join("share/qemu/bin")
+            .join(format!("{}.real", Self::qemu_binary_name()))
     }
     pub fn sfdk(&self) -> PathBuf {
         self.sdk_root.join("bin/sfdk")

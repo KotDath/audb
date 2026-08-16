@@ -17,12 +17,12 @@ const MOUSE_FILES: [(&str, &str); 2] = [
     ("99-qemu-touch.rules", TABLET_IGNORE),
 ];
 
-fn wrapper(socket: &Path) -> String {
+fn wrapper(socket: &Path, real_binary_name: &str) -> String {
     format!(
         r##"#!/bin/bash
 # audb QEMU wrapper - injects QMP and virtual input devices
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ORIG_BIN="${{SCRIPT_DIR}}/qemu-system-x86_64.real"
+ORIG_BIN="${{SCRIPT_DIR}}/{real_binary_name}"
 QMP_SOCKET="{}"
 mkdir -p "$(dirname "$QMP_SOCKET")"
 HAS_QMP=false
@@ -48,6 +48,21 @@ exec "$ORIG_BIN" "${{ARGS[@]}}"
     )
 }
 
+/// Native binary magic bytes: ELF (Linux) and Mach-O thin/fat (macOS).
+const BINARY_MAGICS: [[u8; 4]; 7] = [
+    *b"\x7fELF",
+    [0xFE, 0xED, 0xFA, 0xCE],
+    [0xFE, 0xED, 0xFA, 0xCF],
+    [0xCE, 0xFA, 0xED, 0xFE],
+    [0xCF, 0xFA, 0xED, 0xFE],
+    [0xCA, 0xFE, 0xBA, 0xBE],
+    [0xCA, 0xFE, 0xBA, 0xBF],
+];
+
+fn real_binary_name() -> String {
+    format!("{}.real", EmulatorConfig::qemu_binary_name())
+}
+
 fn script_marker(path: &Path) -> CoreResult<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -55,7 +70,7 @@ fn script_marker(path: &Path) -> CoreResult<Option<String>> {
     let mut file = fs::File::open(path)?;
     let mut magic = [0_u8; 4];
     file.read_exact(&mut magic)?;
-    if magic == *b"\x7fELF" {
+    if BINARY_MAGICS.contains(&magic) {
         return Ok(None);
     }
     Ok(Some(fs::read_to_string(path)?))
@@ -164,7 +179,7 @@ pub fn install(config: &EmulatorConfig) -> CoreResult<Value> {
                 "audb wrapper exists but original QEMU binary is missing",
             ));
         }
-        fs::write(&qemu, wrapper(&config.qmp_socket))?;
+        fs::write(&qemu, wrapper(&config.qmp_socket, &real_binary_name()))?;
         fs::set_permissions(&qemu, fs::Permissions::from_mode(0o755))?;
         "updated"
     } else {
@@ -181,7 +196,7 @@ pub fn install(config: &EmulatorConfig) -> CoreResult<Value> {
             )));
         }
         fs::rename(&qemu, &real)?;
-        if let Err(error) = fs::write(&qemu, wrapper(&config.qmp_socket)) {
+        if let Err(error) = fs::write(&qemu, wrapper(&config.qmp_socket, &real_binary_name())) {
             let _ = fs::rename(&real, &qemu);
             return Err(error.into());
         }
@@ -272,5 +287,37 @@ mod tests {
         assert!(fs::read_to_string(config.qemu_bin())
             .unwrap()
             .contains("/tmp/"));
+    }
+
+    #[test]
+    fn qemu_binary_matches_host_arch() {
+        let expected = format!("qemu-system-{}", std::env::consts::ARCH);
+        assert_eq!(EmulatorConfig::qemu_binary_name(), expected);
+        let (_dir, config) = fixture();
+        assert_eq!(
+            config.qemu_bin().file_name().unwrap().to_str().unwrap(),
+            expected
+        );
+        assert_eq!(
+            config.qemu_real().file_name().unwrap().to_str().unwrap(),
+            format!("{expected}.real")
+        );
+        install(&config).unwrap();
+        let wrapper_script = fs::read_to_string(config.qemu_bin()).unwrap();
+        assert!(wrapper_script.contains(&format!("{expected}.real")));
+    }
+
+    #[test]
+    fn mach_o_binary_is_not_treated_as_script() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("qemu-system-aarch64");
+        for magic in [
+            [0xFE, 0xED, 0xFA, 0xCF],
+            [0xCF, 0xFA, 0xED, 0xFE],
+            [0xCA, 0xFE, 0xBA, 0xBE],
+        ] {
+            fs::write(&path, magic).unwrap();
+            assert!(script_marker(&path).unwrap().is_none());
+        }
     }
 }
