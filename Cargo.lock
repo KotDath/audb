@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "audb-client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "audb-core",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "audb-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "audb-protocol",
  "chrono",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "audb-protocol"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "serde",

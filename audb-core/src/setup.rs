@@ -20,7 +20,7 @@ const MOUSE_FILES: [(&str, &str); 2] = [
 fn wrapper(socket: &Path, real_binary_name: &str) -> String {
     format!(
         r##"#!/bin/bash
-# audb QEMU wrapper - injects QMP and virtual input devices
+# audb QEMU wrapper - QMP, input devices, and a software surface for screendump
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ORIG_BIN="${{SCRIPT_DIR}}/{real_binary_name}"
 QMP_SOCKET="{}"
@@ -34,7 +34,23 @@ for arg in "$@"; do
     -qmp) HAS_QMP=true ;;
     virtio-multitouch-pci) HAS_MULTITOUCH=true ;;
     virtio-keyboard-pci) HAS_KEYBOARD=true ;;
-    sdl,gl=on,show-cursor=off) ARGS+=("sdl,gl=on,show-cursor=on"); continue ;;
+    virtio-vga-gl|virtio-vga-gl,*)
+      ARGS+=("virtio-vga${{arg#virtio-vga-gl}}")
+      continue
+      ;;
+    sdl,gl=on)
+      ARGS+=("sdl,show-cursor=on")
+      continue
+      ;;
+    sdl,gl=on,*)
+      rest="${{arg#sdl,gl=on,}}"
+      rest="${{rest//show-cursor=off/show-cursor=on}}"
+      case ",$rest," in
+        *,show-cursor=on,*) ARGS+=("sdl,$rest") ;;
+        *) ARGS+=("sdl,$rest,show-cursor=on") ;;
+      esac
+      continue
+      ;;
     sdl,show-cursor=off) ARGS+=("sdl,show-cursor=on"); continue ;;
   esac
   ARGS+=("$arg")
@@ -305,6 +321,8 @@ mod tests {
         install(&config).unwrap();
         let wrapper_script = fs::read_to_string(config.qemu_bin()).unwrap();
         assert!(wrapper_script.contains(&format!("{expected}.real")));
+        assert!(wrapper_script.contains("virtio-vga${arg#virtio-vga-gl}"));
+        assert!(wrapper_script.contains("sdl,gl=on,*)"));
     }
 
     #[test]
