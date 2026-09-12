@@ -140,7 +140,7 @@ pub async fn visual(
     }
     longest = longest.max(Instant::now().duration_since(static_start));
     Ok(
-        json!({"backend":"lipstick-dbus/qmp-screendump","rendererFps":Value::Null,"metric":"changed-frame-rate","durationMs":elapsed.as_secs_f64()*1000.0,"samples":frames.len(),"sampleRateHz":frames.len()as f64/elapsed.as_secs_f64(),"changedFrames":changes,"changedFrameRateHz":changes as f64/elapsed.as_secs_f64(),"longestStaticMs":longest.as_secs_f64()*1000.0,"freezeThresholdMs":threshold.as_secs_f64()*1000.0,"freezeDetected":longest>=threshold,"limitations":"Detects visible pixel changes only; this is not Qt renderer FPS."}),
+        json!({"backend":"qmp-screendump/host-qemu-window","rendererFps":Value::Null,"metric":"changed-frame-rate","durationMs":elapsed.as_secs_f64()*1000.0,"samples":frames.len(),"sampleRateHz":frames.len()as f64/elapsed.as_secs_f64(),"changedFrames":changes,"changedFrameRateHz":changes as f64/elapsed.as_secs_f64(),"longestStaticMs":longest.as_secs_f64()*1000.0,"freezeThresholdMs":threshold.as_secs_f64()*1000.0,"freezeDetected":longest>=threshold,"limitations":"Detects visible pixel changes only; this is not Qt renderer FPS."}),
     )
 }
 

@@ -24,6 +24,10 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+png = "0.18"
+x11rb = "0.14"
+
 [lib]
 name = "audb_core"
 path = "src/lib.rs"

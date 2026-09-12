@@ -11,7 +11,7 @@ Physical Aurora devices are intentionally not supported on `main` yet. The previ
 - Rust toolchain for building
 - Docker and a local Aurora Build Tools image only for `package sign` and `package validate`
 
-No helper application is installed on Aurora OS. Input uses QEMU QMP, screenshots use Lipstick's D-Bus API with QMP fallback, and guest operations use the SDK SSH key.
+No helper application is installed on Aurora OS. Input uses QEMU QMP, screenshots use QMP with an exact QEMU-window fallback on Linux for GL scanout, and guest operations use the SDK SSH key.
 
 ## Build and setup
 
