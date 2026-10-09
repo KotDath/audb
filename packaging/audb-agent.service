@@ -1,0 +1,25 @@
+[Unit]
+Description=Audb device automation service
+After=systemd-udevd.service lipstick.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/audb-agent
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=audb-agent
+RuntimeDirectoryMode=0755
+TimeoutStopSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+# Keep home directories hidden, expose only session runtime buses read-only.
+BindReadOnlyPaths=/run/user
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+DevicePolicy=closed
+DeviceAllow=/dev/uinput rw
+ReadWritePaths=/run/audb-agent
+
+[Install]
+WantedBy=multi-user.target

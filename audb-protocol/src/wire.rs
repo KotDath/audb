@@ -7,7 +7,7 @@ pub async fn send_message<T: Serialize, W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &T,
 ) -> Result<()> {
-    let json = serde_json::to_vec(msg)?;
+    let json = zeroize::Zeroizing::new(serde_json::to_vec(msg)?);
     let len = json.len() as u32;
 
     // Write length prefix (4 bytes, little-endian)
@@ -35,7 +35,7 @@ pub async fn recv_message<T: DeserializeOwned, R: AsyncReadExt + Unpin>(
     }
 
     // Read JSON payload
-    let mut buf = vec![0u8; len];
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; len]);
     reader.read_exact(&mut buf).await?;
 
     // Deserialize
@@ -56,7 +56,9 @@ mod tests {
         // Send request from client
         let request = Request {
             id: 42,
+            device_id: Some("phone".into()),
             protocol_version: PROTOCOL_VERSION,
+            timeout_ms: 300_000,
             command: Command::Ping,
         };
 
@@ -76,6 +78,7 @@ mod tests {
         // Send response from server
         let response = Response {
             id: 42,
+            device_id: Some("phone".into()),
             protocol_version: PROTOCOL_VERSION,
             result: CommandResult::Success {
                 output: CommandOutput::Empty,

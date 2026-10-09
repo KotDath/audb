@@ -1,11 +1,11 @@
 use crate::error::{CoreError, CoreResult};
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 const PREFIX: &str = "gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request";
 
-async fn call(transport: &mut EmulatorTransport, method: &str, root: bool) -> CoreResult<String> {
+async fn call(transport: &mut DeviceTransport, method: &str, root: bool) -> CoreResult<String> {
     transport.exec(&format!("{PREFIX}.{method}"), root).await
 }
 
@@ -21,7 +21,7 @@ fn variant(raw: &str) -> String {
     raw.trim_matches(|c| "(), ".contains(c)).to_string()
 }
 
-pub async fn status(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn status(transport: &mut DeviceTransport) -> CoreResult<Value> {
     let display = variant(&call(transport, "get_display_status", false).await?);
     Ok(json!({
         "display": if display == "dimmed" { "dim" } else { &display },
@@ -31,7 +31,7 @@ pub async fn status(transport: &mut EmulatorTransport) -> CoreResult<Value> {
     }))
 }
 
-async fn set_policy(transport: &mut EmulatorTransport, value: i32) -> CoreResult<bool> {
+async fn set_policy(transport: &mut DeviceTransport, value: i32) -> CoreResult<bool> {
     let key = shell_quote("/system/osso/dsm/display/display_never_blank");
     let value = shell_quote(&format!("<int32 {value}>"));
     Ok(transport
@@ -42,7 +42,7 @@ async fn set_policy(transport: &mut EmulatorTransport, value: i32) -> CoreResult
 }
 
 pub async fn set(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     action: &str,
     timeout: Duration,
 ) -> CoreResult<Value> {

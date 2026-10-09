@@ -1,22 +1,25 @@
-use crate::config::EmulatorConfig;
+use crate::devices::{DeviceConfig, DeviceKind};
 use crate::error::{CoreError, CoreResult};
 use crate::qmp::QmpClient;
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use audb_protocol::{Command, CommandOutput};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
-pub struct EmulatorBackend {
-    pub config: EmulatorConfig,
-    pub transport: EmulatorTransport,
-    pub qmp: QmpClient,
+pub struct DeviceBackend {
+    pub config: DeviceConfig,
+    pub transport: DeviceTransport,
+    pub qmp: Option<QmpClient>,
 }
 
-impl EmulatorBackend {
-    pub fn new(config: EmulatorConfig) -> Self {
-        let qmp = QmpClient::new(config.qmp_socket.clone());
-        let transport = EmulatorTransport::new(config.clone());
+impl DeviceBackend {
+    pub fn new(config: DeviceConfig) -> Self {
+        let qmp = config
+            .emulator
+            .as_ref()
+            .map(|e| QmpClient::new(e.qmp_socket.clone()));
+        let transport = DeviceTransport::new(config.clone());
         Self {
             config,
             transport,
@@ -29,18 +32,68 @@ impl EmulatorBackend {
         command: Command,
         socket: Option<String>,
     ) -> CoreResult<CommandOutput> {
-        let custom = socket
-            .as_deref()
-            .is_some_and(|path| Path::new(path) != self.config.qmp_socket);
+        let custom = socket.as_deref().is_some_and(|path| {
+            Some(Path::new(path))
+                != self
+                    .config
+                    .emulator
+                    .as_ref()
+                    .map(|e| e.qmp_socket.as_path())
+        });
+        if self.config.kind == DeviceKind::Physical {
+            if socket.is_some() {
+                return Err(CoreError::invalid("--socket applies only to emulator QMP"));
+            }
+            return crate::physical_input::execute(&mut self.transport, command).await;
+        }
+        // Prefer the same input implementation on both targets. A read-only
+        // capability probe precedes dispatch; never replay a failed input action.
+        if !custom && matches!(&command, Command::Text { .. } | Command::Key { .. }) {
+            let status =
+                crate::physical_input::call(&mut self.transport, json!({"command":"status"})).await;
+            // QMP remains available if this read-only probe fails.
+            if let Ok(data) = status {
+                let capability = if matches!(&command, Command::Text { .. }) {
+                    "text"
+                } else {
+                    "key"
+                };
+                if data["capabilities"][capability] == true {
+                    return crate::physical_input::execute(&mut self.transport, command).await;
+                }
+            }
+        }
         if custom {
             let mut qmp = QmpClient::new(socket.unwrap());
             execute_qmp(&mut qmp, &mut self.transport, command).await
         } else {
-            execute_qmp(&mut self.qmp, &mut self.transport, command).await
+            execute_qmp(
+                self.qmp.as_mut().expect("emulator QMP"),
+                &mut self.transport,
+                command,
+            )
+            .await
         }
     }
 
     pub async fn execute(&mut self, command: Command) -> CoreResult<CommandOutput> {
+        if self.config.kind == DeviceKind::Physical
+            && matches!(
+                &command,
+                Command::LocationSet { .. }
+                    | Command::LocationTrackLoad { .. }
+                    | Command::LocationTrackAction { .. }
+                    | Command::SensorList
+                    | Command::SensorEnable { .. }
+                    | Command::SensorVector { .. }
+                    | Command::SensorScalar { .. }
+            )
+        {
+            return Err(CoreError::new(
+                audb_protocol::ErrorCode::CapabilityUnavailable,
+                "Location and sensor emulation is only supported on emulators",
+            ));
+        }
         let qmp_socket = match &command {
             Command::QmpStatus { socket }
             | Command::Tap { socket, .. }
@@ -55,9 +108,37 @@ impl EmulatorBackend {
             return self.qmp_command(command, socket).await;
         }
         match command {
+            Command::Doctor | Command::Capabilities => {
+                let report = crate::readiness::inspect(&mut self.transport, self.qmp.as_mut()).await;
+                let value = if matches!(command, Command::Doctor) {
+                    serde_json::to_value(report)?
+                } else {
+                    json!({"reportVersion": report.report_version, "device": report.device,
+                        "capabilities": report.capabilities})
+                };
+                Ok(CommandOutput::Json(value))
+            }
+            Command::Permission { application_id, action } => {
+                Ok(CommandOutput::Json(crate::permission::execute(&mut self.transport, &application_id, action).await?))
+            }
+            Command::DeviceStatus => {
+                let ssh = match self.transport.exec("true", false).await {
+                    Ok(_) => json!({"connected": true}),
+                    Err(e) => json!({"connected": false, "error": {"code": e.code, "message": e.message}}),
+                };
+                let agent = if self.config.kind == DeviceKind::Physical && ssh["connected"] == true {
+                    match crate::physical_input::call(&mut self.transport, json!({"command":"status"})).await {
+                        Ok(data) => json!({"implemented":true,"connected":true,"data":data}),
+                        Err(e) => json!({"implemented":true,"connected":false,"error":{"code":e.code,"message":e.message}}),
+                    }
+                } else {json!({"applicable":false})};
+                Ok(CommandOutput::Json(json!({"id": self.config.id, "kind": self.config.kind,
+                    "ssh": ssh, "agent": agent,
+                    "qmp": {"applicable": self.config.kind == DeviceKind::Emulator}})))
+            }
             Command::Ping => Ok(CommandOutput::Text("pong".into())),
             Command::Shell { root, command_line } => Ok(CommandOutput::Text(
-                self.transport.exec(&command_line, root).await?,
+                self.transport.exec_raw(&command_line, root).await?,
             )),
             Command::Push {
                 local_path,
@@ -118,8 +199,14 @@ impl EmulatorBackend {
             Command::PackageList { filter } => Ok(CommandOutput::Json(
                 crate::system::package_list(&mut self.transport, filter.as_deref()).await?,
             )),
-            Command::PackageInstall { name, bytes } => Ok(CommandOutput::Json(
-                crate::system::package_install(&mut self.transport, &name, &bytes).await?,
+            Command::PackageInstall { local_path, timeout_ms } => Ok(CommandOutput::Json(
+                crate::system::package_install(&mut self.transport, Path::new(&local_path), Duration::from_millis(timeout_ms)).await?,
+            )),
+            Command::SystemPackageInstall { local_path, options } => Ok(CommandOutput::Json(
+                crate::system_package::install_system_package(&mut self.transport, Path::new(&local_path), options).await?,
+            )),
+            Command::SetupDevice { local_path, options } => Ok(CommandOutput::Json(
+                crate::system_package::setup_device(&mut self.transport, Path::new(&local_path), options).await?,
             )),
             Command::PackageUninstall { package } => Ok(CommandOutput::Json(
                 crate::system::package_uninstall(&mut self.transport, &package).await?,
@@ -366,7 +453,7 @@ impl EmulatorBackend {
 
 async fn execute_qmp(
     qmp: &mut QmpClient,
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     command: Command,
 ) -> CoreResult<CommandOutput> {
     match command {

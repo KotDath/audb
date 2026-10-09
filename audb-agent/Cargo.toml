@@ -1,0 +1,17 @@
+[package]
+name = "audb-agent"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+tempfile = { workspace = true }
+crc32fast = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+audb-protocol = { path = "../audb-protocol" }
+zbus = "5.19"
+roxmltree = "0.21"

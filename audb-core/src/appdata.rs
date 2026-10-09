@@ -1,6 +1,6 @@
 use crate::app;
 use crate::error::{CoreError, CoreResult};
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
@@ -17,7 +17,7 @@ fn component(value: &str, label: &str) -> CoreResult<()> {
         Ok(())
     }
 }
-pub async fn metadata(t: &mut EmulatorTransport, package: &str) -> CoreResult<Value> {
+pub async fn metadata(t: &mut DeviceTransport, package: &str) -> CoreResult<Value> {
     app::validate_package(package)?;
     let paths = [
         format!("/usr/share/applications/{package}.desktop"),
@@ -58,7 +58,7 @@ pub async fn metadata(t: &mut EmulatorTransport, package: &str) -> CoreResult<Va
         json!({"package":package,"desktopFile":desktop,"organization":org,"application":application}),
     )
 }
-pub async fn paths(t: &mut EmulatorTransport, package: &str) -> CoreResult<Value> {
+pub async fn paths(t: &mut DeviceTransport, package: &str) -> CoreResult<Value> {
     let mut m = metadata(t, package).await?;
     let org = m["organization"].as_str().unwrap();
     let app = m["application"].as_str().unwrap();
@@ -84,7 +84,7 @@ pub async fn paths(t: &mut EmulatorTransport, package: &str) -> CoreResult<Value
     Ok(m)
 }
 async fn roots(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
 ) -> CoreResult<std::collections::HashMap<String, String>> {
     Ok(paths(t, package).await?["paths"]
@@ -114,7 +114,7 @@ fn relative(value: &str) -> CoreResult<String> {
     Ok(out.join("/"))
 }
 async fn resolve(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     kind: &str,
     path: &str,
@@ -161,7 +161,7 @@ async fn resolve(
     }
     Ok((lines[0].into(), lines[1].into()))
 }
-pub async fn clear(t: &mut EmulatorTransport, package: &str, confirm: bool) -> CoreResult<Value> {
+pub async fn clear(t: &mut DeviceTransport, package: &str, confirm: bool) -> CoreResult<Value> {
     let discovered = paths(t, package).await?;
     let targets: Vec<Value> = discovered["paths"]
         .as_array()
@@ -200,7 +200,7 @@ pub async fn clear(t: &mut EmulatorTransport, package: &str, confirm: bool) -> C
     )
 }
 pub async fn list(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     kind: &str,
     path: &str,
@@ -241,7 +241,7 @@ fn parse_listing(raw: &str, root: &str) -> Vec<Value> {
         .collect()
 }
 pub async fn pull(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     kind: &str,
     path: &str,
@@ -250,7 +250,7 @@ pub async fn pull(
     t.download_bytes(Path::new(&remote)).await
 }
 pub async fn sqlite(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     kind: &str,
     path: &str,

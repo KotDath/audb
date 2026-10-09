@@ -1,9 +1,13 @@
 mod daemon;
 mod package;
 
-use audb_core::{config::EMULATOR_ID, emulator, setup, EmulatorConfig};
+use audb_core::{
+    devices::{DeviceConfig, DeviceKind, DeviceRegistry, EmulatorOptions},
+    emulator, setup, EmulatorConfig,
+};
 use audb_protocol::{
-    AudbError, Command, CommandOutput, ErrorCode, LogsOptions, SwipeOptions, TrackPosition,
+    AudbError, Command, CommandOutput, ErrorCode, LogsOptions, PermissionAction, RootPassword,
+    SwipeOptions, SystemPackageOptions, TrackPosition,
 };
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -15,17 +19,88 @@ use std::time::Duration;
 #[command(
     name = "audb",
     version,
-    about = "Aurora Debug Bridge — emulator automation"
+    about = "Aurora Debug Bridge — device and emulator automation"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = "/tmp/audb/qmp.sock")]
-    socket: String,
+    #[arg(long, global = true)]
+    socket: Option<String>,
     #[arg(short = 'd', long, global = true)]
     device: Option<String>,
     #[arg(long, global = true)]
     json: bool,
+    /// Maximum command duration, including queue wait, in seconds.
+    #[arg(long, global = true, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    command_timeout: u64,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum PermissionCommand {
+    /// Read declared permissions, saved grants and dialog state.
+    List { application_id: String },
+    /// Add declared permissions; existing grants are preserved.
+    Grant {
+        application_id: String,
+        #[arg(
+            required_unless_present = "all_requested",
+            conflicts_with = "all_requested"
+        )]
+        permissions: Vec<String>,
+        #[arg(long)]
+        all_requested: bool,
+        /// Allow turning off the dialog before granting (required when enabled).
+        #[arg(long)]
+        disable_prompt: bool,
+    },
+    /// Remove selected saved grants; does not change system policy.
+    Revoke {
+        application_id: String,
+        #[arg(required = true)]
+        permissions: Vec<String>,
+    },
+    /// Clear saved grants and enable the dialog without clearing application data.
+    Reset { application_id: String },
+    /// Enable (clears grants) or disable the dialog (preserves saved grants).
+    Prompt {
+        application_id: String,
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
+}
+fn map_permission(command: PermissionCommand) -> Command {
+    let (application_id, action) = match command {
+        PermissionCommand::List { application_id } => (application_id, PermissionAction::List),
+        PermissionCommand::Grant {
+            application_id,
+            permissions,
+            all_requested,
+            disable_prompt,
+        } => (
+            application_id,
+            PermissionAction::Grant {
+                permissions,
+                all_requested,
+                disable_prompt,
+            },
+        ),
+        PermissionCommand::Revoke {
+            application_id,
+            permissions,
+        } => (application_id, PermissionAction::Revoke { permissions }),
+        PermissionCommand::Reset { application_id } => (application_id, PermissionAction::Reset),
+        PermissionCommand::Prompt {
+            application_id,
+            enable,
+            ..
+        } => (application_id, PermissionAction::Prompt { enabled: enable }),
+    };
+    Command::Permission {
+        application_id,
+        action,
+    }
 }
 
 #[derive(Subcommand)]
@@ -51,8 +126,13 @@ enum Commands {
         hold: Option<u64>,
     },
     Text {
-        string: String,
-        #[arg(long, default_value_t = 50)]
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        string: Option<String>,
+        /// Read exact UTF-8 text from stdin, including a trailing newline.
+        #[arg(long, conflicts_with = "string")]
+        stdin: bool,
+        /// Delay between code points; 0 commits the whole string at once.
+        #[arg(long, default_value_t = 0)]
         delay: u64,
     },
     Key {
@@ -62,10 +142,20 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    Permission {
+        #[command(subcommand)]
+        command: PermissionCommand,
+    },
     Status,
+    /// Read connection and component checks, with suggested fixes.
+    Doctor,
+    /// Read operation support, current readiness and limitations.
+    Capabilities,
     Install,
     Uninstall,
     SetupStatus,
+    /// Install the audb-agent system RPM on the selected device.
+    SetupDevice(SetupDeviceArgs),
     Emulator {
         #[command(subcommand)]
         command: EmulatorCommand,
@@ -157,27 +247,156 @@ enum EmulatorCommand {
 enum DeviceCommand {
     List,
     Current,
-    Add {
-        #[arg(long)]
-        id: String,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        host: String,
-        #[arg(long, default_value_t = 22)]
-        port: u16,
-        #[arg(long)]
-        key: String,
-        #[arg(long, default_value = "defaultuser")]
-        user: String,
-        #[arg(long, default_value = "physical")]
-        kind: String,
-        #[arg(long)]
-        qmp: Option<String>,
-    },
-    Remove {
-        id: String,
-    },
+    Add(DeviceAddArgs),
+    Update(DeviceUpdateArgs),
+    Remove { id: String },
+}
+
+#[derive(Args)]
+struct DeviceAddArgs {
+    /// SSH destination: user@host or SSH profile name.
+    #[arg(conflicts_with = "host", required_unless_present = "host")]
+    destination: Option<String>,
+    /// Stable device ID, independent of its address.
+    #[arg(long)]
+    id: String,
+    /// Display name; defaults to the device ID.
+    #[arg(long)]
+    name: Option<String>,
+    /// IP address, hostname or OpenSSH profile name.
+    #[arg(long, required_unless_present = "destination")]
+    host: Option<String>,
+    /// SSH port; physical devices default to their SSH profile's port.
+    #[arg(long)]
+    port: Option<u16>,
+    /// Private key file; omitted physical keys use OpenSSH profiles/SSH agent.
+    #[arg(long)]
+    key: Option<PathBuf>,
+    /// SSH account; defaults to defaultuser for IP addresses.
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long, default_value = "physical", value_parser = ["physical", "emulator"])]
+    kind: String,
+    /// Optional account for direct root SSH; no devel-su password is stored.
+    #[arg(long)]
+    root_user: Option<String>,
+    /// QMP Unix socket path (emulator only).
+    #[arg(long)]
+    qmp: Option<PathBuf>,
+    /// Aurora SDK directory (emulator only).
+    #[arg(long)]
+    sdk_root: Option<PathBuf>,
+    /// SDK virtual machine name (emulator only).
+    #[arg(long)]
+    emulator_name: Option<String>,
+}
+#[derive(Args)]
+struct DeviceUpdateArgs {
+    id: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long)]
+    port: Option<u16>,
+    #[arg(long)]
+    user: Option<String>,
+    #[arg(long, conflicts_with = "ssh_config")]
+    key: Option<PathBuf>,
+    /// Use OpenSSH profile/agent identities instead of an explicit key (physical only).
+    #[arg(long)]
+    ssh_config: bool,
+    #[arg(long)]
+    root_user: Option<String>,
+    #[arg(long)]
+    qmp: Option<PathBuf>,
+    /// Aurora SDK directory (emulator only).
+    #[arg(long)]
+    sdk_root: Option<PathBuf>,
+    /// SDK virtual machine name (emulator only).
+    #[arg(long)]
+    emulator_name: Option<String>,
+}
+impl DeviceAddArgs {
+    fn into_config(self) -> Result<DeviceConfig, AudbError> {
+        let (destination_user, host) = if let Some(destination) = self.destination {
+            match destination.rsplit_once('@') {
+                Some((user, host)) => (Some(user.to_owned()), host.to_owned()),
+                None => (None, destination),
+            }
+        } else {
+            (None, self.host.unwrap_or_default())
+        };
+        let kind = if self.kind == "emulator" {
+            DeviceKind::Emulator
+        } else {
+            DeviceKind::Physical
+        };
+        let defaults = EmulatorConfig::default();
+        let explicit_user = self.user.or(destination_user);
+        let infer_profile_user =
+            explicit_user.is_none() && host.parse::<std::net::IpAddr>().is_err();
+        let mut d = DeviceConfig {
+            name: self.name.unwrap_or_else(|| self.id.clone()),
+            id: self.id,
+            kind,
+            host,
+            ssh_port: self.port.unwrap_or(22),
+            ssh_user: explicit_user.unwrap_or_else(|| "defaultuser".into()),
+            ssh_key: self.key.map(absolute),
+            root_user: self.root_user,
+            emulator: None,
+        };
+        if kind == DeviceKind::Emulator {
+            d.ssh_key = d.ssh_key.or(Some(defaults.ssh_key));
+            d.root_user = d.root_user.or(Some(defaults.root_user));
+            d.emulator = Some(EmulatorOptions {
+                qmp_socket: self.qmp.map(absolute).unwrap_or(defaults.qmp_socket),
+                sdk_root: self.sdk_root.map(absolute).unwrap_or(defaults.sdk_root),
+                emulator_name: self.emulator_name.unwrap_or(defaults.emulator_name),
+            });
+        } else {
+            if self.qmp.is_some() || self.sdk_root.is_some() || self.emulator_name.is_some() {
+                return Err(error(
+                    ErrorCode::InvalidArgument,
+                    "QMP and SDK options require --kind emulator",
+                ));
+            }
+            d.validate(false).map_err(core_error)?;
+            // ssh -G reads local profiles only. No network connection or host trust change.
+            let mut ssh = std::process::Command::new("ssh");
+            ssh.arg("-G");
+            if !infer_profile_user {
+                ssh.args(["-o", &format!("User={}", d.ssh_user)]);
+            }
+            ssh.args(["--", &d.host]);
+            let output = ssh.output().map_err(internal)?;
+            if !output.status.success() {
+                return Err(error(
+                    ErrorCode::SshError,
+                    String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+            if self.port.is_none() {
+                if let Some(port) = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("port "))
+                {
+                    d.ssh_port = port.parse().map_err(internal)?;
+                }
+            }
+            if infer_profile_user {
+                if let Some(user) = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("user "))
+                {
+                    d.ssh_user = user.to_owned();
+                }
+            }
+        }
+        d.validate(true).map_err(core_error)?;
+        Ok(d)
+    }
 }
 
 #[derive(Args)]
@@ -407,7 +626,12 @@ enum PackageCommand {
     },
     Install {
         rpm: String,
+        /// Maximum wait for APM to register the requested version, in seconds.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout: u64,
     },
+    /// Install a system RPM as root with a per-transaction validation override.
+    InstallSystem(SystemInstallArgs),
     Uninstall {
         name: String,
     },
@@ -421,6 +645,131 @@ enum PackageCommand {
     Validate {
         rpm: String,
     },
+}
+
+#[derive(Args)]
+struct SystemInstallArgs {
+    rpm: PathBuf,
+    #[command(flatten)]
+    options: SystemInstallFlags,
+}
+#[derive(Args)]
+struct SetupDeviceArgs {
+    /// Path to audb-agent RPM; defaults to packages/audb-agent.rpm beside audb.
+    #[arg(long)]
+    rpm: Option<PathBuf>,
+    #[command(flatten)]
+    options: SystemInstallFlags,
+}
+#[derive(Args)]
+struct SystemInstallFlags {
+    /// Use rpm -Uvh instead of -ivh. Does not force replacement of the same version.
+    #[arg(long)]
+    upgrade: bool,
+    /// Allow replacing the same package version via rpm --replacepkgs.
+    #[arg(long)]
+    reinstall: bool,
+    /// Run only rpm --test; do not install the package.
+    #[arg(long)]
+    check_only: bool,
+    /// Read one root password line from stdin for devel-su; never store it.
+    #[arg(long)]
+    root_password_stdin: bool,
+}
+
+fn system_install_request(
+    path: PathBuf,
+    flags: SystemInstallFlags,
+    device: &DeviceConfig,
+    setup: bool,
+) -> Result<Command, AudbError> {
+    use std::io::{BufRead, IsTerminal, Read};
+    let path = std::fs::canonicalize(&path).map_err(|e| {
+        error(
+            ErrorCode::NotFound,
+            format!(
+                "RPM not found: {}: {e}. Supply --rpm for setup-device",
+                path.display()
+            ),
+        )
+    })?;
+    if path.extension().and_then(|s| s.to_str()) != Some("rpm") {
+        return Err(error(ErrorCode::InvalidArgument, "File must be .rpm"));
+    }
+    let mut magic = [0u8; 4];
+    std::fs::File::open(&path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .map_err(internal)?;
+    if magic != [0xed, 0xab, 0xee, 0xdb] {
+        return Err(error(
+            ErrorCode::InvalidArgument,
+            "File does not have an RPM lead header",
+        ));
+    }
+    let password = if flags.root_password_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(4099)
+            .read_until(b'\n', &mut bytes)
+            .map_err(internal)?;
+        if bytes.len() > 4098 {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "Root credential is too long",
+            ));
+        }
+        let mut value = String::from_utf8(bytes)
+            .map_err(|_| error(ErrorCode::InvalidArgument, "Root credential must be UTF-8"))?;
+        if value.ends_with('\n') {
+            value.pop();
+        }
+        if value.ends_with('\r') {
+            value.pop();
+        }
+        Some(RootPassword::new(value))
+    } else if device.root_user.is_none() && device.ssh_user != "root" {
+        if !std::io::stdin().is_terminal() {
+            return Err(error(ErrorCode::RootAccessRequired,
+                "Root installation needs --root-password-stdin, an interactive terminal, or device update ID --root-user root"));
+        }
+        Some(RootPassword::new(
+            rpassword::prompt_password(format!("Root password for {}: ", device.id))
+                .map_err(internal)?,
+        ))
+    } else {
+        None
+    };
+    if let Some(password) = &password {
+        let value = password.expose();
+        if value.is_empty() || value.len() > 4096 || value.contains(['\n', '\r', '\0']) {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "Root credential must be one nonempty line",
+            ));
+        }
+    }
+    let options = SystemPackageOptions {
+        upgrade: flags.upgrade,
+        reinstall: flags.reinstall,
+        check_only: flags.check_only,
+        root_password: password,
+    };
+    let local_path = path
+        .to_str()
+        .ok_or_else(|| error(ErrorCode::InvalidArgument, "RPM path must be UTF-8"))?
+        .to_owned();
+    Ok(if setup {
+        Command::SetupDevice {
+            local_path,
+            options,
+        }
+    } else {
+        Command::SystemPackageInstall {
+            local_path,
+            options,
+        }
+    })
 }
 
 #[tokio::main]
@@ -440,6 +789,7 @@ async fn main() {
         Err(parse_error) if json_requested => {
             emit_error(
                 true,
+                None,
                 &error(ErrorCode::InvalidArgument, parse_error.to_string()),
             );
             std::process::exit(1);
@@ -447,36 +797,78 @@ async fn main() {
         Err(parse_error) => parse_error.exit(),
     };
     let json_mode = cli.json;
-    match run(cli).await {
+    let mut target = None;
+    match run(cli, &mut target).await {
         Ok(()) => {}
         Err(error) => {
-            emit_error(json_mode, &error);
+            emit_error(json_mode, target.as_deref(), &error);
             std::process::exit(exit_code(error.code));
         }
     }
 }
 
-async fn run(cli: Cli) -> Result<(), AudbError> {
-    if let Some(device) = &cli.device {
-        require_emulator(device)?;
-    }
-    let mut config = EmulatorConfig::load_or_default().map_err(core_error)?;
-    config.qmp_socket = cli.socket.clone().into();
+async fn run(cli: Cli, target: &mut Option<String>) -> Result<(), AudbError> {
     match cli.command {
         Commands::Daemon => return daemon::run().await.map_err(internal),
         Commands::Shutdown => {
-            let output = daemon::typed_request(Command::Shutdown).await?;
-            emit(cli.json, output_to_value(output), None);
+            let output = daemon::typed_request(None, Command::Shutdown, 5_000).await?;
+            emit(cli.json, None, output_to_value(output), None);
             return Ok(());
         }
+        Commands::Device { command } => return device_command(cli.json, command, target),
+        Commands::Select { id } => {
+            DeviceRegistry::transaction(|r| {
+                r.get(&id)?;
+                r.default_device = Some(id.clone());
+                Ok(())
+            })
+            .map_err(core_error)?;
+            *target = Some(id.clone());
+            return emit_local(cli.json, Some(&id), json!({"id":id,"selected":true}));
+        }
+        _ => {}
+    }
+    let registry = DeviceRegistry::load().map_err(core_error)?;
+    let device = registry
+        .resolve(cli.device.as_deref())
+        .map_err(core_error)?;
+    *target = Some(device.id.clone());
+    let device_id = Some(device.id.as_str());
+    // Host package tooling still uses the SDK on physical targets.
+    let mut config = device.emulator_config().unwrap_or_default();
+    if let Some(socket) = &cli.socket {
+        config.qmp_socket = socket.into();
+    }
+    match cli.command {
+        Commands::Install
+        | Commands::Uninstall
+        | Commands::SetupStatus
+        | Commands::Emulator { .. } => {
+            device.emulator_config().map_err(core_error)?;
+        }
+        _ => {}
+    }
+    match cli.command {
         Commands::Install => {
-            return emit_local(cli.json, setup::install(&config).map_err(core_error)?)
+            return emit_local(
+                cli.json,
+                device_id,
+                setup::install(&config).map_err(core_error)?,
+            )
         }
         Commands::Uninstall => {
-            return emit_local(cli.json, setup::uninstall(&config).map_err(core_error)?)
+            return emit_local(
+                cli.json,
+                device_id,
+                setup::uninstall(&config).map_err(core_error)?,
+            )
         }
         Commands::SetupStatus => {
-            return emit_local(cli.json, setup::status(&config).map_err(core_error)?)
+            return emit_local(
+                cli.json,
+                device_id,
+                setup::status(&config).map_err(core_error)?,
+            )
         }
         Commands::Emulator { command } => {
             let value = match command {
@@ -490,23 +882,32 @@ async fn run(cli: Cli) -> Result<(), AudbError> {
                     .map_err(core_error)?,
                 EmulatorCommand::Status => emulator::status(&config).await,
             };
-            return emit_local(cli.json, value);
-        }
-        Commands::Device { command } => return device_command(cli.json, command, &config).await,
-        Commands::Select { id } => {
-            require_emulator(&id)?;
-            return emit_local(cli.json, json!({"id":EMULATOR_ID,"selected":true}));
+            return emit_local(cli.json, device_id, value);
         }
         _ => {}
     }
 
     let (command, binary_output): (Command, Option<PathBuf>) = match cli.command {
+        Commands::SetupDevice(args) => {
+            let rpm = match args.rpm {
+                Some(path) => path,
+                None => std::env::current_exe()
+                    .map_err(internal)?
+                    .parent()
+                    .ok_or_else(|| internal("Cannot determine executable directory"))?
+                    .join("packages/audb-agent.rpm"),
+            };
+            (
+                system_install_request(rpm, args.options, device, true)?,
+                None,
+            )
+        }
         Commands::Tap { x, y, duration } => (
             Command::Tap {
                 x,
                 y,
                 duration_ms: duration,
-                socket: Some(cli.socket),
+                socket: cli.socket,
             },
             None,
         ),
@@ -523,22 +924,46 @@ async fn run(cli: Cli) -> Result<(), AudbError> {
                     duration_ms: duration,
                     hold_ms: hold,
                 },
-                socket: Some(cli.socket),
+                socket: cli.socket,
             },
             None,
         ),
-        Commands::Text { string, delay } => (
-            Command::Text {
-                text: string,
-                delay_ms: delay,
-                socket: Some(cli.socket),
-            },
-            None,
-        ),
+        Commands::Text {
+            string,
+            stdin,
+            delay,
+        } => {
+            let text = if stdin {
+                use std::io::Read;
+                let mut value = String::new();
+                std::io::stdin()
+                    .take((audb_protocol::input::MAX_TEXT_BYTES + 1) as u64)
+                    .read_to_string(&mut value)
+                    .map_err(|e| {
+                        error(
+                            ErrorCode::InvalidArgument,
+                            format!("Cannot read UTF-8 text: {e}"),
+                        )
+                    })?;
+                value
+            } else {
+                string.unwrap_or_default()
+            };
+            audb_protocol::input::validate_text(&text, delay)
+                .map_err(|e| error(ErrorCode::InvalidArgument, e))?;
+            (
+                Command::Text {
+                    text,
+                    delay_ms: delay,
+                    socket: cli.socket,
+                },
+                None,
+            )
+        }
         Commands::Key { name } => (
             Command::Key {
                 name,
-                socket: Some(cli.socket),
+                socket: cli.socket,
             },
             None,
         ),
@@ -549,19 +974,19 @@ async fn run(cli: Cli) -> Result<(), AudbError> {
                     "--json screenshot requires --output",
                 ));
             }
-            (
-                Command::Screenshot {
-                    socket: Some(cli.socket),
-                },
-                output,
-            )
+            (Command::Screenshot { socket: cli.socket }, output)
         }
         Commands::Status => (
-            Command::QmpStatus {
-                socket: Some(cli.socket),
+            if device.kind == DeviceKind::Emulator {
+                Command::QmpStatus { socket: cli.socket }
+            } else {
+                Command::DeviceStatus
             },
             None,
         ),
+        Commands::Permission { command } => (map_permission(command), None),
+        Commands::Doctor => (Command::Doctor, None),
+        Commands::Capabilities => (Command::Capabilities, None),
         Commands::Info { category } => (Command::Info { category }, None),
         Commands::Shell(args) => (
             Command::Shell {
@@ -623,25 +1048,41 @@ async fn run(cli: Cli) -> Result<(), AudbError> {
             })),
         ),
         Commands::Package { command } => match command {
-            PackageCommand::List { filter } => (Command::PackageList { filter }, None),
-            PackageCommand::Install { rpm } => (
-                Command::PackageInstall {
-                    name: rpm.clone(),
-                    bytes: std::fs::read(&rpm).map_err(internal)?,
-                },
+            PackageCommand::InstallSystem(args) => (
+                system_install_request(args.rpm, args.options, device, false)?,
                 None,
             ),
+            PackageCommand::List { filter } => (Command::PackageList { filter }, None),
+            PackageCommand::Install { rpm, timeout } => {
+                let path = std::fs::canonicalize(&rpm).map_err(|e| {
+                    error(ErrorCode::NotFound, format!("Cannot open RPM {rpm}: {e}"))
+                })?;
+                if !path.is_file() || path.extension().and_then(|v| v.to_str()) != Some("rpm") {
+                    return Err(error(
+                        ErrorCode::InvalidArgument,
+                        "Package install requires a regular .rpm file",
+                    ));
+                }
+                (
+                    Command::PackageInstall {
+                        local_path: path.to_string_lossy().into_owned(),
+                        timeout_ms: timeout * 1000,
+                    },
+                    None,
+                )
+            }
             PackageCommand::Uninstall { name } => {
                 (Command::PackageUninstall { package: name }, None)
             }
             PackageCommand::Sign { rpm, key, cert } => {
                 return emit_local(
                     cli.json,
+                    device_id,
                     package::sign(&config, &rpm, key.as_deref(), cert.as_deref())?,
                 )
             }
             PackageCommand::Validate { rpm } => {
-                return emit_local(cli.json, package::validate(&rpm)?)
+                return emit_local(cli.json, device_id, package::validate(&rpm)?)
             }
         },
         Commands::Daemon
@@ -653,20 +1094,38 @@ async fn run(cli: Cli) -> Result<(), AudbError> {
         | Commands::Device { .. }
         | Commands::Select { .. } => unreachable!(),
     };
-    let output = daemon::typed_request(command).await?;
+    let raw_shell = matches!(&command, Command::Shell { .. });
+    let is_screenshot = matches!(&command, Command::Screenshot { .. });
+    let output = daemon::typed_request(device_id, command, cli.command_timeout * 1000).await?;
+    if raw_shell && !cli.json {
+        if let CommandOutput::Text(text) = output {
+            std::io::stdout()
+                .write_all(text.as_bytes())
+                .map_err(internal)?;
+            return Ok(());
+        }
+    }
     if let CommandOutput::Binary(bytes) = output {
         if let Some(path) = binary_output {
-            std::fs::write(&path, &bytes).map_err(internal)?;
-            emit(
-                cli.json,
-                json!({"output":absolute(path),"bytes":bytes.len()}),
-                None,
-            );
+            if is_screenshot {
+                audb_core::screenshot::save(&bytes, &path).map_err(core_error)?;
+            } else {
+                std::fs::write(&path, &bytes).map_err(internal)?;
+            }
+            let mut metadata = json!({"output":absolute(path),"bytes":bytes.len()});
+            if is_screenshot {
+                if let Some((width, height)) = audb_core::screenshot::png_dimensions(&bytes) {
+                    metadata["format"] = json!("png");
+                    metadata["width"] = json!(width);
+                    metadata["height"] = json!(height);
+                }
+            }
+            emit(cli.json, device_id, metadata, None);
         } else {
             std::io::stdout().write_all(&bytes).map_err(internal)?;
         }
     } else {
-        emit(cli.json, output_to_value(output), None);
+        emit(cli.json, device_id, output_to_value(output), None);
     }
     Ok(())
 }
@@ -708,7 +1167,7 @@ fn map_display(command: DisplayCommand) -> Command {
         timeout_ms: (timeout * 1000.0) as u64,
     }
 }
-fn map_perf(command: PerfCommand, socket: String) -> Command {
+fn map_perf(command: PerfCommand, socket: Option<String>) -> Command {
     match command {
         PerfCommand::Snapshot {
             package,
@@ -734,7 +1193,7 @@ fn map_perf(command: PerfCommand, socket: String) -> Command {
             duration_ms: (duration * 1000.0) as u64,
             interval_ms: (interval * 1000.0) as u64,
             freeze_threshold_ms: (freeze_threshold * 1000.0) as u64,
-            socket: Some(socket),
+            socket,
         },
     }
 }
@@ -888,35 +1347,117 @@ fn map_sensor(command: SensorCommand) -> Command {
     }
 }
 
-async fn device_command(
+fn device_command(
     json_mode: bool,
     command: DeviceCommand,
-    config: &EmulatorConfig,
+    target: &mut Option<String>,
 ) -> Result<(), AudbError> {
-    match command {
+    let registry = match command {
         DeviceCommand::List => {
-            let item = json!({"id":EMULATOR_ID,"name":config.name,"kind":"emulator","host":config.host,"sshPort":config.ssh_port,"qmpSocket":config.qmp_socket,"current":true,"state":if emulator::is_running(config).await{"online"}else{"offline"}});
-            emit_local(json_mode, Value::Array(vec![item]))
+            let r = DeviceRegistry::load().map_err(core_error)?;
+            let items: Vec<_> = r
+                .devices
+                .iter()
+                .map(|d| device_value(d, r.resolve(None).ok().map(|d| d.id.as_str())))
+                .collect();
+            return emit_local(json_mode, None, json!(items));
         }
-        DeviceCommand::Current => emit_local(
-            json_mode,
-            json!({"id":EMULATOR_ID,"name":config.name,"kind":"emulator","host":config.host,"sshPort":config.ssh_port,"qmpSocket":config.qmp_socket,"current":true,"state":if emulator::is_running(config).await{"online"}else{"offline"}}),
-        ),
-        DeviceCommand::Add { id, .. } | DeviceCommand::Remove { id } => Err(error(
-            ErrorCode::UnsupportedInEmulatorOnly,
-            format!("Device registry mutation is unavailable in emulator-only mode: {id}"),
-        )),
-    }
+        DeviceCommand::Current => {
+            let r = DeviceRegistry::load().map_err(core_error)?;
+            let d = r.resolve(None).map_err(core_error)?;
+            *target = Some(d.id.clone());
+            return emit_local(json_mode, Some(&d.id), device_value(d, Some(&d.id)));
+        }
+        DeviceCommand::Add(args) => {
+            let d = args.into_config()?;
+            let id = d.id.clone();
+            let r = DeviceRegistry::transaction(|r| r.add(d)).map_err(core_error)?;
+            *target = Some(id.clone());
+            return emit_local(
+                json_mode,
+                Some(&id),
+                device_value(
+                    r.get(&id).map_err(core_error)?,
+                    r.resolve(None).ok().map(|d| d.id.as_str()),
+                ),
+            );
+        }
+        DeviceCommand::Update(args) => {
+            let id = args.id.clone();
+            let check_key = args.key.is_some();
+            let r = DeviceRegistry::transaction(|r| {
+                let mut d = r.get(&id)?.clone();
+                if let Some(v) = args.name {
+                    d.name = v;
+                }
+                if let Some(v) = args.host {
+                    d.host = v;
+                }
+                if let Some(v) = args.port {
+                    d.ssh_port = v;
+                }
+                if let Some(v) = args.user {
+                    d.ssh_user = v;
+                }
+                if args.ssh_config {
+                    d.ssh_key = None;
+                }
+                if let Some(v) = args.key {
+                    d.ssh_key = Some(absolute(v));
+                }
+                if let Some(v) = args.root_user {
+                    d.root_user = Some(v);
+                }
+                if let Some(v) = args.qmp {
+                    d.emulator
+                        .as_mut()
+                        .ok_or_else(|| audb_core::CoreError::invalid("--qmp requires emulator"))?
+                        .qmp_socket = absolute(v);
+                }
+                if let Some(v) = args.sdk_root {
+                    d.emulator
+                        .as_mut()
+                        .ok_or_else(|| {
+                            audb_core::CoreError::invalid("--sdk-root requires emulator")
+                        })?
+                        .sdk_root = absolute(v);
+                }
+                if let Some(v) = args.emulator_name {
+                    d.emulator
+                        .as_mut()
+                        .ok_or_else(|| {
+                            audb_core::CoreError::invalid("--emulator-name requires emulator")
+                        })?
+                        .emulator_name = v;
+                }
+                d.validate(check_key)?;
+                *r.devices.iter_mut().find(|d| d.id == id).unwrap() = d;
+                Ok(())
+            })
+            .map_err(core_error)?;
+            *target = Some(id.clone());
+            return emit_local(
+                json_mode,
+                Some(&id),
+                device_value(
+                    r.get(&id).map_err(core_error)?,
+                    r.resolve(None).ok().map(|d| d.id.as_str()),
+                ),
+            );
+        }
+        DeviceCommand::Remove { id } => {
+            DeviceRegistry::transaction(|r| r.remove(&id)).map_err(core_error)?;
+            *target = Some(id.clone());
+            json!({"id":id,"removed":true})
+        }
+    };
+    emit_local(json_mode, target.as_deref(), registry)
 }
-fn require_emulator(id: &str) -> Result<(), AudbError> {
-    if id == EMULATOR_ID {
-        Ok(())
-    } else {
-        Err(error(
-            ErrorCode::UnsupportedInEmulatorOnly,
-            format!("Only device '{EMULATOR_ID}' is supported"),
-        ))
-    }
+fn device_value(d: &DeviceConfig, default: Option<&str>) -> Value {
+    let mut v = serde_json::to_value(d).expect("serializable device config");
+    v["current"] = json!(default == Some(d.id.as_str()));
+    v["state"] = json!("unknown"); // Offline registry operation; status probes the selected target.
+    v
 }
 fn parse_on_off(v: &str) -> Result<bool, AudbError> {
     match v {
@@ -933,15 +1474,18 @@ fn output_to_value(output: CommandOutput) -> Value {
         CommandOutput::Binary(v) => json!({"bytes":v.len()}),
     }
 }
-fn emit_local(json_mode: bool, value: Value) -> Result<(), AudbError> {
-    emit(json_mode, value.clone(), Some(pretty(&value)));
+fn emit_local(json_mode: bool, device_id: Option<&str>, value: Value) -> Result<(), AudbError> {
+    emit(json_mode, device_id, value.clone(), Some(pretty(&value)));
     Ok(())
 }
-fn emit(json_mode: bool, value: Value, text: Option<String>) {
+fn emit(json_mode: bool, device_id: Option<&str>, value: Value, text: Option<String>) {
     if json_mode {
         println!(
             "{}",
-            serde_json::to_string(&json!({"ok":true,"deviceId":EMULATOR_ID,"data":value})).unwrap()
+            serde_json::to_string(
+                &json!({"ok":true,"schemaVersion":1,"deviceId":device_id,"data":value})
+            )
+            .unwrap()
         )
     } else if let Some(text) = text {
         println!("{text}")
@@ -951,9 +1495,9 @@ fn emit(json_mode: bool, value: Value, text: Option<String>) {
         println!("{}", pretty(&value))
     }
 }
-fn emit_error(json_mode: bool, error: &AudbError) {
+fn emit_error(json_mode: bool, device_id: Option<&str>, error: &AudbError) {
     if json_mode {
-        let mut document = json!({"ok":false,"deviceId":EMULATOR_ID,"error":{"code":error.code,"message":error.message}});
+        let mut document = json!({"ok":false,"schemaVersion":1,"deviceId":device_id,"error":{"code":error.code,"message":error.message}});
         if let Some(data) = &error.data {
             document["data"] = data.clone();
         }

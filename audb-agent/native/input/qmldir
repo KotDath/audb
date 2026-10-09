@@ -1,0 +1,2 @@
+module Audb.Input
+plugin audbinput

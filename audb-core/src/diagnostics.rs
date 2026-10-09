@@ -3,7 +3,7 @@ use crate::config::cache_dir;
 use crate::error::{CoreError, CoreResult};
 use crate::qmp::QmpClient;
 use crate::screenshot;
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,7 +18,7 @@ fn numbers(raw: &str) -> HashMap<String, u64> {
         })
         .collect()
 }
-async fn sample(t: &mut EmulatorTransport, package: &str) -> CoreResult<HashMap<String, u64>> {
+async fn sample(t: &mut DeviceTransport, package: &str) -> CoreResult<HashMap<String, u64>> {
     app::validate_package(package)?;
     let base = "/sys/fs/cgroup";
     let scope = "user.slice/runtime-manager-helper.service/user-100000";
@@ -39,7 +39,7 @@ fn get(v: &HashMap<String, u64>, key: &str) -> u64 {
     v.get(key).copied().unwrap_or(0)
 }
 pub async fn perf_snapshot(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     interval: Duration,
 ) -> CoreResult<Value> {
@@ -62,7 +62,7 @@ pub async fn perf_snapshot(
     )
 }
 pub async fn perf_monitor(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     duration: Duration,
     interval: Duration,
@@ -101,7 +101,7 @@ pub async fn perf_monitor(
 }
 
 pub async fn visual(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     q: &mut QmpClient,
     duration: Duration,
     interval: Duration,
@@ -195,7 +195,7 @@ fn crash_since(package: Option<&str>, since: Option<&str>) -> CoreResult<String>
     })
 }
 pub async fn crash_list(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: Option<&str>,
     since: Option<&str>,
     lines: usize,
@@ -250,7 +250,7 @@ pub async fn crash_list(
     )
 }
 pub async fn crash_watch(
-    t: &mut EmulatorTransport,
+    t: &mut DeviceTransport,
     package: &str,
     timeout: Duration,
     interval: Duration,

@@ -5,8 +5,34 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const ABS_MAX: f64 = 32767.0;
-const WIDTH: i32 = 360;
-const HEIGHT: i32 = 800;
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    pub width: i32,
+    pub height: i32,
+}
+impl Geometry {
+    pub async fn query(qmp: &mut QmpClient) -> CoreResult<Self> {
+        let (width, height) = crate::screenshot::qmp_geometry(qmp).await?;
+        if width < 2 || height < 2 {
+            return Err(CoreError::invalid(
+                "QMP touchscreen requires dimensions of at least 2x2",
+            ));
+        }
+        Ok(Self {
+            width: width as i32,
+            height: height as i32,
+        })
+    }
+    fn check(self, x: i32, y: i32) -> CoreResult<()> {
+        if !(0..self.width).contains(&x) || !(0..self.height).contains(&y) {
+            return Err(CoreError::invalid(format!(
+                "Coordinates outside {}x{} QMP display: {x},{y}",
+                self.width, self.height
+            )));
+        }
+        Ok(())
+    }
+}
 
 fn abs(value: i32, extent: i32) -> i32 {
     (value as f64 * ABS_MAX / (extent - 1) as f64).round() as i32
@@ -27,12 +53,12 @@ async fn events(qmp: &mut QmpClient, events: Vec<Value>) -> CoreResult<()> {
 }
 
 pub async fn tap(qmp: &mut QmpClient, x: i32, y: i32, duration_ms: u64) -> CoreResult<String> {
-    if !(0..WIDTH).contains(&x) || !(0..HEIGHT).contains(&y) {
-        return Err(CoreError::invalid(format!(
-            "tap coordinates outside {WIDTH}x{HEIGHT}: {x},{y}"
-        )));
+    if !(1..=3000).contains(&duration_ms) {
+        return Err(CoreError::invalid("Tap duration must be 1..3000 ms"));
     }
-    let (x_abs, y_abs) = (abs(x, WIDTH), abs(y, HEIGHT));
+    let geometry = Geometry::query(qmp).await?;
+    geometry.check(x, y)?;
+    let (x_abs, y_abs) = (abs(x, geometry.width), abs(y, geometry.height));
     events(
         qmp,
         vec![
@@ -58,30 +84,31 @@ pub async fn tap(qmp: &mut QmpClient, x: i32, y: i32, duration_ms: u64) -> CoreR
     Ok(format!("tap({x}, {y}) via QMP multitouch"))
 }
 
-fn direction_coords(direction: &str) -> Option<(i32, i32, i32, i32)> {
-    let cx = WIDTH / 2;
-    let cy = HEIGHT / 2;
-    let mx = (WIDTH / 10).max(20);
-    let edge = (WIDTH / 8).max(30);
+fn direction_coords(direction: &str, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
+    let cx = width / 2;
+    let cy = height / 2;
+    let mx = (width / 10).clamp(1, width - 1);
+    let edge_x = (width / 8).clamp(1, width - 1);
+    let edge_y = (height / 8).clamp(1, height - 1);
     Some(match direction {
         "up" => (
             cx,
-            (HEIGHT as f64 * 0.78) as i32,
+            (height as f64 * 0.78) as i32,
             cx,
-            (HEIGHT as f64 * 0.22) as i32,
+            (height as f64 * 0.22) as i32,
         ),
         "down" => (
             cx,
-            (HEIGHT as f64 * 0.22) as i32,
+            (height as f64 * 0.22) as i32,
             cx,
-            (HEIGHT as f64 * 0.78) as i32,
+            (height as f64 * 0.78) as i32,
         ),
-        "left" => (WIDTH - mx, cy, mx, cy),
-        "right" => (mx, cy, WIDTH - mx, cy),
-        "edge-up" => (cx, HEIGHT - 3, cx, edge),
-        "edge-down" => (cx, 30, cx, HEIGHT - 3),
-        "edge-left" => (WIDTH - 3, cy, edge, cy),
-        "edge-right" => (3, cy, WIDTH - edge, cy),
+        "left" => (width - mx, cy, mx, cy),
+        "right" => (mx, cy, width - mx, cy),
+        "edge-up" => (cx, (height - 3).max(1), cx, edge_y),
+        "edge-down" => (cx, 30.min(height - 1), cx, (height - 3).max(1)),
+        "edge-left" => ((width - 3).max(1), cy, edge_x, cy),
+        "edge-right" => (3.min(width - 1), cy, width - edge_x, cy),
         _ => return None,
     })
 }
@@ -91,6 +118,7 @@ pub async fn swipe(
     args: &[String],
     options: SwipeOptions,
 ) -> CoreResult<String> {
+    let geometry = Geometry::query(qmp).await?;
     let (x1, y1, x2, y2, description, mode) = if args.len() == 4 {
         let values = args
             .iter()
@@ -116,7 +144,7 @@ pub async fn swipe(
         } else {
             (original, "scroll")
         };
-        let coords = direction_coords(base)
+        let coords = direction_coords(base, geometry.width, geometry.height)
             .ok_or_else(|| CoreError::invalid(format!("Unknown swipe direction: {original}")))?;
         (
             coords.0,
@@ -132,6 +160,8 @@ pub async fn swipe(
         ));
     };
 
+    geometry.check(x1, y1)?;
+    geometry.check(x2, y2)?;
     let (default_steps, default_duration, default_hold, settle) = match mode {
         "gesture" => (60, 500, 50, 800),
         "long" => (80, 1500, 50, 800),
@@ -146,14 +176,19 @@ pub async fn swipe(
             },
         ),
     };
-    let steps = options.steps.unwrap_or(default_steps).max(1);
+    let steps = options.steps.unwrap_or(default_steps);
     let duration = options.duration_ms.unwrap_or(default_duration);
     let hold = options.hold_ms.unwrap_or(default_hold);
+    if !(1..=240).contains(&steps) || !(40..=3000).contains(&duration) || hold > 1000 {
+        return Err(CoreError::invalid(
+            "Swipe requires steps 1..240, duration 40..3000 ms, hold 0..1000 ms",
+        ));
+    }
     let (sx, sy, ex, ey) = (
-        abs(x1, WIDTH),
-        abs(y1, HEIGHT),
-        abs(x2, WIDTH),
-        abs(y2, HEIGHT),
+        abs(x1, geometry.width),
+        abs(y1, geometry.height),
+        abs(x2, geometry.width),
+        abs(y2, geometry.height),
     );
     events(
         qmp,
@@ -241,12 +276,15 @@ fn qcode(character: char) -> Option<(String, bool)> {
 }
 
 pub async fn text(qmp: &mut QmpClient, value: &str, delay_ms: u64) -> CoreResult<String> {
-    let mut unsupported = String::new();
+    audb_protocol::input::validate_text(value, delay_ms).map_err(CoreError::invalid)?;
+    if value.chars().any(|c| qcode(c).is_none()) {
+        return Err(CoreError::new(
+            audb_protocol::ErrorCode::CapabilityUnavailable,
+            "QMP cannot type this text; install audb-agent for Unicode input. Nothing was sent",
+        ));
+    }
     for character in value.chars() {
-        let Some((code, shifted)) = qcode(character) else {
-            unsupported.push(character);
-            continue;
-        };
+        let (code, shifted) = qcode(character).expect("validated before input");
         if shifted {
             send_key(qmp, "shift", true).await?;
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -260,12 +298,10 @@ pub async fn text(qmp: &mut QmpClient, value: &str, delay_ms: u64) -> CoreResult
         }
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
-    let suffix = if unsupported.is_empty() {
-        String::new()
-    } else {
-        format!(" (unsupported chars skipped: {unsupported})")
-    };
-    Ok(format!("text(\"{value}\") via QMP keyboard{suffix}"))
+    Ok(format!(
+        "text({} code points) via QMP keyboard; requires a matching guest keyboard layout",
+        value.chars().count()
+    ))
 }
 
 pub async fn key(qmp: &mut QmpClient, name: &str) -> CoreResult<String> {
@@ -289,6 +325,14 @@ pub async fn key(qmp: &mut QmpClient, name: &str) -> CoreResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn qmp_rejects_unicode_before_connecting_or_typing_ascii_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut qmp = QmpClient::new(dir.path().join("absent.sock"));
+        let error = text(&mut qmp, "ASCII Привет", 0).await.unwrap_err();
+        assert_eq!(error.code, audb_protocol::ErrorCode::CapabilityUnavailable);
+        assert!(error.message.contains("Nothing was sent"));
+    }
     #[test]
     fn pixel_mapping_matches_python() {
         assert_eq!(abs(359, 360), 32767);
@@ -296,6 +340,145 @@ mod tests {
     }
     #[test]
     fn edge_coordinates_are_in_bounds() {
-        assert_eq!(direction_coords("edge-right"), Some((3, 400, 315, 400)));
+        assert_eq!(
+            direction_coords("edge-right", 360, 800),
+            Some((3, 400, 315, 400))
+        );
+    }
+    async fn mock_display(
+        socket: &std::path::Path,
+        malformed: bool,
+    ) -> tokio::task::JoinHandle<Vec<Value>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut io = BufReader::new(stream);
+            io.get_mut().write_all(b"{\"QMP\":{}}\n").await.unwrap();
+            let mut inputs = Vec::new();
+            let mut dumps = 0;
+            loop {
+                let mut line = String::new();
+                if io.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(&line).unwrap();
+                match request["execute"].as_str().unwrap() {
+                    "qmp_capabilities" => {}
+                    "screendump" => {
+                        let png: &[u8] = if malformed {
+                            b"incomplete image"
+                        } else if dumps == 0 {
+                            include_bytes!("../tests/qmp-portrait.png")
+                        } else {
+                            include_bytes!("../tests/qmp-landscape.png")
+                        };
+                        tokio::fs::write(request["arguments"]["filename"].as_str().unwrap(), png)
+                            .await
+                            .unwrap();
+                        dumps += 1;
+                    }
+                    "input-send-event" => inputs.push(request["arguments"]["events"].clone()),
+                    command => panic!("Unexpected command {command}"),
+                }
+                io.get_mut()
+                    .write_all(format!("{}\n", json!({"return":{},"id":request["id"]})).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            inputs
+        })
+    }
+    #[tokio::test]
+    async fn qmp_touch_refreshes_geometry_after_resize_and_rejects_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("qmp.sock");
+        let server = mock_display(&socket, false).await;
+        let mut qmp = QmpClient::new(socket);
+        tap(&mut qmp, 719, 1279, 1).await.unwrap();
+        tap(&mut qmp, 799, 359, 1).await.unwrap();
+        assert_eq!(
+            tap(&mut qmp, 800, 359, 1).await.unwrap_err().code,
+            audb_protocol::ErrorCode::InvalidArgument
+        );
+        swipe(
+            &mut qmp,
+            &["0".into(), "0".into(), "799".into(), "359".into()],
+            SwipeOptions {
+                steps: Some(1),
+                duration_ms: Some(40),
+                hold_ms: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            swipe(
+                &mut qmp,
+                &["0".into(), "0".into(), "900".into(), "359".into()],
+                SwipeOptions::default()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            audb_protocol::ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            swipe(
+                &mut qmp,
+                &[
+                    i32::MIN.to_string(),
+                    "0".into(),
+                    i32::MAX.to_string(),
+                    "0".into()
+                ],
+                SwipeOptions::default()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            audb_protocol::ErrorCode::InvalidArgument
+        );
+        drop(qmp);
+        let inputs = server.await.unwrap();
+        assert_eq!(inputs.len(), 7);
+        for index in [0, 2] {
+            assert_eq!(inputs[index][0]["data"]["value"], 32767);
+            assert_eq!(inputs[index][1]["data"]["value"], 32767);
+        }
+        assert_eq!(inputs[4][0]["data"]["value"], 0);
+        assert_eq!(inputs[5][0]["data"]["value"], 32767);
+        assert_eq!(inputs[5][1]["data"]["value"], 32767);
+        assert_eq!(inputs[6][2]["data"]["down"], false);
+    }
+    #[tokio::test]
+    async fn missing_qmp_geometry_sends_no_touch_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("qmp.sock");
+        let server = mock_display(&socket, true).await;
+        let mut qmp = QmpClient::new(socket);
+        assert!(tap(&mut qmp, 10, 10, 1).await.is_err());
+        drop(qmp);
+        assert!(server.await.unwrap().is_empty());
+    }
+    #[test]
+    fn all_direction_aliases_stay_inside_current_geometry() {
+        for (width, height) in [(720, 1280), (800, 360), (2, 2)] {
+            for name in [
+                "up",
+                "down",
+                "left",
+                "right",
+                "edge-up",
+                "edge-down",
+                "edge-left",
+                "edge-right",
+            ] {
+                let (x1, y1, x2, y2) = direction_coords(name, width, height).unwrap();
+                let geometry = Geometry { width, height };
+                geometry.check(x1, y1).unwrap();
+                geometry.check(x2, y2).unwrap();
+            }
+        }
     }
 }

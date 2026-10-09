@@ -25,6 +25,8 @@ pub struct EmulatorConfig {
     pub emulator_name: String,
     #[serde(skip)]
     pub(crate) config_file: Option<PathBuf>,
+    #[serde(skip)]
+    pub(crate) registry_device: bool,
 }
 
 impl Default for EmulatorConfig {
@@ -44,6 +46,7 @@ impl Default for EmulatorConfig {
             sdk_root,
             emulator_name: DEFAULT_EMULATOR_NAME.into(),
             config_file: None,
+            registry_device: false,
         }
     }
 }
@@ -67,6 +70,25 @@ impl EmulatorConfig {
     }
 
     pub fn save(&self) -> CoreResult<()> {
+        if self.registry_device {
+            return crate::devices::DeviceRegistry::transaction(|r| {
+                let d = r
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.id == self.id)
+                    .ok_or_else(|| {
+                        CoreError::new(
+                            audb_protocol::ErrorCode::DeviceNotFound,
+                            format!("Device not found: {}", self.id),
+                        )
+                    })?;
+                // Setup may change QMP parameters; do not replace concurrently
+                // edited SSH settings with this invocation's older snapshot.
+                d.emulator = crate::devices::DeviceConfig::from(self.clone()).emulator;
+                Ok(())
+            })
+            .map(|_| ());
+        }
         let path = self.storage_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -121,9 +143,6 @@ impl EmulatorConfig {
     }
 
     pub fn validate(&self) -> CoreResult<()> {
-        if self.id != EMULATOR_ID {
-            return Err(CoreError::invalid("Only the emulator device is supported"));
-        }
         if !Path::new(&self.ssh_key).exists() {
             return Err(CoreError::new(
                 audb_protocol::ErrorCode::NotFound,

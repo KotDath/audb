@@ -1,11 +1,11 @@
 use crate::error::{CoreError, CoreResult};
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use audb_protocol::TrackPosition;
 use regex::Regex;
 use serde_json::{json, Value};
 
 async fn dbus(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     destination: &str,
     object: &str,
     interface: &str,
@@ -51,7 +51,7 @@ fn section_string(raw: &str, section: &str, key: &str) -> Option<String> {
 }
 
 async fn connman(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     interface: &str,
     method: &str,
     args: &str,
@@ -60,7 +60,7 @@ async fn connman(
     dbus(transport, "net.connman", "/", interface, method, args, root).await
 }
 
-pub async fn network_status(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn network_status(transport: &mut DeviceTransport) -> CoreResult<Value> {
     let manager = connman(transport, "net.connman.Manager", "GetProperties", "", false).await?;
     let services = connman(transport, "net.connman.Manager", "GetServices", "", false).await?;
     let emulated_offline = transport
@@ -89,7 +89,7 @@ pub async fn network_status(transport: &mut EmulatorTransport) -> CoreResult<Val
     )
 }
 
-pub async fn network_interfaces(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn network_interfaces(transport: &mut DeviceTransport) -> CoreResult<Value> {
     let raw = transport.exec("for i in /sys/class/net/*; do n=${i##*/}; test \"$n\" = lo && continue; echo IFACE=$n; cat $i/operstate 2>/dev/null; cat $i/address 2>/dev/null; cat $i/mtu 2>/dev/null; done", true).await?;
     let mut result = Vec::new();
     let mut current: Option<serde_json::Map<String, Value>> = None;
@@ -117,12 +117,12 @@ pub async fn network_interfaces(transport: &mut EmulatorTransport) -> CoreResult
     Ok(Value::Array(result))
 }
 
-pub async fn network_traffic(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn network_traffic(transport: &mut DeviceTransport) -> CoreResult<Value> {
     let raw=transport.exec("for i in /sys/class/net/*; do n=${i##*/}; test \"$n\" = lo && continue; echo $n $(cat $i/statistics/rx_bytes) $(cat $i/statistics/tx_bytes) $(cat $i/statistics/rx_packets) $(cat $i/statistics/tx_packets) $(cat $i/statistics/rx_errors) $(cat $i/statistics/tx_errors); done",true).await?;
     Ok(Value::Array(raw.lines().filter_map(|line|{let f:Vec<_>=line.split_whitespace().collect();if f.len()!=7{return None}Some(json!({"interface":f[0],"rxBytes":f[1].parse::<u64>().ok()?,"txBytes":f[2].parse::<u64>().ok()?,"rxPackets":f[3].parse::<u64>().ok()?,"txPackets":f[4].parse::<u64>().ok()?,"rxErrors":f[5].parse::<u64>().ok()?,"txErrors":f[6].parse::<u64>().ok()?}))}).collect()))
 }
 
-pub async fn proxy_get(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn proxy_get(transport: &mut DeviceTransport) -> CoreResult<Value> {
     let active = connman(
         transport,
         "org.sailfishos.connman.GlobalProxy",
@@ -149,7 +149,7 @@ pub async fn proxy_get(transport: &mut EmulatorTransport) -> CoreResult<Value> {
     )
 }
 pub async fn proxy_set(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     host: &str,
     port: u16,
 ) -> CoreResult<Value> {
@@ -179,7 +179,7 @@ pub async fn proxy_set(
     .await?;
     proxy_get(transport).await
 }
-pub async fn proxy_clear(transport: &mut EmulatorTransport) -> CoreResult<Value> {
+pub async fn proxy_clear(transport: &mut DeviceTransport) -> CoreResult<Value> {
     connman(
         transport,
         "org.sailfishos.connman.GlobalProxy",
@@ -202,7 +202,7 @@ pub async fn proxy_clear(transport: &mut EmulatorTransport) -> CoreResult<Value>
     .await?;
     proxy_get(transport).await
 }
-pub async fn offline(transport: &mut EmulatorTransport, enabled: bool) -> CoreResult<Value> {
+pub async fn offline(transport: &mut DeviceTransport, enabled: bool) -> CoreResult<Value> {
     // ConnMan's OfflineMode removes eth0 and therefore destroys the SSH control plane used by
     // the emulator backend. Isolate guest traffic in a dedicated chain while always allowing
     // SSH replies; this gives applications an offline network without making `offline off`
@@ -225,7 +225,7 @@ pub async fn offline(transport: &mut EmulatorTransport, enabled: bool) -> CoreRe
     Ok(json!({"offlineRequested":enabled,"offline":enabled,"controlPlane":"ssh-preserved"}))
 }
 
-async fn geo(transport: &mut EmulatorTransport, method: &str, args: &str) -> CoreResult<String> {
+async fn geo(transport: &mut DeviceTransport, method: &str, args: &str) -> CoreResult<String> {
     dbus(
         transport,
         "ru.omp.GeoclueEmulationManagement",
@@ -238,7 +238,7 @@ async fn geo(transport: &mut EmulatorTransport, method: &str, args: &str) -> Cor
     .await
 }
 pub async fn location_set(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     lat: f64,
     lon: f64,
     alt: f64,
@@ -255,7 +255,7 @@ pub async fn location_set(
     Ok(json!({"latitude":lat,"longitude":lon,"altitude":alt}))
 }
 pub async fn track_load(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     positions: &[TrackPosition],
     looped: Option<bool>,
     speed: Option<i32>,
@@ -315,7 +315,7 @@ pub async fn track_load(
     Ok(result)
 }
 pub async fn track_action(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     action: &str,
     index: Option<i32>,
     looped: Option<bool>,
@@ -387,7 +387,7 @@ const SENSORS: [&str; 9] = [
     "tap",
 ];
 async fn sensor_call(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     method: &str,
     args: &str,
 ) -> CoreResult<String> {
@@ -411,7 +411,7 @@ pub fn sensor_list() -> Value {
     )
 }
 pub async fn sensor_enable(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     sensor: &str,
     enabled: bool,
 ) -> CoreResult<Value> {
@@ -431,7 +431,7 @@ pub async fn sensor_enable(
     Ok(json!({"sensor":sensor,"enabled":enabled}))
 }
 pub async fn sensor_vector(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     sensor: &str,
     x: f64,
     y: f64,
@@ -476,7 +476,7 @@ pub async fn sensor_vector(
     Ok(json!({"sensor":sensor,"x":x,"y":y,"z":z}))
 }
 pub async fn sensor_scalar(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     sensor: &str,
     value: i32,
 ) -> CoreResult<Value> {

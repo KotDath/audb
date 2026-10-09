@@ -3,6 +3,7 @@ members = [
     "audb-client",
     "audb-protocol",
     "audb-core",
+    "audb-agent",
 ]
 resolver = "2"
 

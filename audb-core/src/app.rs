@@ -1,5 +1,5 @@
 use crate::error::{CoreError, CoreResult};
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use regex::Regex;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ pub fn validate_package(package: &str) -> CoreResult<()> {
 }
 
 async fn call(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     method: &str,
     argument: Option<&str>,
 ) -> CoreResult<String> {
@@ -38,13 +38,13 @@ pub fn parse_running(raw: &str) -> Vec<Value> {
     regex.captures_iter(raw).filter_map(|capture| Some(json!({"package": capture.get(1)?.as_str(), "pid": capture.get(2)?.as_str().parse::<i64>().ok()?}))).collect()
 }
 
-pub async fn list(transport: &mut EmulatorTransport) -> CoreResult<Vec<Value>> {
+pub async fn list(transport: &mut DeviceTransport) -> CoreResult<Vec<Value>> {
     Ok(parse_running(
         &call(transport, "GetRunningApplications", None).await?,
     ))
 }
 
-pub async fn pid(transport: &mut EmulatorTransport, package: &str) -> CoreResult<Option<i64>> {
+pub async fn pid(transport: &mut DeviceTransport, package: &str) -> CoreResult<Option<i64>> {
     validate_package(package)?;
     Ok(list(transport)
         .await?
@@ -53,20 +53,20 @@ pub async fn pid(transport: &mut EmulatorTransport, package: &str) -> CoreResult
         .and_then(|item| item["pid"].as_i64()))
 }
 
-pub async fn launch(transport: &mut EmulatorTransport, package: &str) -> CoreResult<Value> {
+pub async fn launch(transport: &mut DeviceTransport, package: &str) -> CoreResult<Value> {
     validate_package(package)?;
     let raw = call(transport, "Start", Some(package)).await?;
     Ok(json!({"package": package, "launched": true, "response": raw}))
 }
 
-pub async fn stop(transport: &mut EmulatorTransport, package: &str) -> CoreResult<Value> {
+pub async fn stop(transport: &mut DeviceTransport, package: &str) -> CoreResult<Value> {
     validate_package(package)?;
     let raw = call(transport, "Terminate", Some(package)).await?;
     Ok(json!({"package": package, "stopped": true, "response": raw}))
 }
 
 pub async fn wait(
-    transport: &mut EmulatorTransport,
+    transport: &mut DeviceTransport,
     package: &str,
     running: bool,
     timeout: Duration,

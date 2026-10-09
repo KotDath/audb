@@ -1,5 +1,5 @@
 use crate::error::{CoreError, CoreResult};
-use crate::transport::{shell_quote, EmulatorTransport};
+use crate::transport::{shell_quote, DeviceTransport};
 use audb_protocol::LogsOptions;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -23,14 +23,14 @@ fn variant(raw: &str) -> String {
         .unwrap_or_default()
         .into()
 }
-async fn device_info(t: &mut EmulatorTransport, method: &str) -> CoreResult<String> {
+async fn device_info(t: &mut DeviceTransport, method: &str) -> CoreResult<String> {
     t.exec(&format!("gdbus call --system --dest ru.omp.deviceinfo --object-path /ru/omp/deviceinfo/Features --method ru.omp.deviceinfo.Features.{method}"),false).await
 }
-async fn mce(t: &mut EmulatorTransport, method: &str) -> CoreResult<String> {
+async fn mce(t: &mut DeviceTransport, method: &str) -> CoreResult<String> {
     t.exec(&format!("gdbus call --system --dest com.nokia.mce --object-path /com/nokia/mce/request --method com.nokia.mce.request.{method}"),false).await
 }
 
-pub async fn info(t: &mut EmulatorTransport, category: Option<&str>) -> CoreResult<Value> {
+pub async fn info(t: &mut DeviceTransport, category: Option<&str>) -> CoreResult<Value> {
     let valid = ["device", "cpu", "memory", "storage", "battery", "features"];
     if let Some(c) = category {
         if !valid.contains(&c) {
@@ -105,7 +105,7 @@ fn priority(value: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-pub async fn logs(t: &mut EmulatorTransport, o: LogsOptions) -> CoreResult<String> {
+pub async fn logs(t: &mut DeviceTransport, o: LogsOptions) -> CoreResult<String> {
     if o.kernel && o.unit.is_some() {
         return Err(CoreError::invalid(
             "--kernel and --unit are mutually exclusive",
@@ -144,7 +144,7 @@ pub async fn logs(t: &mut EmulatorTransport, o: LogsOptions) -> CoreResult<Strin
 }
 
 const APM: &str = "gdbus call --system --dest ru.omp.APM --object-path /ru/omp/APM --method";
-pub async fn package_list(t: &mut EmulatorTransport, filter: Option<&str>) -> CoreResult<Value> {
+pub async fn package_list(t: &mut DeviceTransport, filter: Option<&str>) -> CoreResult<Value> {
     let raw = t
         .exec(&format!("{APM} ru.omp.APM.GetPackageList"), false)
         .await?;
@@ -168,36 +168,172 @@ pub async fn package_list(t: &mut EmulatorTransport, filter: Option<&str>) -> Co
     }
     Ok(json!({"packages":ids,"count":ids.len(),"filter":filter}))
 }
+/// Upload RPM contents over SFTP and confirm its APM registration. The daemon
+/// request contains a path, never a JSON array of package bytes.
 pub async fn package_install(
-    t: &mut EmulatorTransport,
-    name: &str,
-    bytes: &[u8],
+    t: &mut DeviceTransport,
+    local: &Path,
+    timeout: std::time::Duration,
 ) -> CoreResult<Value> {
-    if !name.ends_with(".rpm") {
+    use crate::system_package::{parse_info, StageCleanup, QUERY_FORMAT};
+    use audb_protocol::ErrorCode;
+    use tokio::io::AsyncReadExt;
+    if local.extension().and_then(|v| v.to_str()) != Some("rpm") {
         return Err(CoreError::invalid("File must be .rpm"));
     }
-    let filename = Path::new(name)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .ok_or_else(|| CoreError::invalid("Invalid RPM filename"))?;
-    let remote = format!("/home/{}/Downloads/{filename}", t.config().ssh_user);
-    t.upload_bytes(Path::new(&remote), bytes).await?;
-    let result = t
-        .exec(
-            &format!(
-                "{APM} ru.omp.APM.Install {} {}",
-                shell_quote(&remote),
-                shell_quote("{}")
-            ),
-            false,
+    if timeout < std::time::Duration::from_secs(1) || timeout > std::time::Duration::from_secs(3600)
+    {
+        return Err(CoreError::invalid(
+            "Package registration timeout must be 1..3600 seconds",
+        ));
+    }
+    let mut source = tokio::fs::File::open(local).await.map_err(|e| {
+        CoreError::new(
+            ErrorCode::NotFound,
+            format!("Cannot open RPM {}: {e}", local.display()),
         )
-        .await;
-    let _ = t
-        .exec(&format!("rm -f {}", shell_quote(&remote)), false)
-        .await;
-    Ok(json!({"package":filename,"installed":true,"response":result?}))
+    })?;
+    if !source.metadata().await?.is_file() {
+        return Err(CoreError::invalid("RPM must be a regular file"));
+    }
+    let mut lead = [0u8; 4];
+    source
+        .read_exact(&mut lead)
+        .await
+        .map_err(|_| CoreError::invalid("File has no RPM header"))?;
+    if lead != [0xed, 0xab, 0xee, 0xdb] {
+        return Err(CoreError::invalid("File has no RPM header"));
+    }
+    drop(source);
+    let dir = t
+        .exec("umask 077 && mktemp -d /tmp/audb-app-rpm.XXXXXX", false)
+        .await?;
+    let suffix = dir
+        .strip_prefix("/tmp/audb-app-rpm.")
+        .filter(|s| s.len() == 6 && s.bytes().all(|c| c.is_ascii_alphanumeric()));
+    if suffix.is_none() {
+        return Err(CoreError::runtime(
+            "Invalid application RPM staging directory",
+        ));
+    }
+    let remote = format!("{dir}/package.rpm");
+    let cleanup = format!(
+        "rm -f -- {} && rmdir -- {}",
+        shell_quote(&remote),
+        shell_quote(&dir)
+    );
+    let mut guard = StageCleanup {
+        config: Some(t.config().clone()),
+        command: cleanup.clone(),
+    };
+    let mut dispatched = false;
+    let result = async {
+        let bytes = t.upload_file(local,Path::new(&remote)).await?;
+        let package = parse_info(&t.exec(&format!("rpm -qp --queryformat {} -- {}", shell_quote(QUERY_FORMAT),shell_quote(&remote)),false).await?)?;
+        let arch = t.exec("rpm --eval '%{_arch}'",false).await?;
+        if package.arch != "noarch" && package.arch != arch {
+            return Err(CoreError::invalid(format!("RPM architecture '{}' does not match device '{}'",package.arch,arch)));
+        }
+        let version = format!("{}-{}",package.version,package.release);
+        let query = format!("{APM} ru.omp.APM.GetPackage {}",shell_quote(&package.name));
+        let current = apm_package(t,&query).await?;
+        if current.as_ref().is_some_and(|v| v.get("general.id")==Some(&package.name) && v.get("general.version")==Some(&version)) {
+            return Ok(json!({"package":package.name,"rpm":package,"installed":true,"verified":true,
+                "alreadyInstalled":true,"changed":false,"bytes":bytes,"verificationBackend":"APM.GetPackage"}));
+        }
+        // Once APM may have received the request, don't delete its queued source
+        // on cancellation or an unknown outcome. Installation is never replayed.
+        dispatched = true;
+        guard.config = None;
+        let response = t.exec(&format!("{APM} ru.omp.APM.Install {} {}", shell_quote(&remote),shell_quote("{}")),false).await?;
+        let deadline = std::time::Instant::now()+timeout;
+        let mut observed = None;
+        loop {
+            let read = tokio::time::timeout(deadline.saturating_duration_since(std::time::Instant::now()),apm_package(t,&query)).await;
+            match read {
+                Ok(Ok(Some(info))) => {
+                    if info.get("general.id")==Some(&package.name) && info.get("general.version")==Some(&version) {
+                        return Ok(json!({"package":package.name,"rpm":package,"installed":true,"verified":true,
+                            "alreadyInstalled":false,"changed":true,"bytes":bytes,"response":response,"verificationBackend":"APM.GetPackage"}));
+                    }
+                    observed = Some(info);
+                }
+                Ok(Ok(None)) => {},
+                Ok(Err(e)) => return Err(CoreError::new(ErrorCode::OutcomeUnknown,format!("APM installation requested, but verification failed: {}",e.message))),
+                Err(_) => break,
+            }
+            if std::time::Instant::now()>=deadline { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(CoreError::new(ErrorCode::OutcomeUnknown,"APM installation was requested but the expected version was not registered before the deadline; installation was not repeated")
+            .with_data(json!({"phase":"verify","requested":package,"observed":observed})))
+    }.await;
+    let result = match result {
+        Err(mut error) if dispatched => {
+            let mut data = error.data.take().unwrap_or_else(|| json!({}));
+            data["installationRequested"] = json!(true);
+            data["stagingRetained"] = json!(true);
+            data["stagingDirectory"] = json!(dir);
+            data["retried"] = json!(false);
+            error.data = Some(data);
+            return Err(error);
+        }
+        other => other,
+    };
+    let removed = t.exec(&cleanup, false).await;
+    guard.config = None;
+    match result {
+        Ok(mut value) => {
+            value["stagingCleanup"] = json!(removed.is_ok());
+            if let Err(e) = removed {
+                value["cleanupError"] = json!({"message":e.message,"directory":dir});
+            }
+            Ok(value)
+        }
+        Err(mut e) => {
+            let mut data = e.data.take().unwrap_or_else(|| json!({}));
+            data["stagingCleanup"] = json!(removed.is_ok());
+            e.data = Some(data);
+            Err(e)
+        }
+    }
 }
-pub async fn package_uninstall(t: &mut EmulatorTransport, package: &str) -> CoreResult<Value> {
+
+/// APM returns a{ss}. Package metadata values use simple IDs/versions, but the
+/// parser handles GVariant quote/backslash escaping without invoking a shell.
+fn parse_apm_package(raw: &str) -> CoreResult<std::collections::BTreeMap<String, String>> {
+    let pattern = Regex::new(r#"'((?:[^'\\]|\\.)*)'\s*:\s*'((?:[^'\\]|\\.)*)'"#).unwrap();
+    let fields: std::collections::BTreeMap<_, _> = pattern
+        .captures_iter(raw)
+        .map(|c| {
+            (
+                c[1].replace("\\'", "'").replace("\\\\", "\\"),
+                c[2].replace("\\'", "'").replace("\\\\", "\\"),
+            )
+        })
+        .collect();
+    if !fields.contains_key("general.id") || !fields.contains_key("general.version") {
+        return Err(CoreError::runtime("APM package response has no ID/version"));
+    }
+    Ok(fields)
+}
+async fn apm_package(
+    t: &mut DeviceTransport,
+    query: &str,
+) -> CoreResult<Option<std::collections::BTreeMap<String, String>>> {
+    match t.exec(query, false).await {
+        Ok(raw) => Ok(Some(parse_apm_package(&raw)?)),
+        Err(e)
+            if e.code == audb_protocol::ErrorCode::RemoteCommandFailed
+                && e.message.contains("ru.omp.APM.Error.PackageNotExist") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn package_uninstall(t: &mut DeviceTransport, package: &str) -> CoreResult<Value> {
     if package.is_empty() {
         return Err(CoreError::invalid("Package name required"));
     }
@@ -223,5 +359,13 @@ mod tests {
         assert_eq!(variant("(uint32 2,)"), "2");
         assert_eq!(variant("(uint64 4116619264,)"), "4116619264");
         assert_eq!(priority("E"), Some("err"));
+    }
+    #[test]
+    fn apm_verification_requires_id_and_version_and_handles_quoted_values() {
+        let package=parse_apm_package("({'general.id': 'ru.test.Probe', 'general.version': '0.1.0+1-1', 'label': 'User\\'s test'},)").unwrap();
+        assert_eq!(package["general.version"], "0.1.0+1-1");
+        assert_eq!(package["label"], "User's test");
+        assert!(parse_apm_package("({'general.id':'ru.test.Probe'},)").is_err());
+        assert!(parse_apm_package("invalid output").is_err());
     }
 }
