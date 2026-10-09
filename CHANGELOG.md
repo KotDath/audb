@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `setup-root` explicitly provisions and verifies SSH access for the selected
+  device. It reuses working root SSH or asks once for a hidden `devel-su`
+  password, creates an identity per device, and verifies both user and root
+  access before updating the registry. `--check-only` makes no changes.
+
+### Fixed
+
+- Bootstrap UID checks guard the complete privileged shell command, including
+  commands containing multiple statements.
+- Missing root SSH reports `ROOT_ACCESS_REQUIRED` with a setup instruction.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

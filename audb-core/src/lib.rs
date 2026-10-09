@@ -12,6 +12,7 @@ pub mod input;
 pub mod physical_input;
 pub mod qmp;
 pub mod readiness;
+pub mod root_setup;
 pub mod screenshot;
 pub mod setup;
 pub mod system;

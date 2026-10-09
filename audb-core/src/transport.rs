@@ -82,7 +82,7 @@ impl DeviceTransport {
         command: &str,
         password: Option<&audb_protocol::RootPassword>,
     ) -> CoreResult<String> {
-        let checked = format!("test \"$(id -u)\" = 0 && {command}");
+        let checked = checked_root_command(command);
         if self.config.ssh_user == "root" && self.config.root_user.is_none() {
             return self.exec_raw(&checked, false).await;
         }
@@ -208,8 +208,8 @@ impl DeviceTransport {
         let user = if root {
             self.config.root_user.as_deref().ok_or_else(|| {
                 CoreError::new(
-                    ErrorCode::CapabilityUnavailable,
-                    "Root SSH is not configured; privileged operations require audb-agent",
+                    ErrorCode::RootAccessRequired,
+                    "Root SSH is not configured; run audb --device ID setup-root once",
                 )
             })?
         } else {
@@ -582,12 +582,35 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn checked_root_command(command: &str) -> String {
+    format!(
+        "test \"$(id -u)\" = 0 && /bin/sh -c {}",
+        shell_quote(command)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn quote_handles_single_quotes() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+    #[test]
+    fn non_root_uid_cannot_execute_later_privileged_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist");
+        let command = format!("true; touch {}", shell_quote(target.to_str().unwrap()));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "id() {{ printf '100000\\n'; }}; {}",
+                checked_root_command(&command)
+            ))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!target.exists());
     }
     #[test]
     fn sftp_paths_cannot_add_commands_or_expand_globs() {

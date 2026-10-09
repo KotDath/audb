@@ -156,6 +156,15 @@ enum Commands {
     SetupStatus,
     /// Install the audb-agent system RPM on the selected device.
     SetupDevice(SetupDeviceArgs),
+    /// Configure and verify passwordless root SSH for the selected device.
+    SetupRoot {
+        /// Read the one-time devel-su credential from stdin instead of a hidden prompt.
+        #[arg(long)]
+        root_password_stdin: bool,
+        /// Check existing root SSH without changing keys or the registry.
+        #[arg(long)]
+        check_only: bool,
+    },
     Emulator {
         #[command(subcommand)]
         command: EmulatorCommand,
@@ -677,13 +686,117 @@ struct SystemInstallFlags {
     root_password_stdin: bool,
 }
 
+fn read_root_password(
+    from_stdin: bool,
+    required: bool,
+    device_id: &str,
+) -> Result<Option<RootPassword>, AudbError> {
+    use std::io::{BufRead, IsTerminal, Read};
+    let password = if from_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(4099)
+            .read_until(b'\n', &mut bytes)
+            .map_err(internal)?;
+        if bytes.len() > 4098 {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "Root credential is too long",
+            ));
+        }
+        let mut value = String::from_utf8(bytes)
+            .map_err(|_| error(ErrorCode::InvalidArgument, "Root credential must be UTF-8"))?;
+        if value.ends_with('\n') {
+            value.pop();
+        }
+        if value.ends_with('\r') {
+            value.pop();
+        }
+        Some(RootPassword::new(value))
+    } else if required {
+        if !std::io::stdin().is_terminal() {
+            return Err(error(ErrorCode::RootAccessRequired,
+                "Root access needs --root-password-stdin or an interactive terminal; run setup-root once for passwordless SSH"));
+        }
+        Some(RootPassword::new(
+            rpassword::prompt_password(format!("Root password for {}: ", device_id))
+                .map_err(internal)?,
+        ))
+    } else {
+        None
+    };
+    if let Some(password) = &password {
+        let value = password.expose();
+        if value.is_empty() || value.len() > 4096 || value.contains(['\n', '\r', '\0']) {
+            return Err(error(
+                ErrorCode::InvalidArgument,
+                "Root credential must be one nonempty line",
+            ));
+        }
+    }
+    Ok(password)
+}
+
+async fn setup_root(
+    device: &DeviceConfig,
+    from_stdin: bool,
+    check_only: bool,
+    timeout: u64,
+) -> Result<Value, AudbError> {
+    let probe = tokio::time::timeout(
+        Duration::from_secs(timeout),
+        audb_core::root_setup::probe(device),
+    )
+    .await
+    .map_err(|_| error(ErrorCode::OutcomeUnknown, "Root SSH probe timed out"))?;
+    let configured = match probe {
+        Ok(configured) => configured,
+        Err(error) if check_only => return Err(core_error(error)),
+        Err(_) => {
+            let password = read_root_password(from_stdin, true, &device.id)?
+                .ok_or_else(|| error(ErrorCode::RootAccessRequired, "Root credential required"))?;
+            let directory = DeviceRegistry::path()
+                .map_err(core_error)?
+                .parent()
+                .unwrap()
+                .join("ssh-identities");
+            tokio::time::timeout(
+                Duration::from_secs(timeout),
+                audb_core::root_setup::configure(device, &password, &directory),
+            )
+            .await
+            .map_err(|_| {
+                error(
+                    ErrorCode::OutcomeUnknown,
+                    "Root setup timed out; inspect SSH keys before retrying",
+                )
+            })?
+            .map_err(core_error)?
+        }
+    };
+    let changed = configured != *device && !check_only;
+    if changed {
+        DeviceRegistry::transaction(|registry| {
+            if registry.get(&device.id)? != device {
+                return Err(audb_core::CoreError::new(ErrorCode::OutcomeUnknown, "Device configuration changed during root setup; verified keys were retained, registry was not overwritten"));
+            }
+            *registry.devices.iter_mut().find(|d| d.id == device.id).unwrap() = configured.clone();
+            Ok(())
+        }).map_err(core_error)?;
+    }
+    Ok(
+        json!({"verified":true,"uid":0,"method":"ssh-key","rootUser":configured.root_user,"sshKey":configured.ssh_key,"changed":changed,"checkOnly":check_only}),
+    )
+}
+
 fn system_install_request(
     path: PathBuf,
     flags: SystemInstallFlags,
     device: &DeviceConfig,
     setup: bool,
 ) -> Result<Command, AudbError> {
-    use std::io::{BufRead, IsTerminal, Read};
+    use std::io::Read;
     let path = std::fs::canonicalize(&path).map_err(|e| {
         error(
             ErrorCode::NotFound,
@@ -706,49 +819,11 @@ fn system_install_request(
             "File does not have an RPM lead header",
         ));
     }
-    let password = if flags.root_password_stdin {
-        let mut bytes = Vec::new();
-        std::io::stdin()
-            .lock()
-            .take(4099)
-            .read_until(b'\n', &mut bytes)
-            .map_err(internal)?;
-        if bytes.len() > 4098 {
-            return Err(error(
-                ErrorCode::InvalidArgument,
-                "Root credential is too long",
-            ));
-        }
-        let mut value = String::from_utf8(bytes)
-            .map_err(|_| error(ErrorCode::InvalidArgument, "Root credential must be UTF-8"))?;
-        if value.ends_with('\n') {
-            value.pop();
-        }
-        if value.ends_with('\r') {
-            value.pop();
-        }
-        Some(RootPassword::new(value))
-    } else if device.root_user.is_none() && device.ssh_user != "root" {
-        if !std::io::stdin().is_terminal() {
-            return Err(error(ErrorCode::RootAccessRequired,
-                "Root installation needs --root-password-stdin, an interactive terminal, or device update ID --root-user root"));
-        }
-        Some(RootPassword::new(
-            rpassword::prompt_password(format!("Root password for {}: ", device.id))
-                .map_err(internal)?,
-        ))
-    } else {
-        None
-    };
-    if let Some(password) = &password {
-        let value = password.expose();
-        if value.is_empty() || value.len() > 4096 || value.contains(['\n', '\r', '\0']) {
-            return Err(error(
-                ErrorCode::InvalidArgument,
-                "Root credential must be one nonempty line",
-            ));
-        }
-    }
+    let password = read_root_password(
+        flags.root_password_stdin,
+        device.root_user.is_none() && device.ssh_user != "root",
+        &device.id,
+    )?;
     let options = SystemPackageOptions {
         upgrade: flags.upgrade,
         reinstall: flags.reinstall,
@@ -849,6 +924,14 @@ async fn run(cli: Cli, target: &mut Option<String>) -> Result<(), AudbError> {
         _ => {}
     }
     match cli.command {
+        Commands::SetupRoot {
+            root_password_stdin,
+            check_only,
+        } => {
+            let value =
+                setup_root(device, root_password_stdin, check_only, cli.command_timeout).await?;
+            return emit_local(cli.json, device_id, value);
+        }
         Commands::Install => {
             return emit_local(
                 cli.json,
@@ -1092,7 +1175,8 @@ async fn run(cli: Cli, target: &mut Option<String>) -> Result<(), AudbError> {
         | Commands::SetupStatus
         | Commands::Emulator { .. }
         | Commands::Device { .. }
-        | Commands::Select { .. } => unreachable!(),
+        | Commands::Select { .. }
+        | Commands::SetupRoot { .. } => unreachable!(),
     };
     let raw_shell = matches!(&command, Command::Shell { .. });
     let is_screenshot = matches!(&command, Command::Screenshot { .. });

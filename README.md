@@ -44,6 +44,31 @@ The full registration form accepts `--host`, `--user`, `--port`, `--key`, `--kin
 
 Emulators additionally accept `--qmp`, `--sdk-root` and `--emulator-name`. Ordinary privileged guest commands currently require root SSH. System package installation also supports one-shot devel-su authentication; audb does not store a devel-su password.
 
+### One-time root SSH setup (source build; not included in released 0.3.0)
+
+```sh
+audb --device phone setup-root
+audb --device phone setup-root --check-only
+audb --device phone shell --root 'id -u'
+```
+
+`setup-root` first tests root SSH. If it already works, no password is needed.
+Otherwise it asks for a hidden `devel-su` password once, creates an Ed25519
+identity for this device under `ssh-identities/` beside the registry, and adds
+the public key to the existing SSH user and UID-0 account. It verifies both
+connections before atomically saving the key path and root account. Repeating
+setup returns `changed: false`. Setup preserves the selected default and works
+with each device's registered host/profile, port and account; emulator SDK root
+access is reused. Noninteractive setup accepts `--root-password-stdin`; the
+credential never appears in argv, JSON output or the registry.
+
+`--check-only` changes nothing. SSH must permit root public-key authentication
+and use the account's `.ssh/authorized_keys`. Setup does not edit `sshd` policy.
+If verification fails, newly added key lines are removed where possible, and
+the registry is unchanged. Inspect `data.keyCleanup` on errors or existing keys
+after an unknown outcome. Existing keys and the generated local identity remain
+available; do not blindly retry interrupted setup.
+
 The registry is `${XDG_CONFIG_HOME:-~/.config}/audb/devices-v1.json`. On first use, `emulator.json` is migrated with ID `emulator`; the original and a `emulator.json.pre-registry.bak` backup remain available. When no old emulator configuration exists, the default emulator is registered for compatibility. An older `devices.json` uses a different schema and is left untouched. Writes are atomic and registry mutations are locked.
 
 Without `--device`, audb uses the saved default or the only registered device. Ambiguous or empty registries return `DEVICE_REQUIRED`; an unknown ID returns `DEVICE_NOT_FOUND`. `device list` reads registration metadata without network probes and reports state `unknown`; use targeted `status` to probe connectivity.
@@ -279,7 +304,7 @@ tap, swipe, text, key, screenshot, status, doctor, capabilities
 permission list|grant|revoke|reset|prompt
 install, uninstall, setup-status, setup-device
 emulator start|stop|status
-device add|update|remove|list|current, select
+device add|update|remove|list|current, select, setup-root
 shell, push, pull, open, info, logs
 launch, stop, app ...
 display status|on|off|dim|lock|wake
