@@ -140,7 +140,7 @@ fn authorize(public: &str, root: Option<&str>, remove: bool) -> String {
     } else {
         format!("if ! grep -Fqx -- {key} \"$file\"; then printf '\\n%s\\n' {key} >> \"$file\"; printf 'AUDB_KEY_ADDED\\n'; fi;", key=shell_quote(public))
     };
-    format!("set -e; umask 077; {home} case \"$home\" in /*) ;; *) exit 1;; esac; dir=\"$home/.ssh\"; file=\"$dir/authorized_keys\"; test ! -L \"$dir\" && test ! -L \"$file\"; if test -e \"$file\"; then test -f \"$file\"; fi; mkdir -p \"$dir\"; chmod 700 \"$dir\"; touch \"$file\"; chmod 600 \"$file\"; {action}")
+    format!("set -e; umask 077; {home} case \"$home\" in /*) ;; *) exit 1;; esac; dir=\"$home/.ssh\"; file=\"$dir/authorized_keys\"; test ! -L \"$dir\"; test ! -L \"$file\"; if test -e \"$file\"; then test -f \"$file\"; fi; mkdir -p \"$dir\"; chmod 700 \"$dir\"; touch \"$file\"; chmod 600 \"$file\"; {action}")
 }
 
 #[cfg(all(test, unix))]
@@ -182,5 +182,18 @@ mod tests {
             .status
             .success());
         assert_eq!(fs::read_to_string(target).unwrap(), "preserve");
+    }
+    #[test]
+    fn authorization_refuses_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated");
+        fs::create_dir(&target).unwrap();
+        let file = target.join("authorized_keys");
+        fs::write(&file, "preserve").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(".ssh")).unwrap();
+        assert!(!run(dir.path(), "ssh-ed25519 fixture", false)
+            .status
+            .success());
+        assert_eq!(fs::read_to_string(file).unwrap(), "preserve");
     }
 }
