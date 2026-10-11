@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Physical touch on framebuffer panels that have no DRM connector. The agent
+  reads the fbdev mode file and falls back to modes. Keyboard, permissions and
+  screenshots stay available when no panel mode exists. doctor stays healthy
+  and reports a touch warning instead of asking for another device setup after
+  the agent is already installed.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added

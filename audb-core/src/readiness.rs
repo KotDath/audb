@@ -335,6 +335,7 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
             } else { Check::problem("inputFocus", "warning", "INPUT_NOT_FOCUSED", "Unicode backend is available; no compatible editor is focused", "Tap an editable field before text. If an app was open during setup, restart that app once.") });
         }
     }
+    let touch_panel = touch_warning(&agent);
     checks.splice(
         0..0,
         [
@@ -349,6 +350,9 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
             qmp,
         ],
     );
+    if let Some(touch_panel) = touch_panel {
+        checks.push(touch_panel);
+    }
     let healthy = checks.iter().all(|check| check.status != "failed");
     Report {
         report_version: 1,
@@ -362,6 +366,26 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
 
 fn skipped(name: &str, message: &str, fix: &str) -> Check {
     Check::problem(name, "skipped", "CHECK_SKIPPED", message, fix)
+}
+
+fn touch_warning(agent: &Check) -> Option<Check> {
+    if !agent.ok() {
+        return None;
+    }
+    let code = agent.data["panel"]["reasonCode"].as_str()?;
+    if code.is_empty() {
+        return None;
+    }
+    let message = agent.data["panel"]["message"]
+        .as_str()
+        .unwrap_or("Panel geometry is unavailable");
+    Some(Check::problem(
+        "touch",
+        "warning",
+        code,
+        message,
+        "Read the kernel DRM connector or fbdev mode and restart audb-agent. Keyboard, permissions and screenshots remain available.",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,14 +468,37 @@ fn capabilities(
                 },
             );
             if !available {
-                cap = cap.blocked(
-                    agent.code.as_deref().unwrap_or("CAPABILITY_UNAVAILABLE"),
-                    agent
-                        .message
-                        .as_deref()
-                        .unwrap_or("Agent backend is unavailable"),
-                    "Run doctor and setup-device; check the user session and agent capabilities.",
-                );
+                // An installed agent that simply has no touchscreen is not fixed by reinstalling it.
+                if agent.ok() && matches!(name, "tap" | "swipe") {
+                    if let Some(warning) = touch_warning(agent) {
+                        cap = cap.blocked(
+                            warning
+                                .code
+                                .as_deref()
+                                .unwrap_or("PANEL_GEOMETRY_UNAVAILABLE"),
+                            warning
+                                .message
+                                .as_deref()
+                                .unwrap_or("Panel geometry is unavailable"),
+                            warning.fix.as_deref().unwrap_or(""),
+                        );
+                    } else {
+                        cap = cap.blocked(
+                            "CAPABILITY_UNAVAILABLE",
+                            "No uinput touchscreen is available",
+                            "Check audb-agent logs for uinput creation errors.",
+                        );
+                    }
+                } else {
+                    cap = cap.blocked(
+                        agent.code.as_deref().unwrap_or("CAPABILITY_UNAVAILABLE"),
+                        agent
+                            .message
+                            .as_deref()
+                            .unwrap_or("Agent backend is unavailable"),
+                        "Run doctor and setup-device; check the user session and agent capabilities.",
+                    );
+                }
             } else if name == "text" && agent.data["input"]["active"] != true {
                 cap = cap.blocked(
                     "INPUT_NOT_FOCUSED",
@@ -771,5 +818,107 @@ mod tests {
                 "screendump"
             ]
         );
+    }
+
+    fn physical(agent: &Check, display: &Check) -> BTreeMap<String, Capability> {
+        let ssh = Check::passed("ssh", json!({}));
+        evaluate(false, &ssh, agent, display, &skipped("qmp", "physical", ""))
+    }
+
+    #[test]
+    fn installed_agent_without_touch_does_not_prescribe_setup_device() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 1600, "height": 720},
+                "capabilities": {"tap": false, "swipe": false, "key": true, "text": true, "screenshot": true}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        let fix = caps["tap"].fix.as_deref().unwrap();
+        assert!(!fix.contains("setup-device"), "{fix}");
+        assert!(!caps["swipe"]
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("setup-device"));
+        assert_eq!(
+            caps["tap"].reason_code.as_deref(),
+            Some("CAPABILITY_UNAVAILABLE")
+        );
+        assert!(caps["key"].ready == Some(true));
+        assert!(caps["screenshot"].ready == Some(true));
+        assert!(touch_warning(&agent).is_none());
+    }
+
+    #[test]
+    fn panel_geometry_failure_is_a_touch_warning_and_not_a_reinstall() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": null,
+                "capabilities": {"tap": false, "swipe": false, "key": true, "text": true, "screenshot": true},
+                "panel": {
+                    "reasonCode": "PANEL_GEOMETRY_UNAVAILABLE",
+                    "message": "No DRM connector or framebuffer was found"
+                }
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        assert_eq!(
+            caps["tap"].reason_code.as_deref(),
+            Some("PANEL_GEOMETRY_UNAVAILABLE")
+        );
+        assert_eq!(
+            caps["swipe"].reason_code.as_deref(),
+            Some("PANEL_GEOMETRY_UNAVAILABLE")
+        );
+        assert_eq!(
+            caps["tap"].reason.as_deref(),
+            Some("No DRM connector or framebuffer was found")
+        );
+        assert!(!caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
+        assert_ne!(
+            caps["tap"].reason_code.as_deref(),
+            Some("DISPLAY_NOT_READY")
+        );
+        assert!(caps["key"].ready == Some(true));
+        assert!(caps["screenshot"].ready == Some(true));
+        let warning = touch_warning(&agent).unwrap();
+        assert_eq!(warning.name, "touch");
+        assert_eq!(warning.status, "warning");
+        assert_eq!(warning.code.as_deref(), Some("PANEL_GEOMETRY_UNAVAILABLE"));
+        assert_eq!(
+            warning.message.as_deref(),
+            Some("No DRM connector or framebuffer was found")
+        );
+        assert!(!warning.fix.as_deref().unwrap().contains("setup-device"));
+        let checks = [Check::passed("agent", json!({})), warning];
+        assert!(checks.iter().all(|check| check.status != "failed"));
+    }
+
+    #[test]
+    fn failed_agent_still_prescribes_setup_device() {
+        let agent = Check::problem(
+            "agent",
+            "failed",
+            "CAPABILITY_UNAVAILABLE",
+            "Agent backend is unavailable",
+            "Run audb setup-device",
+        );
+        let display = skipped("display", "Agent check failed", "setup");
+        let caps = physical(&agent, &display);
+        assert!(caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
+        assert!(touch_warning(&agent).is_none());
     }
 }

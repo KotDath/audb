@@ -1,5 +1,7 @@
 //! Privileged, narrow input service. No shell execution or arbitrary file API.
-use audb_agent::{gesture, read_socket_frame, Display, Gesture, Request, PROTOCOL, SOCKET};
+use audb_agent::{
+    gesture, panel::PanelError, read_socket_frame, Display, Gesture, Request, PROTOCOL, SOCKET,
+};
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, Write};
@@ -291,67 +293,43 @@ fn pause(duration: Duration, socket: &UnixStream) -> io::Result<()> {
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
-fn native_display() -> Result<Display, String> {
-    let mut modes = Vec::new();
-    for entry in fs::read_dir("/sys/class/drm").map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
-        if fs::read_to_string(path.join("status"))
-            .unwrap_or_default()
-            .trim()
-            != "connected"
-        {
-            continue;
-        }
-        let text = fs::read_to_string(path.join("modes")).map_err(|e| e.to_string())?;
-        if let Some((w, h)) = text.lines().next().and_then(|s| s.split_once('x')) {
-            modes.push((
-                w.parse::<i32>().map_err(|e| e.to_string())?,
-                h.parse::<i32>().map_err(|e| e.to_string())?,
-            ));
-        }
-    }
-    if modes.len() != 1 {
-        return Err(format!(
-            "Expected one connected DRM panel, found {}",
-            modes.len()
-        ));
-    }
-    let d = Display {
-        native_width: modes[0].0,
-        native_height: modes[0].1,
-        rotation: 0,
-    };
-    d.validate()?;
-    Ok(d)
-}
 fn peer_allowed(socket: &UnixStream, input_gid: libc::gid_t) -> Option<libc::uid_t> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut cred as *mut libc::ucred).cast(),
-            &mut len,
-        )
-    } != 0
+    #[cfg(not(target_os = "linux"))]
     {
-        return None;
+        let _ = (socket, input_gid);
+        None
     }
-    if cred.uid == 0 {
-        return Some(cred.uid);
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return None;
+        }
+        if cred.uid == 0 {
+            return Some(cred.uid);
+        }
+        // Single-threaded server: libc's static passwd/group storage is not raced.
+        let pwd = unsafe { libc::getpwuid(cred.uid) };
+        if pwd.is_null() {
+            return None;
+        }
+        let mut groups = vec![0; 256];
+        let mut n = groups.len() as i32;
+        let rc = unsafe {
+            libc::getgrouplist((*pwd).pw_name, (*pwd).pw_gid, groups.as_mut_ptr(), &mut n)
+        };
+        (rc >= 0 && groups[..n as usize].contains(&input_gid)).then_some(cred.uid)
     }
-    // Single-threaded server: libc's static passwd/group storage is not raced.
-    let pwd = unsafe { libc::getpwuid(cred.uid) };
-    if pwd.is_null() {
-        return None;
-    }
-    let mut groups = vec![0; 256];
-    let mut n = groups.len() as i32;
-    let rc =
-        unsafe { libc::getgrouplist((*pwd).pw_name, (*pwd).pw_gid, groups.as_mut_ptr(), &mut n) };
-    (rc >= 0 && groups[..n as usize].contains(&input_gid)).then_some(cred.uid)
 }
 fn permission_worker(uid: u32) -> Value {
     let result = (|| {
@@ -446,6 +424,7 @@ fn permission_request(uid: u32, action: &audb_agent::Action) -> Value {
 }
 fn handle(
     touch: &mut Option<Touch>,
+    panel_error: Option<&PanelError>,
     keyboard: &mut Option<Keyboard>,
     socket: &UnixStream,
     uid: libc::uid_t,
@@ -497,17 +476,20 @@ fn handle(
         }
         if matches!(req.action, audb_agent::Action::Status) {
             let display = req.display.map(|d| { let (w,h) = d.size(); json!({"width":w,"height":h,"nativeWidth":d.native_width,"nativeHeight":d.native_height,"rotation":d.rotation}) });
-            return Ok(
-                json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
-                "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action}),
-            );
+            let mut data = json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
+                "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action});
+            if let Some(error) = panel_error {
+                data["panel"] =
+                    json!({"reasonCode":error.reason_code(),"message":error.to_string()});
+            }
+            return Ok(data);
         }
         let display = req.display.ok_or("Missing graphical session geometry")?;
         if let Some(touch) = touch.as_ref() {
             if display.native_width != touch.display.native_width
                 || display.native_height != touch.display.native_height
             {
-                return Err("Graphical session geometry does not match DRM panel".into());
+                return Err("Graphical session geometry does not match kernel panel".into());
             }
         }
         if let audb_agent::Action::Screenshot { directory } = &req.action {
@@ -522,7 +504,10 @@ fn handle(
         if let Some(g) = gesture(display, &req.action)? {
             let Some(touch) = touch.as_mut() else {
                 error_code = "CAPABILITY_UNAVAILABLE";
-                return Err("No available uinput touchscreen/DRM panel".into());
+                return Err(match panel_error {
+                    Some(error) => format!("{}: {error}", error.reason_code()),
+                    None => "No available uinput touchscreen/DRM panel".into(),
+                });
             };
             touch.perform(g, socket)?;
             std::thread::sleep(Duration::from_millis(250));
@@ -548,10 +533,21 @@ fn run() -> Result<(), String> {
         return Err("System input group does not exist".into());
     }
     let gid = unsafe { (*group).gr_gid };
-    let mut touch = native_display()
-        .and_then(|display| Touch::create(display).map_err(|e| e.to_string()))
-        .map_err(|e| eprintln!("Input unavailable; permission service remains available: {e}"))
-        .ok();
+    // Root-local geometry only. A client Request.display must not size this node.
+    let panel = audb_agent::panel::panel_geometry(std::path::Path::new("/sys"));
+    let panel_error = panel.as_ref().err().cloned();
+    let mut touch = match panel {
+        Ok(display) => Touch::create(display)
+            .map_err(|e| eprintln!("Input unavailable; permission service remains available: {e}"))
+            .ok(),
+        Err(error) => {
+            eprintln!(
+                "Input unavailable; permission service remains available: {}: {error}",
+                error.reason_code()
+            );
+            None
+        }
+    };
     let mut keyboard = Keyboard::create()
         .map_err(|e| eprintln!("Keyboard unavailable: {e}"))
         .ok();
@@ -591,7 +587,13 @@ fn run() -> Result<(), String> {
                 let Some(uid) = peer_allowed(&socket, gid) else {
                     continue;
                 };
-                let response = handle(&mut touch, &mut keyboard, &socket, uid);
+                let response = handle(
+                    &mut touch,
+                    panel_error.as_ref(),
+                    &mut keyboard,
+                    &socket,
+                    uid,
+                );
                 let _ = writeln!(socket, "{response}");
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -624,7 +626,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     #[test]
     fn keyboard_disconnect_releases_pressed_key() {
         let file = tempfile::tempfile().unwrap();
@@ -707,5 +709,81 @@ mod tests {
             (EV_ABS, TRACK, -1)
         );
         assert_eq!((last[2].kind, last[2].code, last[2].value), (EV_SYN, 0, 0));
+    }
+
+    fn response(touch: &mut Option<Touch>, panel_error: Option<&PanelError>, body: &str) -> Value {
+        let (agent, mut client) = UnixStream::pair().unwrap();
+        client.write_all(body.as_bytes()).unwrap();
+        client
+            .write_all(
+                b"
+",
+            )
+            .unwrap();
+        let mut keyboard = None;
+        handle(touch, panel_error, &mut keyboard, &agent, 0)
+    }
+
+    fn touch_node(width: i32, height: i32) -> Touch {
+        Touch {
+            file: tempfile::tempfile().unwrap(),
+            active: false,
+            tracking: 100,
+            display: Display {
+                native_width: width,
+                native_height: height,
+                rotation: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn session_geometry_mismatch_stays_input_failed() {
+        let mut touch = Some(touch_node(720, 1600));
+        let response = response(
+            &mut touch,
+            None,
+            r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INPUT_FAILED");
+        assert_eq!(
+            response["error"]["message"],
+            "Graphical session geometry does not match kernel panel"
+        );
+    }
+
+    #[test]
+    fn status_reports_panel_failure_without_using_request_display() {
+        let mut touch = None;
+        let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
+        let response = response(
+            &mut touch,
+            Some(&error),
+            r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":720,"rotation":90},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data"]["capabilities"]["tap"], false);
+        assert_eq!(response["data"]["capabilities"]["swipe"], false);
+        assert_eq!(
+            response["data"]["panel"]["reasonCode"],
+            "PANEL_GEOMETRY_UNAVAILABLE"
+        );
+        assert!(touch.is_none());
+    }
+
+    #[test]
+    fn tap_without_panel_names_geometry_reason() {
+        let mut touch = None;
+        let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
+        let response = response(
+            &mut touch,
+            Some(&error),
+            r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
+        );
+        assert_eq!(response["error"]["code"], "CAPABILITY_UNAVAILABLE");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("PANEL_GEOMETRY_UNAVAILABLE"), "{message}");
+        assert!(touch.is_none());
     }
 }
