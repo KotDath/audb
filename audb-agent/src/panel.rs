@@ -102,8 +102,9 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         let entry = entry.map_err(|error| {
             PanelError::ReadFailed(format!("Cannot read {}: {error}", dir.display()))
         })?;
-        // `version` is a file. Connectors are directories; follow sysfs symlinks.
-        let metadata = entry.metadata().map_err(|error| {
+        // `version` is a file. Connectors are directories. Sysfs publishes
+        // them as symlinks, and `DirEntry::metadata` does not follow those.
+        let metadata = fs::metadata(entry.path()).map_err(|error| {
             PanelError::ReadFailed(format!("Cannot read {}: {error}", entry.path().display()))
         })?;
         if !metadata.is_dir() {
@@ -324,6 +325,23 @@ mod tests {
         ]);
         // An unreadable extra framebuffer must not matter when DRM is selected.
         fs::create_dir(dir.path().join("class/graphics/fb1")).unwrap();
+        assert_eq!(geometry(dir.path()).unwrap(), (1080, 2340));
+    }
+
+    #[test]
+    fn drm_connector_symlink_overrides_fbdev() {
+        let dir = sysfs(&[
+            ("class/drm/version", "drm 1.1.0 20060810\n"),
+            ("devices/dsi/status", "connected\n"),
+            ("devices/dsi/modes", "1080x2340\n720x1600\n"),
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", FB_MODES),
+        ]);
+        std::os::unix::fs::symlink(
+            dir.path().join("devices/dsi"),
+            dir.path().join("class/drm/card0-DSI-1"),
+        )
+        .unwrap();
         assert_eq!(geometry(dir.path()).unwrap(), (1080, 2340));
     }
 
