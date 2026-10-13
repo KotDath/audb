@@ -418,9 +418,15 @@ its own orientation changes the space underneath the same geometry. This is a pr
 existing device-orientation model (the merged change only alters where the panel *size* comes
 from), it is now measured rather than assumed, and per-app orientation handling is future work.
 
-**Still pending:** the screen-off/locked refusal check (`DISPLAY_NOT_READY`). Display control on
-t1100 requires root SSH (`displayControl: ROOT_ACCESS_REQUIRED`) and the agent protocol exposes
-no lock action, so blanking or locking the device needs a manual action or `key power`.
+**Locked/blanked refusal (done, operator-authorized).** `audb key power` blanked and locked the
+device (`display: off, lockMode: locked, touchPolicy: disabled`), and readiness then reported
+`tap`/`swipe` `ready: false` with `DISPLAY_NOT_READY`. After the display came back on but stayed
+locked (`display: on, lockMode: locked, touchPolicy: enabled`) the same refusal held, and **no
+application started** (the only running package was the pre-existing Settings pid) — so a ready
+result cannot be confused with a contact the session ignored. Note the injected contact did wake
+the blanked display (a later frame was a full 6.4 MB lock screen, not a blank one), and the
+injected `key power` blanked it but did not reliably wake it again; a physical press is the
+reliable wake. Evidence: `target/armv7/evidence/doctor-t1100-locked.json`, `lock-screen.png`.
 
 ## 5. Review dispositions
 
