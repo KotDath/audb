@@ -149,11 +149,9 @@ async fn install_bytes(
         if let Some(expected) = expected {
             if package.name != expected { return Err(CoreError::invalid(format!("setup-device requires package '{expected}', got '{}'", package.name))); }
         }
-        let arch = t.user("rpm --eval '%{_arch}'").await?;
-        let arch = arch.trim();
-        if package.arch != "noarch" && package.arch != arch {
-            return Err(CoreError::invalid(format!("Package architecture '{}' does not match device '{arch}'", package.arch)));
-        }
+        let platform_archs =
+            crate::rpm_arch::probe_platform_archs(|| t.user(crate::rpm_arch::ARCH_QUERY)).await?;
+        crate::rpm_arch::ensure_package_arch(&package.arch, &platform_archs)?;
         // --test uses the same mode and override as the actual transaction.
         let check = t.root(&rpm_command(&remote, options.upgrade, options.reinstall, true), options.root_password.as_ref()).await
             .map_err(|e| phase_error(e, "check", &package))?;
@@ -285,6 +283,7 @@ mod tests {
         calls: Vec<String>,
         metadata: Option<String>,
         arch: Option<String>,
+        installed: Option<String>,
         fail_check: bool,
         fail_install: bool,
         fail_upload: bool,
@@ -314,7 +313,9 @@ mod tests {
                 return Err(CoreError::new(ErrorCode::RemoteCommandFailed, "RPM failed"));
             }
             Ok(if command.contains("rpm -q ") {
-                "audb-agent\t0.3.0\t1\taarch64\n".into()
+                self.installed
+                    .clone()
+                    .unwrap_or_else(|| "audb-agent\t0.3.0\t1\taarch64\n".into())
             } else {
                 "ok".into()
             })
@@ -413,6 +414,72 @@ mod tests {
             assert!(t.calls.last().unwrap().contains("rmdir"));
         }
     }
+    /// The measured T1100 pair: rpm's family label is `arm` while `%{_target_cpu}`
+    /// and every installed architecture-specific package are `armv7hl`.
+    #[tokio::test]
+    async fn armv7hl_device_accepts_armv7hl_package() {
+        let mut t = Mock {
+            metadata: Some("audb-agent\t0.3.0\t1\tarmv7hl\n".into()),
+            arch: Some("armv7hl arm\n".into()),
+            installed: Some("audb-agent\t0.3.0\t1\tarmv7hl\n".into()),
+            ..Default::default()
+        };
+        let result = install_bytes(
+            &mut t,
+            &[],
+            &SystemPackageOptions::default(),
+            Some(AGENT_PACKAGE_NAME),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["installed"], true);
+        assert_eq!(result["stagingCleanup"], true);
+    }
+
+    #[tokio::test]
+    async fn cross_bitness_packages_are_rejected_before_root() {
+        for (device, package) in [("aarch64", "armv7hl"), ("armv7hl arm", "aarch64")] {
+            let mut t = Mock {
+                metadata: Some(format!("audb-agent\t1\t1\t{package}\n")),
+                arch: Some(device.into()),
+                ..Default::default()
+            };
+            let error = install_bytes(
+                &mut t,
+                &[],
+                &SystemPackageOptions::default(),
+                Some(AGENT_PACKAGE_NAME),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert!(!t.calls.iter().any(|c| c.contains("--undefine")));
+            assert!(t.calls.last().unwrap().contains("rmdir"));
+        }
+    }
+
+    /// An rpm that cannot resolve `%{_target_cpu}` reports only the family label.
+    /// The gate then refuses instead of inventing an `armv7hl` mapping, so an
+    /// installable package fails closed with both observed values named. Today's
+    /// Aurora rpm resolves `%{_target_cpu}` (armv7hl on t1100), so this path is
+    /// reached only on devices that cannot name their package architecture.
+    #[tokio::test]
+    async fn unresolvable_target_cpu_refuses_rather_than_aliasing() {
+        let mut t = Mock {
+            metadata: Some("audb-agent\t1\t1\tarmv7hl\n".into()),
+            arch: Some("%{_target_cpu} arm\n".into()),
+            ..Default::default()
+        };
+        assert!(install_bytes(
+            &mut t,
+            &[],
+            &SystemPackageOptions::default(),
+            Some(AGENT_PACKAGE_NAME)
+        )
+        .await
+        .is_err());
+    }
+
     #[tokio::test]
     async fn upload_failure_cleans_up() {
         let mut t = Mock {
