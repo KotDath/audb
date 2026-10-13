@@ -382,34 +382,45 @@ reproducible for the aarch64 RPM and with both build-tools images, so it is a pr
 external-signature layout, not of this build. The freshly built, unsigned RPM verifies cleanly,
 and that is the check the build script now enforces (§3 D3).
 
-### 4.7 Tap/swipe on t1100 (checked on request)
+### 4.7 Touch parity on t1100 (resolved)
 
-**Taps and swipes do not work on this device, and it is not an armv7 issue.** The agent's touch
-backend derives the touch surface from a DRM panel: `native_display()` enumerates
-`/sys/class/drm`, keeps entries whose `status` is `connected`, requires exactly one and reads
-`modes` (`audb-agent/src/bin/audb-agent.rs:300-323`). The T1100 is **fbdev-only** — `/dev/dri`
-and `/sys/class/drm` do not exist, `/dev/fb0` does — so that probe fails, the error is swallowed
-at `:555-559` (`Input unavailable; permission service remains available`), `touch` stays `None`,
-`capabilities.tap/swipe` are reported `false`, and every gesture is refused with
-`CAPABILITY_UNAVAILABLE: "No available uinput touchscreen/DRM panel"` (`:528-530`).
+`tap`/`swipe` were unavailable because the agent derived the touch surface from a DRM panel
+while the T1100 is fbdev-only. Task A's `panel.rs` fallback (merged, authorship preserved) fixes
+that: `read_dir("/sys/class/drm")` returns `NotFound` on this device, so `panel_geometry` falls
+through to `/sys/class/graphics/fb0`, where `mode` is empty and `modes` is `U:1600x2176p-0`
+(one `fbN`, no DRM class). The triple-buffered `virtual_size` (`1600,6528`) and `stride`
+(`6400`) are explicitly not treated as the panel. Independently cross-checked: `audb info`
+reports `screen 1600x2176`, the session reports native `1600x2176` / rotation `90` / oriented
+`2176x1600`, and the screenshot is `2176x1600`.
 
-Measured on the device:
+Verified on the signed, installed armv7hl build (`audb-agent-0.3.0-11.armv7hl`; the running
+`/usr/sbin/audb-agent` md5 `fe4578c1…` equals the RPM payload, so this is the new agent, not the
+old installation):
 
-| Probe | Result |
+| Check | Result |
 | --- | --- |
-| `ls /dev/dri /sys/class/drm` | both absent |
-| `ls /dev/fb0` | present (MediaTek mt6771 fbdev) |
-| `/proc/bus/input/devices` | `mtk-tpd` (event5, `ABS=2000000 1000003`), `himax-touchscreen` (event4), **`audb-keyboard` (event6)** |
-| `audb tap 300 300` | `CAPABILITY_UNAVAILABLE … No available uinput touchscreen/DRM panel` |
-| `key` capability | `true` |
-| `screenshot` capability | `true` (real 2176×1600 PNG) |
+| `/proc/bus/input/devices` | `audb-touchscreen` beside `audb-keyboard` |
+| agent status | `panel: {source: fbdev, node: fb0, nativeWidth: 1600, nativeHeight: 2176, matchesSession: true}`; `capabilities.tap/swipe = true` |
+| doctor | `healthy: true`; only `rootSsh`/`qmp` skipped, `architectureBitness` and `inputFocus` warnings; **no `touch` warning**; `tap.geometry = {space: oriented, 2176x1600, native 1600x2176, rotation 90, panelSource: fbdev}` |
+| bounds (negative control) | `tap 2176 800`, `tap 1088 1600`, `tap -1 800`, `swipe 100 100 2176 100` all rejected `INVALID_ARGUMENT … outside 2176x1600`, and the screen was byte-identical afterwards (`ef0846df…`) — no phantom input |
+| two taps, two controls | dock position 3 (872,1482) opened `ru.omp.camera`; dock position 7 (1635,1482) opened `io.github.ihhub.fheroes2`; confirmed by process list, the app-card strip and screenshots — not by "something changed" |
+| swipes, opposite directions | Settings list scrolled up then down: `s0 c41a677a…` → `s1 2b29c2ce…` → `s2 c41a677a…`, i.e. **byte-identical return to the start**; the centre swipe stayed in Settings (never home) |
+| edge gesture | `edge-up` from the landscape Camera app and from Settings reached home; from a portrait-only app it did not (see below) |
+| non-touch recheck | `key esc` ok, `permission list jolla-settings` ok, screenshot ok, doctor healthy; `text` remains available through Maliit (needs a focused editor) |
 
-That the agent's own `audb-keyboard` uinput node exists proves `/dev/uinput`, the uinput ABI and
-the unit's `DeviceAllow=/dev/uinput rw` all work on this device, and the graphical session
-already supplies geometry (2176×1600, rotation 90). The single missing input is a panel-size
-source, i.e. exactly the fbdev fallback that integration branch U carries; this branch does not
-implement it (one writer per worktree). Touch/geometry verification therefore stays with U, as
-the task brief assigned it.
+**Orientation limitation (observed, and the check that caught it).** While the portrait-only
+`io.github.ihhub.fheroes2` app was foreground, the session geometry still reported rotation `90`
+and oriented `2176x1600` (the device/home orientation), so a gesture computed in that space did
+not reach the intended place: `swipe edge-up` was a no-op, while a client-space *horizontal*
+swipe `2175 799 → 300 799` mapped to native `(800,2175) → (800,300)` and **did** reach home. So
+gestures are correct in the device orientation that `tap.geometry` advertises; an app that forces
+its own orientation changes the space underneath the same geometry. This is a property of the
+existing device-orientation model (the merged change only alters where the panel *size* comes
+from), it is now measured rather than assumed, and per-app orientation handling is future work.
+
+**Still pending:** the screen-off/locked refusal check (`DISPLAY_NOT_READY`). Display control on
+t1100 requires root SSH (`displayControl: ROOT_ACCESS_REQUIRED`) and the agent protocol exposes
+no lock action, so blanking or locking the device needs a manual action or `key power`.
 
 ## 5. Review dispositions
 
