@@ -13,7 +13,6 @@
 //! value is a direct statement by the device's own rpm, and equality is per-token
 //! exact, so no rule here can equate a 32-bit ARM name with `aarch64`.
 use crate::{CoreError, CoreResult};
-use std::future::Future;
 
 /// One remote command reporting the device's RPM platform architectures, in
 /// preference order: `%{_target_cpu}` (the architecture rpm builds packages for)
@@ -22,17 +21,6 @@ use std::future::Future;
 /// rpm echoes macros it cannot resolve verbatim, so callers must not assume the
 /// output is well formed; [`parse_platform_archs`] validates it.
 pub(crate) const ARCH_QUERY: &str = "rpm --eval '%{_target_cpu} %{_arch}'";
-
-/// Runs the shared arch probe over the caller's transport and returns the
-/// validated platform architectures. The query is not caller-supplied, so the two
-/// installation paths cannot drift apart.
-pub(crate) async fn probe_platform_archs<F, Fut>(run: F) -> CoreResult<Vec<String>>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = CoreResult<String>>,
-{
-    parse_platform_archs(&run().await?)
-}
 
 /// RPM architecture names are `[A-Za-z0-9_]+` (for example `armv7hl`, `aarch64`,
 /// `x86_64`, `noarch`). Anything else is an unresolved macro such as
@@ -133,6 +121,14 @@ mod tests {
                 "{package} should be rejected on {platform:?}"
             );
         }
+    }
+
+    #[test]
+    fn mismatch_error_names_the_package_and_every_observed_architecture() {
+        let platform = parse_platform_archs("armv7hl arm").unwrap();
+        let error = ensure_package_arch("x86_64", &platform).unwrap_err();
+        assert!(error.message.contains("'x86_64'"), "{}", error.message);
+        assert!(error.message.contains("armv7hl or arm"), "{}", error.message);
     }
 
     /// The probe is a shell command; its behaviour cannot be proven by the remote

@@ -150,7 +150,7 @@ async fn install_bytes(
             if package.name != expected { return Err(CoreError::invalid(format!("setup-device requires package '{expected}', got '{}'", package.name))); }
         }
         let platform_archs =
-            crate::rpm_arch::probe_platform_archs(|| t.user(crate::rpm_arch::ARCH_QUERY)).await?;
+            crate::rpm_arch::parse_platform_archs(&t.user(crate::rpm_arch::ARCH_QUERY).await?)?;
         crate::rpm_arch::ensure_package_arch(&package.arch, &platform_archs)?;
         // --test uses the same mode and override as the actual transaction.
         let check = t.root(&rpm_command(&remote, options.upgrade, options.reinstall, true), options.root_password.as_ref()).await

@@ -230,9 +230,9 @@ pub async fn package_install(
     let result = async {
         let bytes = t.upload_file(local,Path::new(&remote)).await?;
         let package = parse_info(&t.exec(&format!("rpm -qp --queryformat {} -- {}", shell_quote(QUERY_FORMAT),shell_quote(&remote)),false).await?)?;
-        let platform_archs = crate::rpm_arch::probe_platform_archs(|| {
-            t.exec(crate::rpm_arch::ARCH_QUERY,false)
-        }).await?;
+        let platform_archs = crate::rpm_arch::parse_platform_archs(
+            &t.exec(crate::rpm_arch::ARCH_QUERY,false).await?,
+        )?;
         crate::rpm_arch::ensure_package_arch(&package.arch, &platform_archs)?;
         let version = format!("{}-{}",package.version,package.release);
         let query = format!("{APM} ru.omp.APM.GetPackage {}",shell_quote(&package.name));
