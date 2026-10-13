@@ -398,7 +398,14 @@ through to `/sys/class/graphics/fb0`, where `mode` is empty and `modes` is `U:16
 reports `screen 1600x2176`, the session reports native `1600x2176` / rotation `90` / oriented
 `2176x1600`, and the screenshot is `2176x1600`.
 
-Verified on the signed, installed armv7hl build (`audb-agent-0.3.0-11.armv7hl`; the running
+Re-verified after the final review fixes (Release 12, which fails closed on an unreadable DRM
+connector and compares the session against the discovered panel rather than a second copy of the
+geometry): `audb-agent-0.3.0-12.armv7hl` installed by upgrade, `rpm -V` clean, `security.ima`
+present, service active, `doctor` `healthy: true` with `tap`/`swipe`/`key`/`screenshot` ready and
+no `touch` warning, and a tap on dock position 3 launched `ru.omp.camera`. Evidence:
+`target/armv7/evidence/doctor-t1100-release12.json`.
+
+Originally verified on the signed, installed armv7hl build (`audb-agent-0.3.0-11.armv7hl`; the running
 `/usr/sbin/audb-agent` md5 `fe4578c1…` equals the RPM payload, so this is the new agent, not the
 old installation):
 
