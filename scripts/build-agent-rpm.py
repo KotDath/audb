@@ -21,30 +21,42 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Device contract per rpm architecture: where Qt QML modules and Maliit plugins are
-# actually resolved on the device. /usr/lib/systemd/system is deliberately *not* here:
-# it is not %{_libdir} and stays literal in the spec.
-PLATFORM_LIBDIR = {'aarch64': '/usr/lib64', 'armv7hl': '/usr/lib'}
 # Aurora's own armv7hl optflags (rpmrc): Armv7-A, hard-float ABI, VFPv3-D16 (not NEON).
 # The cross gcc defaults to NEON, which is *not* the Aurora baseline for 32-bit devices.
+# It does not select FPU codegen for the Rust objects: those are already non-NEON per the
+# target spec (`rustc --print cfg` reports no feature="neon"); these are link arguments so
+# the driver picks the matching sysroot and emits the hard-float ABI attribute.
 ARM_FLOAT_FLAGS = ['-march=armv7-a', '-mfloat-abi=hard', '-mfpu=vfpv3-d16']
 ARMHF_INTERPRETER = 'ld-linux-armhf.so.3'
-# Measured against the aurora-os-build-engine container: aarch64 is native, armv7hl is
-# cross-compiled from the toolchain installed by cross-armv7hl-gcc/-binutils.
+# Measured against the aurora-os-build-engine container: aarch64 is native, armv7hl and
+# x86_64 are cross-compiled from the toolchain installed by the cross-*-gcc packages.
+# `libdir` is the device contract for that rpm architecture: where Qt QML modules and Maliit
+# plugins are actually resolved. /usr/lib/systemd/system is deliberately not part of it.
 PLATFORMS = {
     'aarch64': {'rustTarget': 'aarch64-unknown-linux-gnu', 'cc': 'gcc', 'cxx': 'g++',
-                'sysroot': '', 'rpmTarget': ''},
+                'sysroot': '', 'rpmTarget': '', 'libdir': '/usr/lib64'},
     'armv7hl': {'rustTarget': 'armv7-unknown-linux-gnueabihf',
                 'cc': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-gcc',
                 'cxx': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-g++',
                 'sysroot': '/opt/cross/armv7hl-meego-linux-gnueabi/sys-root',
-                'rpmTarget': 'armv7hl-meego-linux'},
+                'rpmTarget': 'armv7hl-meego-linux', 'libdir': '/usr/lib'},
+    'x86_64': {'rustTarget': 'x86_64-unknown-linux-gnu',
+               'cc': '/opt/cross/bin/x86_64-meego-linux-gnu-gcc',
+               'cxx': '/opt/cross/bin/x86_64-meego-linux-gnu-g++',
+               'sysroot': '/opt/cross/x86_64-meego-linux-gnu/sys-root',
+               'rpmTarget': 'x86_64-meego-linux', 'libdir': '/usr/lib64'},
+}
+# Expected `readelf -h` class and machine substring per rpm architecture.
+ELF_EXPECT = {
+    'aarch64': ('ELF64', 'AArch64'),
+    'armv7hl': ('ELF32', 'ARM'),
+    'x86_64': ('ELF64', 'X86-64'),
 }
 
 
 def expected_machine(arch):
     """The `gcc -dumpmachine` prefix that must produce this rpm architecture."""
-    return {'aarch64': 'aarch64', 'armv7hl': 'armv7'}[arch]
+    return {'aarch64': 'aarch64', 'armv7hl': 'armv7', 'x86_64': 'x86_64'}[arch]
 
 
 def parse_target_platform(output):
@@ -57,7 +69,7 @@ def parse_target_platform(output):
     if len(fields) != 3 or any('%' in f or '{' in f or not f for f in fields):
         raise SystemExit(f'Unresolved rpm platform probe: {output!r}')
     arch, libdir = fields[0], fields[2]
-    contract = PLATFORM_LIBDIR.get(arch)
+    contract = PLATFORMS.get(arch, {}).get('libdir')
     if contract is None:
         raise SystemExit(f'No device libdir contract for rpm architecture {arch!r}')
     if libdir != contract:
@@ -81,6 +93,22 @@ def check_rust_target(arch, rust_target):
             f'--rust-target {rust_target} is not a hard-float triple; the device runs '
             f'/{ARMHF_INTERPRETER}'
         )
+
+
+def pkg_config_flags(sysroot, modules):
+    """argv that resolves Qt flags for `sysroot`, with the environment applied to
+    pkg-config itself.
+
+    Writing them as command-local assignments on the compiler would not work: the shell
+    expands `$(pkg-config ...)` *before* those assignments take effect, so pkg-config would
+    read the ambient container configuration and could select native headers and libraries.
+    Passing the resolved flags as argv also makes a failed pkg-config fatal.
+    """
+    argv = []
+    if sysroot:
+        argv += ['env', f'PKG_CONFIG_SYSROOT_DIR={sysroot}',
+                 f'PKG_CONFIG_LIBDIR={sysroot}/usr/lib/pkgconfig']
+    return argv + ['pkg-config', '--cflags', '--libs', *modules]
 
 
 def install_paths(libdir):
@@ -139,11 +167,21 @@ def self_test():
     assert interpreter_ok('[Requesting program interpreter: /lib/ld-linux-armhf.so.3]')
     assert not interpreter_ok('[Requesting program interpreter: /lib/ld-linux.so.3]')
     # The presets encode measured container paths; a re-imaged container must not silently
-    # change which compiler or sysroot a 32-bit build uses.
+    # change which compiler, sysroot or libdir a platform build uses.
     assert PLATFORMS['armv7hl']['rpmTarget'] == 'armv7hl-meego-linux'
     assert PLATFORMS['armv7hl']['cc'].endswith('armv7hl-meego-linux-gnueabi-gcc')
     assert PLATFORMS['armv7hl']['sysroot'].endswith('armv7hl-meego-linux-gnueabi/sys-root')
+    assert PLATFORMS['armv7hl']['libdir'] == '/usr/lib'
+    assert PLATFORMS['x86_64']['libdir'] == '/usr/lib64'
+    assert PLATFORMS['x86_64']['rustTarget'] == 'x86_64-unknown-linux-gnu'
     assert PLATFORMS['aarch64']['rustTarget'] == 'aarch64-unknown-linux-gnu'
+    assert parse_target_platform('x86_64 x86_64 /usr/lib64') == ('x86_64', '/usr/lib64')
+    # The sysroot must be applied to pkg-config, not to the compiler's command prefix.
+    scoped = pkg_config_flags('/sys/root', ['Qt5Gui'])
+    assert scoped[0] == 'env' and scoped[1] == 'PKG_CONFIG_SYSROOT_DIR=/sys/root'
+    assert scoped[2] == 'PKG_CONFIG_LIBDIR=/sys/root/usr/lib/pkgconfig'
+    assert scoped[3] == 'pkg-config' and scoped[4:] == ['--cflags', '--libs', 'Qt5Gui']
+    assert pkg_config_flags('', ['Qt5Core']) == ['pkg-config', '--cflags', '--libs', 'Qt5Core']
     print('self-test: ok')
 
 
@@ -171,13 +209,21 @@ def main():
     a.rpm_target = a.rpm_target if a.rpm_target is not None else preset['rpmTarget']
     rpm_target_args = ['--target', a.rpm_target] if a.rpm_target else []
 
+    def execute(argv, capture_output=False, **kw):
+        command = shlex.join(map(str, argv))
+        print(command, flush=True)
+        result = subprocess.run(list(map(str, argv)), cwd=ROOT, text=True,
+                                stdout=subprocess.PIPE if capture_output else None, **kw)
+        if result.returncode != 0:
+            detail = ((result.stderr or '').strip() if capture_output else '')
+            raise SystemExit(f'command failed ({result.returncode}): {command}' + (f'\n{detail}' if detail else ''))
+        return result.stdout if capture_output else result
+
     def capture(argv, **kw):
-        print(shlex.join(map(str, argv)), flush=True)
-        return subprocess.run(list(map(str, argv)), check=True, cwd=ROOT, text=True, stdout=subprocess.PIPE, **kw).stdout
+        return execute(argv, capture_output=True, **kw)
 
     def run(argv, **kw):
-        print(shlex.join(map(str, argv)), flush=True)
-        return subprocess.run(list(map(str, argv)), check=True, cwd=ROOT, **kw)
+        return execute(argv, **kw)
 
     def sdk(argv):
         return run(['docker', 'exec', '--user', 'mersdk', a.container, 'sb2', '-t', a.target, '-m', 'sdk-build', *argv])
@@ -194,20 +240,22 @@ def main():
     check_rust_target(arch, a.rust_target)
     if a.arch is not None and a.arch != arch:
         raise SystemExit(f'--arch {a.arch} contradicts the selected platform, which builds {arch}')
-    machine = sdk_output([a.cc, '-dumpmachine']).strip()
-    if not machine.startswith(expected_machine(arch)):
-        raise SystemExit(
-            f'{a.cc} reports machine {machine}, expected {expected_machine(arch)}-*; '
-            f'wrong --platform or missing cross toolchain'
-        )
+    # Both compiler drivers produce shipped ELFs, so both are checked against the platform.
+    machine = ''
+    for driver in dict.fromkeys([a.cc, a.cxx]):
+        reported = sdk_output([driver, '-dumpmachine']).strip()
+        if not reported.startswith(expected_machine(arch)):
+            raise SystemExit(
+                f'{driver} reports machine {reported}, expected {expected_machine(arch)}-*; '
+                f'wrong --platform or missing cross toolchain'
+            )
+        machine = machine or reported
     qml_rel, plugin_rel = install_paths(libdir)
     float_flags = ARM_FLOAT_FLAGS if arch == 'armv7hl' else []
-    pkg_env = ''
-    if a.sysroot:
-        pkg_env = (
-            f'PKG_CONFIG_SYSROOT_DIR={shlex.quote(a.sysroot)} '
-            f'PKG_CONFIG_LIBDIR={shlex.quote(a.sysroot + "/usr/lib/pkgconfig")} '
-        )
+    # Resolve Qt flags with the sysroot applied to pkg-config (see pkg_config_flags).
+    qt_ui_flags = shlex.split(sdk_output(pkg_config_flags(a.sysroot, ['Qt5Gui', 'Qt5Core'])))
+    qt_plugin_flags = shlex.split(
+        sdk_output(pkg_config_flags(a.sysroot, ['Qt5Quick', 'Qt5Qml', 'Qt5Network'])))
     print(f'building {arch} with libdir {libdir} via {machine} (cc {a.cc})', flush=True)
 
     env = os.environ.copy()
@@ -243,9 +291,10 @@ def main():
     shutil.copy2(ROOT/'packaging/audb-agent.service', service)
     display = stage/'usr/libexec/audb-agent/display'
     display.parent.mkdir(parents=True, exist_ok=True)
-    flags = ' '.join(float_flags)
-    compile_cmd = f'{pkg_env}{a.cxx} -std=c++11 -O2 -Wall -Wextra -Werror -Wno-deprecated-copy -fPIC {flags} ' + shlex.quote(str(ROOT/'audb-agent/native/display.cpp')) + ' -o ' + shlex.quote(str(display)) + ' $(pkg-config --cflags --libs Qt5Gui Qt5Core)'
-    sdk(['/bin/sh', '-c', compile_cmd])
+    display_flags = [a.cxx, '-std=c++11', '-O2', '-Wall', '-Wextra', '-Werror',
+                     '-Wno-deprecated-copy', '-fPIC', *float_flags,
+                     str(ROOT/'audb-agent/native/display.cpp'), '-o', str(display), *qt_ui_flags]
+    sdk(display_flags)
     # Maliit background plugin: does not replace or patch the stock keyboard.
     module = stage/qml_rel
     module.mkdir(parents=True, exist_ok=True)
@@ -258,26 +307,15 @@ def main():
     native = work/'native-input'
     native.mkdir(exist_ok=True)
     shutil.copy2(source, native/'bridge.cpp')
-    compile_cmd = 'cd ' + shlex.quote(str(native)) + ' && moc bridge.cpp -o bridge.moc && ' + pkg_env + a.cxx + ' -std=c++11 -shared -fPIC -O2 -Wall -Wextra -Werror -Wno-deprecated-copy ' + flags + ' bridge.cpp -o ' + shlex.quote(str(module/'libaudbinput.so')) + ' $(pkg-config --cflags --libs Qt5Quick Qt5Qml Qt5Network)'
+    plugin_flags = [a.cxx, '-std=c++11', '-shared', '-fPIC', '-O2', '-Wall', '-Wextra',
+                    '-Werror', '-Wno-deprecated-copy', *float_flags, 'bridge.cpp', '-o',
+                    str(module/'libaudbinput.so'), *qt_plugin_flags]
+    compile_cmd = ('cd ' + shlex.quote(str(native)) + ' && moc bridge.cpp -o bridge.moc && '
+                   + ' '.join(shlex.quote(flag) for flag in plugin_flags))
     sdk(['/bin/sh', '-c', compile_cmd])
 
-    # 2. Every shipped ELF must use the platform's float ABI, not just the Rust ones: the
-    #    plugin is what Maliit dlopens and it is built by the compiler driver directly. Checked
-    #    on the staged (stripped) files.
-    if arch == 'armv7hl':
-        elf_checks = [
-            ('usr/sbin/audb-agent', True), ('usr/bin/audb-agentctl', True),
-            ('usr/libexec/audb-agent/display', True), (str(qml_rel/'libaudbinput.so'), False),
-        ]
-        for relative, executable in elf_checks:
-            path = str(stage/relative)
-            attributes = sdk_output(['readelf', '-A', path])
-            if not vfp_args_ok(attributes):
-                raise SystemExit(f'{relative} is not Tag_ABI_VFP_args: VFP registers; the compiler is not hard-float')
-            if executable:
-                headers = sdk_output(['readelf', '-l', path])
-                if not interpreter_ok(headers):
-                    raise SystemExit(f'{relative} does not request /{ARMHF_INTERPRETER}')
+    # The packaged payload is what matters: rpmbuild postprocessing runs after staging, so the
+    # ELF checks below run on the files extracted from the RPM, for every platform.
 
     archive = work/'audb-agent-stage.tar.gz'
     with tarfile.open(archive, 'w:gz') as tar:
@@ -304,33 +342,59 @@ def main():
     if not Path(built).name.endswith('.' + arch + '.rpm'):
         raise SystemExit(f'{built} is not labelled {arch}')
     output = work/('audb-agent-'+version+'-'+release+'.'+arch+'.rpm')
-    run(['docker', 'cp', a.container+':'+built, output])
+    candidate = output.with_name(output.name + '.candidate')
+    run(['docker', 'cp', a.container+':'+built, candidate])
     # A transfer that silently changes bytes would ship a package whose payload digest no longer
     # matches its header (seen once with a same-size copy), so compare digests with the original
     # and let the target's rpm verify the copy before anything signs or installs it.
     container_md5 = sdk_output(['md5sum', built]).split()[0]
-    host_md5 = sdk_output(['md5sum', str(output)]).split()[0]
+    host_md5 = sdk_output(['md5sum', str(candidate)]).split()[0]
     if container_md5 != host_md5:
-        raise SystemExit(f'{output} differs from the built RPM ({host_md5} != {container_md5}); refusing to use it')
-    checksig = sdk_output(['rpmkeys', '--checksig', '-v', str(output)])
-    bad = [line.strip() for line in checksig.splitlines() if ' BAD' in line]
-    if bad:
-        raise SystemExit(f'{output} failed its own digests: {bad}')
+        raise SystemExit(f'{candidate} differs from the built RPM ({host_md5} != {container_md5}); refusing to use it')
+    # This gate is for the UNSIGNED artefact only. An externally signed package reports payload
+    # digests as BAD even to the device's own rpmkeys (see docs/armv7-support.md 4.6), so it must
+    # never be reused after signing.
+    checksig = sdk_output(['rpmkeys', '--checksig', '-v', str(candidate)])
+    lines = [line.strip() for line in checksig.splitlines()]
+    bad = [line for line in lines if 'BAD' in line or 'NOT OK' in line]
+    digest_ok = [line for line in lines if line.endswith('digest: OK')]
+    if bad or not digest_ok:
+        raise SystemExit(f'{candidate} did not verify as an unsigned package: {bad or "no OK digest line"}')
     # Inspect the copied artifact through the container's rpm; the macOS host has none.
-    header = sdk_output(['rpm', '-qp', '--qf', '%{ARCH}', str(output)]).strip()
+    header = sdk_output(['rpm', '-qp', '--qf', '%{ARCH}', str(candidate)]).strip()
     if header != arch:
-        raise SystemExit(f'{output} has RPM architecture {header!r}, expected {arch!r}')
-    payload = sdk_output(['rpm', '-qpl', str(output)]).split()
+        raise SystemExit(f'{candidate} has RPM architecture {header!r}, expected {arch!r}')
+    payload = sdk_output(['rpm', '-qpl', str(candidate)]).split()
     for expected in ['/'+str(qml_rel), '/'+str(plugin_rel), '/usr/lib/systemd/system/audb-agent.service']:
         if not any(entry == expected or entry.startswith(expected + '/') for entry in payload):
-            raise SystemExit(f'{expected} missing from {output}')
+            raise SystemExit(f'{expected} missing from {candidate}')
     lib64 = [entry for entry in payload if entry.startswith('/usr/lib64/')]
     if lib64 and libdir == '/usr/lib':
-        raise SystemExit(f'{output} contains lib64 paths although the device contract is {libdir}: {lib64}')
+        raise SystemExit(f'{candidate} contains lib64 paths although the device contract is {libdir}: {lib64}')
+    # Every shipped ELF, validated in the packaged payload rather than the staging tree.
+    payload_dir = '/tmp/audb-payload-' + arch
+    sdk_output(['/bin/sh', '-c', 'rm -rf ' + payload_dir + ' && mkdir -p ' + payload_dir
+                + ' && cd ' + payload_dir + ' && rpm2cpio ' + shlex.quote(str(candidate))
+                + ' | cpio -idm --quiet'])
+    class_expected, machine_expected = ELF_EXPECT[arch]
+    for relative, executable in [('usr/sbin/audb-agent', True), ('usr/bin/audb-agentctl', True),
+                                 ('usr/libexec/audb-agent/display', True),
+                                 (str(qml_rel/'libaudbinput.so'), False)]:
+        path = f'{payload_dir}/{relative}'
+        header_text = sdk_output(['readelf', '-h', path])
+        if class_expected not in header_text or machine_expected not in header_text:
+            raise SystemExit(f'{relative} in the package is not {class_expected}/{machine_expected}')
+        if arch == 'armv7hl':
+            if not vfp_args_ok(sdk_output(['readelf', '-A', path])):
+                raise SystemExit(f'{relative} is not Tag_ABI_VFP_args: VFP registers; the compiler is not hard-float')
+            if executable and not interpreter_ok(sdk_output(['readelf', '-l', path])):
+                raise SystemExit(f'{relative} does not request /{ARMHF_INTERPRETER}')
+    candidate.replace(output)
     receipt = {
         'platform': a.platform, 'target': a.target, 'rustTarget': a.rust_target, 'arch': arch,
-        'libdir': libdir, 'cc': a.cc, 'sysroot': a.sysroot, 'rpmTarget': a.rpm_target,
-        'machine': machine, 'containerOutputDir': str(Path(built).parent),
+        'libdir': libdir, 'cc': a.cc, 'cxx': a.cxx, 'sysroot': a.sysroot,
+        'rpmTarget': a.rpm_target, 'machine': machine,
+        'containerOutputDir': str(Path(built).parent),
         'containerOutputName': Path(built).name, 'hostPath': str(output),
         'rpmArchHeader': header, 'payload': sorted(payload),
     }
