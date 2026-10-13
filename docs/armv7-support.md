@@ -411,6 +411,31 @@ needed; `cargo check -p audb-agent --target armv7-unknown-linux-gnueabihf` compi
 Pending: the SDK probe, the armv7hl RPM, its `%{ARCH}`/payload assertions, the t1100
 `--check-only` transaction, and the on-device install/doctor evidence.
 
+### 8.1 Done since the reviews
+
+- `t1100` is registered in `~/Library/Application Support/audb/devices-v1.json` (SSH profile
+  `t1100` → 192.168.1.207, `defaultuser`); `emulator`, `emu-adt`, `t1`, `vm` are byte-identical
+  to before, and `defaultDevice` is unchanged. A sixth entry, `phone` (127.0.0.1:22), is
+  present that was not there at session start: it is residue of the non-isolated integration
+  suite shared with the sibling `audb-fbdev-touch` worktree, and was deliberately left alone
+  rather than edited outside this branch's scope.
+- On-device read-only `doctor` with a build of this branch (evidence:
+  `target/armv7/evidence/doctor-t1100-private.json`) reports `architecture: aarch64`,
+  `longBit: 32`, `rpmArch: armv7hl`, `rpmArchClass: arm`, `rpmLibdir: /usr/lib`, and the new
+  `architectureBitness` warning `MIXED_KERNEL_USERSPACE_BITNESS`. `healthy` is false only
+  because `audb-agent` is not installed yet.
+- The raw inventory command was also run directly over SSH and returns exactly those fields
+  (`longBit 32`, `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`), independently of
+  the client.
+- Host verification battery: `target/armv7/evidence/verification-battery.txt`.
+- **The shared daemon matters for evidence:** `audb doctor` talks to the long-lived daemon at
+  `BaseDirs::cache_dir()/audb/audb-v10.sock` (`audb-client/src/daemon.rs:22-26`) and `--socket`
+  is the *QMP* socket, not the daemon socket (`audb-client/src/main.rs:839-840`). A stale
+  installed daemon (`~/.cargo/bin/audb`, PID 20499) therefore answered the first doctor run with
+  the old inventory. The recorded evidence was produced with a throwaway `HOME`, so this
+  branch's daemon answered; those daemons were then stopped. No other worktree's daemon was
+  touched.
+
 ## 9. Out of scope
 
 Touch/geometry verification on t1100 (branch U, with A's fbdev fallback); signing and
