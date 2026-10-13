@@ -40,7 +40,7 @@ rewrites `arm` into `armv7hl`, and no rule can equate a 32-bit ARM name with `aa
 
 The aarch64 side was measured on `t1` (operator-approved, read-only): `%{_target_cpu}` and
 `%{_arch}` are both `aarch64` and `%{_libdir}` is `/usr/lib64`, so the accepted set on a
-working 64-bit device is unchanged — the fix is provably non-regressive.
+working 64-bit device is unchanged — non-regressive for that measured device.
 
 ## Reviewed
 
@@ -50,21 +50,22 @@ committed verbatim; §5 of the design doc dispositions every must-fix (no alias,
 package namespace, float ABI on all four ELFs, target-derived libdir, `--arch` assertion-only,
 doctor warning not failure, fake-`rpm` shell test). One deliberate, disclosed deviation: the
 gate accepts **any** rpm-reported platform arch by exact match (non-regressive) instead of
-preferring `_target_cpu` with a fallback — now moot, since `t1` proved both macros agree on
-aarch64.
+preferring `_target_cpu` with a fallback. The two still differ on the measured armv7hl device
+(`armv7hl arm`), so the union is an accepted non-regression decision rather than equivalence with
+that recommendation.
 
 ## Verified here
 
-- `cargo test -p audb-protocol`: 7 pass. `cargo test -p audb-core`: 51 pass, 1 fail —
-  `setup::tests::migrates_audb2_wrapper_in_place` (`setup.rs:303`) is **pre-existing and
-  macOS-specific** (asserts a `/tmp/` path; macOS tempdirs are under `/var/folders/…`); it
-  fails identically on the base commit.
+- `cargo test -p audb-protocol`: 7 pass. `cargo test -p audb-core`: **61 pass / 0 fail**. The one
+  macOS-only failure at the base commit (`setup::tests::migrates_audb2_wrapper_in_place` asserted a
+  `/tmp/` path) is fixed in this branch: the assertion now checks the configured QMP socket, so it is
+  host-independent.
 - clippy clean for host crates, and for `audb-agent --target armv7-unknown-linux-gnueabihf`
   (the agent is Linux-only, so `--workspace` cannot be green on macOS at all).
 - `rustc --print cfg --target armv7-unknown-linux-gnueabihf`: `target_abi="eabihf"`, 32-bit, no
   `feature="neon"`; the compile-time `InputEvent` size assertion holds and fires when perturbed.
 - packaging `--self-test`, `py_compile`, `sh -n`: ok.
-- **armv7hl RPM built**: `target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm`,
+- **armv7hl RPM built** (Release 12, the review-fix build): `target/agent-rpm/armv7hl/audb-agent-0.3.0-12.armv7hl.rpm`,
   `rpmArchHeader=armv7hl`, payload under `/usr/lib` with no `lib64` entries, receipt at
   `target/agent-rpm/armv7hl/build-receipt.json`.
 - **Payload independently verified** (extracted with `rpm2cpio`): all four ELFs are ELF32/ARM
@@ -90,12 +91,12 @@ and reinstalling with `--reinstall`:
 
 | Evidence | Result |
 | --- | --- |
-| `rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}'` | `audb-agent-0.3.0-10.armv7hl` |
+| `rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}'` | `audb-agent-0.3.0-12.armv7hl` |
 | `rpm -ql` | Qt/Maliit paths under `/usr/lib` (libdir fix on real hardware) |
 | `systemctl status audb-agent` | **`active (running)`**, `/usr/sbin/audb-agent` |
 | `rpm -V audb-agent` | clean — installed files match the package |
 | `getfattr` on all four payload files | `security.appid="audb-agent"` + `security.ima=0s…` |
-| `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-10`, identity reports `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`, `longBit 32`, `architecture aarch64`; `architectureBitness` stays a warning |
+| `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-12`, identity reports `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`, `longBit 32`, `architecture aarch64`; `architectureBitness` stays a warning |
 | non-touch command | `audb --device t1100 screenshot` → real PNG **2176×1600, 6336658 bytes** |
 
 ### Touch parity on t1100 (tap and swipe work)
@@ -106,7 +107,7 @@ The agent's touch surface comes from the kernel panel, and the T1100 has no DRM 
 the panel is discovered from `/sys/class/graphics/fb0` and the triple-buffered `virtual_size`
 (`1600,6528`) is correctly ignored.
 
-Verified on the signed installed build `audb-agent-0.3.0-11.armv7hl` (running binary md5
+Verified on the signed installed build `audb-agent-0.3.0-12.armv7hl` (running binary md5
 `fe4578c1…` equals the RPM payload — the new agent, not the old installation):
 
 | Check | Result |

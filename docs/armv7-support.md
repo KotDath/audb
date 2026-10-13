@@ -13,7 +13,8 @@ Goal: make `audb` (client + agent + packaging) work end-to-end on the Fplus T110
 
 ## 1. Measured evidence
 
-All device commands were read-only; nothing on the device was modified.
+The Phase 1 survey commands were read-only; the device was modified later only by the signed
+installs recorded in §4.6 and §4.8.
 
 ### 1.1 Device `t1100` (host alias in `~/.ssh/config` → 192.168.1.207)
 
@@ -81,7 +82,7 @@ Measured to prove the new arch rule cannot regress working 64-bit devices, and t
 | loader / installed `glibc` ARCH | `/lib/ld-linux-aarch64.so.1` / `aarch64` |
 
 Consequences: (1) D2's accepted set on an aarch64 device is exactly `{aarch64}` — the same
-value today's gate uses — so the union is provably non-regressive there, and the reviewers'
+value today's gate uses — so the union is non-regressive for that measured aarch64 device, and the reviewers'
 "preferred-order" variant would be equally safe; (2) `%{_libdir}` resolves to `/usr/lib64` on
 aarch64 devices, so the spec change keeps their Qt/Maliit paths unchanged, provided the
 aarch64 **sb2 target** also reports `/usr/lib64` (checked before the spec change).
@@ -142,7 +143,7 @@ This is why the design no longer treats `--target` as a target selector: the con
 - `libc::timeval` is 8 bytes on 32-bit ARM and 16 on aarch64, so the `#[repr(C)] InputEvent`
   in `audb-agent/src/bin/audb-agent.rs:26-31` (16 bytes on this triple) matches what an
   aarch64 kernel's compat `input_event` expects. A `cfg`-gated compile-time assertion pins
-  this (see §4.4).
+  this (see §4.4 and §4.5).
 - Float ABI is a property of **every shipped ELF**. If the SDK target's `g++` is soft-float,
   `-march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16` must be added to both `g++` commands
   (`build-agent-rpm.py:51,61`) *and* to the Rust link line (`-C link-arg=…`, not a bare
@@ -216,8 +217,10 @@ an `aarch64` package is rejected. On an aarch64 device tokens are `{aarch64}` (o
   `armv7hl` ⇒ `/usr/lib`, `aarch64` ⇒ `/usr/lib64` (the aarch64 side is confirmed by probing
   the aarch64 sb2 target before the spec edit, since editing `%{_libdir}` is an aarch64
   change too).
-- The same NVR (`audb-agent-0.3.0-10`) is kept across architectures; the built file is
-  `audb-agent-0.3.0-10.armv7hl.rpm`.
+- Each installable build takes a new `Release` (10, 11, then 12 for the review fixes). A same-NVR
+  replacement is refused at the `check` phase once `rpm-plugin-external-ima` has attributed the
+  installed files, so an upgrade needs a newer release; the built file is
+  `audb-agent-0.3.0-<release>.armv7hl.rpm`. The maintainer may collapse these into one release.
 - `scripts/build-agent-rpm.py --self-test` exercises all of the above decision logic
   (probe parsing, contract check, Rust-triple/machine cross-check, staging paths, ELF
   assertions) without Docker, and each build writes `target/agent-rpm/<arch>/build-receipt.json`
@@ -310,9 +313,10 @@ has no `time_t`/pointer fields and needs none.
 
 ---
 
-### 4.4 Measured results (commit `a051558`)
+### 4.5 Measured results (commit `a051558`)
 
-**armv7hl RPM built**: `target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm`
+**armv7hl RPM built**: `target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm` (Release 10; the
+branch now builds Release 12, §4.8)
 (receipt `build-receipt.json`: platform armv7hl, libdir `/usr/lib`, cc the cross gcc,
 `machine=armv7hl-meego-linux-gnueabi`, container output dir
 `/home/mersdk/audb-agent-rpmbuild-armv7hl/RPMS/armv7hl`, `rpmArchHeader=armv7hl`, payload
@@ -345,10 +349,11 @@ Reaching the privileged step means the new gate **accepted** the armv7hl package
 returned `Package architecture 'armv7hl' does not match device 'arm'` before any root access.
 Staging was cleaned and `rpm -q audb-agent` still reports the package is not installed.
 
-### 4.5 On-device outcome (signed RPM)
+### 4.6 On-device outcome (signed RPM, Release 10)
 
-Signed with the Regular development certificate (`audb package sign`) and reinstalled with
-`--reinstall`: **`audb-agent-0.3.0-10.armv7hl`** is installed and the service is
+This was the first signed install, built at `a051558` (Release 10) and superseded by the Release 12
+verification in §4.8. Signed with the Regular development certificate (`audb package sign`) and
+reinstalled with `--reinstall`: **`audb-agent-0.3.0-10.armv7hl`** was installed and the service became
 **active (running)**.
 
 | Evidence | Result |
@@ -366,7 +371,7 @@ the documented readiness behaviour; touch/geometry verification belongs to branc
 Evidence files: `target/armv7/evidence/doctor-t1100-signed-install.json`,
 `screenshot-t1100.{json,png}`.
 
-### 4.6 Signing is mandatory on this device class (finding)
+### 4.7 Signing is mandatory on this device class (finding)
 
 The unsigned package installed but its files could not execute: the device boots with
 `ima_appraise=enforce` on the kernel command line and ships `rpm-plugin-external-ima`, which
@@ -378,11 +383,11 @@ attributed and the service runs.
 
 Note: `rpmkeys --checksig` reports `Payload … digest: BAD` for **externally signed** packages
 (Aurora's `rpmsign-external` layout) on the device's own rpm 4.16.1.3 as well as in the SDK —
-reproducible for the aarch64 RPM and with both build-tools images, so it is a property of the
-external-signature layout, not of this build. The freshly built, unsigned RPM verifies cleanly,
+reproducible for the aarch64 RPM and with both build-tools images, so on the toolchains and packages
+tested it is a property of the external-signature layout rather than of this build. The freshly built, unsigned RPM verifies cleanly,
 and that is the check the build script now enforces (§3 D3).
 
-### 4.7 Touch parity on t1100 (resolved)
+### 4.8 Touch parity on t1100 (resolved)
 
 `tap`/`swipe` were unavailable because the agent derived the touch surface from a DRM panel
 while the T1100 is fbdev-only. Task A's `panel.rs` fallback (merged, authorship preserved) fixes
@@ -419,8 +424,9 @@ existing device-orientation model (the merged change only alters where the panel
 from), it is now measured rather than assumed, and per-app orientation handling is future work.
 
 **Locked/blanked refusal (done, operator-authorized).** `audb key power` blanked and locked the
-device (`display: off, lockMode: locked, touchPolicy: disabled`), and readiness then reported
-`tap`/`swipe` `ready: false` with `DISPLAY_NOT_READY`. After the display came back on but stayed
+device (`display: off, lockMode: locked, touchPolicy: disabled`), and the doctor readiness then reported
+`tap`/`swipe` `ready: false` with `DISPLAY_NOT_READY`. The agent does not read MCE, so this is a
+readiness flag: an injected contact is still delivered and, as noted below, woke the display. After the display came back on but stayed
 locked (`display: on, lockMode: locked, touchPolicy: enabled`) the same refusal held, and **no
 application started** (the only running package was the pre-existing Settings pid) — so a ready
 result cannot be confused with a contact the session ignored. Note the injected contact did wake
@@ -483,7 +489,8 @@ Architect (Sol 6.1) verdict: *conditionally approve the approach, not D2 as writ
 
 ---
 
-## 6. Phase 1 baseline findings (host `190bbaa`) — pre-existing, unrelated to this task
+## 6. Phase 1 baseline findings (host `190bbaa`) — pre-existing at that time; the
+`setup.rs` failure was fixed by the merge in this branch
 
 | Check | Result |
 | --- | --- |
@@ -513,7 +520,7 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 ## 7. Residual risks / not yet verified
 
 - **On-device install is done** (signed, service running, doctor healthy, screenshot captured —
-  §4.5). Signing the RPM is not optional on this device class (§4.6): the unsigned package
+  §4.8). Signing the RPM is not optional on this device class (§4.7): the unsigned package
   installs but cannot execute.
 - The container's `sb2` shim discards `-t`; a future re-imaging could change the cross layout.
   `--self-test` asserts the preset paths, and the build re-verifies `-dumpmachine`, the rpm
@@ -527,12 +534,13 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 - Unsigned RPM: the install path runs plain `rpm -ivh`/`-Uvh` with no `--nosignature`
   (`system_package.rs:260-266`) and it succeeds on t1100 — but the files are then not
   executable, because the device enforces IMA appraisal and only a signed package's files
-  receive `security.ima` (§4.6). On this device class the signed-RPM workflow in `README.md`
+  receive `security.ima` (§4.7). On this device class the signed-RPM workflow in `README.md`
   (`audb package sign`) is required, not optional.
 - Device is Aurora 5.2.0.180 while the SDK sysroot is 5.2.1.200 — Qt is 5.6.3 on both sides and
-  the needed sonames exist, but the agent has not run there yet.
+  the needed sonames exist, and the agent has run on the device's 5.2.0.180 userspace; other Aurora
+  releases are untested.
 - uinput `InputEvent` layout across the 32/64-bit boundary is reasoned and compile-pinned, not
-  device-verified; touch verification belongs to branch U.
+  device-verified on t1100 (§4.8); other 32-bit devices and other rotations are untested.
 - `armv7hnl`/NEON and other 32-bit ARM devices are untested by design.
 
 ## 8. Implementation status
@@ -540,11 +548,18 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 | Commit | Scope | Verification |
 | --- | --- | --- |
 | `e01efad` | design of record + both reviews | read-only review by Sol 6.1 and grok-4.7 |
-| `af52ec0` | shared arch probe/parse/gate used by both install paths | `cargo test -p audb-core` 51 pass (1 pre-existing macOS-only failure), `cargo clippy` clean |
+| `af52ec0` | shared arch probe/parse/gate used by both install paths | `cargo test -p audb-core` 51 pass at that commit; the branch is now 61 pass / 0 fail (the macOS-only assertion was fixed by the merge) |
 | `1f77fbc` | doctor rpm arch / libdir / bitness fields + warning | same suite; new parser and warning tests |
 | `c63d0c9` | spec `%{_libdir}`, target-derived arch/libdir, ELF and payload assertions, linker machine guard | `py_compile`, `--self-test`, `sh -n`. **Not re-executed against the SDK** |
 | `56b02fb` | compile-time pin of the 32-bit uinput event layout | builds for `armv7-unknown-linux-gnueabihf`; assertion fires when perturbed |
-| `a051558` | real cross toolchain driver: `--platform` presets, `rpm --target` probe, `AUDB_CROSS_CC` | armv7hl RPM built and verified; aarch64 rebuild unchanged (§4.4) |
+| `a051558` | real cross toolchain driver: `--platform` presets, `rpm --target` probe, `AUDB_CROSS_CC` | armv7hl RPM built and verified; aarch64 rebuild unchanged (§4.5) |
+| `19aa269` | verify the transferred RPM (md5 + checksig) before signing or shipping | caught a same-size corrupt copy |
+| `1e65754` | merge Task A's fbdev panel fallback, both readiness change sets kept | 61 pass / 0 fail; touch verified on t1100 (§4.8) |
+| `f109f33` | panel provenance, gesture-scoped guard, `PANEL_GEOMETRY_MISMATCH`, T1100 fixture | 61 pass / 0 fail; device re-verified |
+| `ebfb840` | Release 11 (same-NVR replacement is refused once files are IMA-attributed) | signed install on t1100 |
+| `7a8c5f3` | sysroot applied to `pkg-config`, both drivers checked, packaged-payload ELF checks, digest `OK` gate, x86_64 preset | armv7hl and x86_64 rebuilds |
+| `d976c70` | fail-closed unreadable DRM connectors, single geometry source, `PanelError: Error` | armv7/aarch64 clippy clean |
+| `7b8730d` | one touch diagnostic, table-driven inventory fields, no probe wrapper | 61 pass / 0 fail |
 
 Host checks that can be run today: `cargo test -p audb-core -p audb-protocol`,
 `cargo clippy -p audb-core -p audb-protocol -p audb-client --all-targets`,
@@ -557,7 +572,7 @@ needed; `cargo check -p audb-agent --target armv7-unknown-linux-gnueabihf` compi
 
 Pending: the on-device install + service restart + post-install doctor and non-touch command
 (needs the t1100 devel-su password); everything before that point is verified, including the
-arch gate on the real device (§4.4).
+arch gate on the real device (§4.5).
 
 ### 8.1 Done since the reviews
 
@@ -586,6 +601,5 @@ arch gate on the real device (§4.4).
 
 ## 9. Out of scope
 
-Touch/geometry verification on t1100 (branch U, with A's fbdev fallback); signing and
-publishing; changes to `final-judge`/`architect`/critic role configuration; any push, merge or
+Signing and publishing; changes to `final-judge`/`architect`/critic role configuration; any push, merge or
 history rewrite.
