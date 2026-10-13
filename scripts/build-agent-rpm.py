@@ -321,10 +321,11 @@ def main():
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(stage/'usr', arcname='usr')
     # Build in the container filesystem, as in StrongSwanPortation; sb2 maps shared host paths
-    # differently when rpmbuild executes target postprocessors. The topdir is removed first so
-    # a stale RPM cannot be mistaken for this build's.
-    top = '/home/mersdk/audb-agent-rpmbuild-' + arch
-    run(['docker', 'exec', a.container, 'rm', '-rf', top])
+    # differently when rpmbuild executes target postprocessors. A fresh topdir per build means a
+    # stale RPM cannot be mistaken for this build's and concurrent builds of the same architecture
+    # do not delete each other's output.
+    top = capture(['docker', 'exec', '--user', 'mersdk', a.container, 'mktemp', '-d',
+                   '/home/mersdk/audb-agent-rpmbuild-XXXXXX']).strip()
     run(['docker', 'exec', '--user', 'mersdk', a.container, 'mkdir', '-p', top+'/SOURCES'])
     run(['docker', 'cp', archive, a.container+':'+top+'/SOURCES/audb-agent-stage.tar.gz'])
     run(['docker', 'cp', ROOT/'packaging/audb-agent.spec', a.container+':'+top+'/audb-agent.spec'])
@@ -390,6 +391,7 @@ def main():
             if executable and not interpreter_ok(sdk_output(['readelf', '-l', path])):
                 raise SystemExit(f'{relative} does not request /{ARMHF_INTERPRETER}')
     candidate.replace(output)
+    run(['docker', 'exec', a.container, 'rm', '-rf', top])
     receipt = {
         'platform': a.platform, 'target': a.target, 'rustTarget': a.rust_target, 'arch': arch,
         'libdir': libdir, 'cc': a.cc, 'cxx': a.cxx, 'sysroot': a.sysroot,
