@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Cross-build audb-agent and package it using Aurora SDK sb2/rpmbuild.
-Signing is a separate step. Requires installed Rust target and running SDK engine.
+"""Cross-build audb-agent and package it using the Aurora build-tools container.
+Signing is a separate step. Requires the installed Rust target and a running container.
 
-Everything architecture-specific is derived from the *selected sb2 target's own rpm*
-(`%{_target_cpu}`, `%{_libdir}`) and asserted against the device contract below, so a
-mistyped --target/--rust-target fails the build instead of producing a plausible-looking
-RPM for the wrong platform. `--self-test` checks that logic without Docker.
+Everything architecture-specific is derived from the *container's own rpm* asked for the
+selected platform (`rpm --target <platform> --eval '%{_target_cpu} %{_arch} %{_libdir}'`) and
+asserted against the device contract below, so a mistyped platform/compiler fails the build
+instead of producing a plausible-looking RPM for the wrong platform.
+
+`--self-test` checks that logic without Docker.
 """
 import argparse
 import json
@@ -24,8 +26,20 @@ ROOT = Path(__file__).resolve().parents[1]
 # it is not %{_libdir} and stays literal in the spec.
 PLATFORM_LIBDIR = {'aarch64': '/usr/lib64', 'armv7hl': '/usr/lib'}
 # Aurora's own armv7hl optflags (rpmrc): Armv7-A, hard-float ABI, VFPv3-D16 (not NEON).
+# The cross gcc defaults to NEON, which is *not* the Aurora baseline for 32-bit devices.
 ARM_FLOAT_FLAGS = ['-march=armv7-a', '-mfloat-abi=hard', '-mfpu=vfpv3-d16']
 ARMHF_INTERPRETER = 'ld-linux-armhf.so.3'
+# Measured against the aurora-os-build-engine container: aarch64 is native, armv7hl is
+# cross-compiled from the toolchain installed by cross-armv7hl-gcc/-binutils.
+PLATFORMS = {
+    'aarch64': {'rustTarget': 'aarch64-unknown-linux-gnu', 'cc': 'gcc', 'cxx': 'g++',
+                'sysroot': '', 'rpmTarget': ''},
+    'armv7hl': {'rustTarget': 'armv7-unknown-linux-gnueabihf',
+                'cc': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-gcc',
+                'cxx': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-g++',
+                'sysroot': '/opt/cross/armv7hl-meego-linux-gnueabi/sys-root',
+                'rpmTarget': 'armv7hl-meego-linux'},
+}
 
 
 def expected_machine(arch):
@@ -34,22 +48,22 @@ def expected_machine(arch):
 
 
 def parse_target_platform(output):
-    """Parses `rpm --eval '%{_target_cpu} %{_arch} %{_libdir}'` run inside an sb2 target.
+    """Parses `rpm --eval '%{_target_cpu} %{_arch} %{_libdir}'` for the selected platform.
 
     rpm echoes macros it cannot resolve verbatim, so an unresolved field must never be
     mistaken for a value.
     """
     fields = output.split()
     if len(fields) != 3 or any('%' in f or '{' in f or not f for f in fields):
-        raise SystemExit(f'Unresolved rpm platform probe inside the sb2 target: {output!r}')
+        raise SystemExit(f'Unresolved rpm platform probe: {output!r}')
     arch, libdir = fields[0], fields[2]
     contract = PLATFORM_LIBDIR.get(arch)
     if contract is None:
         raise SystemExit(f'No device libdir contract for rpm architecture {arch!r}')
     if libdir != contract:
         raise SystemExit(
-            f'sb2 target reports {arch} with libdir {libdir}, but the device contract for '
-            f'{arch} is {contract}; refusing to build for the wrong platform'
+            f'rpm reports {arch} with libdir {libdir}, but the device contract for {arch} '
+            f'is {contract}; refusing to build for the wrong platform'
         )
     return arch, libdir
 
@@ -124,19 +138,38 @@ def self_test():
     assert not vfp_args_ok('Attribute Section: aeabi\n')
     assert interpreter_ok('[Requesting program interpreter: /lib/ld-linux-armhf.so.3]')
     assert not interpreter_ok('[Requesting program interpreter: /lib/ld-linux.so.3]')
+    # The presets encode measured container paths; a re-imaged container must not silently
+    # change which compiler or sysroot a 32-bit build uses.
+    assert PLATFORMS['armv7hl']['rpmTarget'] == 'armv7hl-meego-linux'
+    assert PLATFORMS['armv7hl']['cc'].endswith('armv7hl-meego-linux-gnueabi-gcc')
+    assert PLATFORMS['armv7hl']['sysroot'].endswith('armv7hl-meego-linux-gnueabi/sys-root')
+    assert PLATFORMS['aarch64']['rustTarget'] == 'aarch64-unknown-linux-gnu'
     print('self-test: ok')
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--container', default=os.environ.get('AUDB_SDK_CONTAINER', 'aurora-os-build-engine-5.2.1.200-mb2_kotdath'))
-    p.add_argument('--target', default='AuroraOS-5.2.1.200-aarch64', help='sb2 target that runs the compilation and rpmbuild')
-    p.add_argument('--rust-target', default='aarch64-unknown-linux-gnu')
+    p.add_argument('--target', default='AuroraOS-5.2.1.200-aarch64', help='sb2 target name passed to the sb2 wrapper (the container shim ignores it)')
+    p.add_argument('--platform', choices=sorted(PLATFORMS), default='aarch64', help='target platform preset')
+    p.add_argument('--rust-target', default=None, help='Rust triple (default: from --platform)')
+    p.add_argument('--cc', default=None, help='C compiler driver inside the container (default: from --platform)')
+    p.add_argument('--cxx', default=None, help='C++ compiler driver inside the container (default: from --platform)')
+    p.add_argument('--sysroot', default=None, help='target sysroot for pkg-config (default: from --platform)')
+    p.add_argument('--rpm-target', default=None, help='rpm/rpmbuild --target (default: from --platform)')
     p.add_argument('--arch', default=None, help='Assertion only: expected RPM architecture. Never selects paths.')
     p.add_argument('--self-test', action='store_true', help='Check the architecture logic without Docker')
     a = p.parse_args()
     if a.self_test:
         return self_test()
+
+    preset = PLATFORMS[a.platform]
+    a.rust_target = a.rust_target or preset['rustTarget']
+    a.cc = a.cc or preset['cc']
+    a.cxx = a.cxx or preset['cxx']
+    a.sysroot = a.sysroot if a.sysroot is not None else preset['sysroot']
+    a.rpm_target = a.rpm_target if a.rpm_target is not None else preset['rpmTarget']
+    rpm_target_args = ['--target', a.rpm_target] if a.rpm_target else []
 
     def capture(argv, **kw):
         print(shlex.join(map(str, argv)), flush=True)
@@ -152,36 +185,45 @@ def main():
     def sdk_output(argv):
         return capture(['docker', 'exec', '--user', 'mersdk', a.container, 'sb2', '-t', a.target, '-m', 'sdk-build', *argv])
 
-    # 1. Ask the target's own rpm what it builds for, and fail closed on any disagreement
-    #    with the device contract. `%{_libdir}` is an install path inside the payload and
-    #    is never used as a host or sb2 filesystem path.
-    arch, libdir = parse_target_platform(sdk_output(['rpm', '--eval', '%{_target_cpu} %{_arch} %{_libdir}']))
+    # 1. Ask the container's own rpm what the selected platform builds for, and fail closed on
+    #    any disagreement with the device contract. `%{_libdir}` is an install path inside the
+    #    payload and is never used as a host or container filesystem path.
+    arch, libdir = parse_target_platform(
+        sdk_output(['rpm', *rpm_target_args, '--eval', '%{_target_cpu} %{_arch} %{_libdir}'])
+    )
     check_rust_target(arch, a.rust_target)
     if a.arch is not None and a.arch != arch:
-        raise SystemExit(f'--arch {a.arch} contradicts the sb2 target, which builds {arch}')
-    machine = sdk_output(['gcc', '-dumpmachine']).strip()
+        raise SystemExit(f'--arch {a.arch} contradicts the selected platform, which builds {arch}')
+    machine = sdk_output([a.cc, '-dumpmachine']).strip()
     if not machine.startswith(expected_machine(arch)):
         raise SystemExit(
-            f'sb2 target {a.target} reports gcc machine {machine}, expected {expected_machine(arch)}-*; '
-            f'the target is missing or was not selected'
+            f'{a.cc} reports machine {machine}, expected {expected_machine(arch)}-*; '
+            f'wrong --platform or missing cross toolchain'
         )
     qml_rel, plugin_rel = install_paths(libdir)
     float_flags = ARM_FLOAT_FLAGS if arch == 'armv7hl' else []
-    print(f'building {arch} with libdir {libdir} via {machine}', flush=True)
+    pkg_env = ''
+    if a.sysroot:
+        pkg_env = (
+            f'PKG_CONFIG_SYSROOT_DIR={shlex.quote(a.sysroot)} '
+            f'PKG_CONFIG_LIBDIR={shlex.quote(a.sysroot + "/usr/lib/pkgconfig")} '
+        )
+    print(f'building {arch} with libdir {libdir} via {machine} (cc {a.cc})', flush=True)
 
     env = os.environ.copy()
     env['AUDB_SDK_CONTAINER'] = a.container
     env['AUDB_SDK_TARGET'] = a.target
     env['RUSTC'] = subprocess.check_output(['rustup', 'which', '--toolchain', 'stable', 'rustc'], text=True).strip()
     env['CARGO_TARGET_' + a.rust_target.upper().replace('-', '_') + '_LINKER'] = str(ROOT/'scripts/aurora-linker.sh')
-    # The linker wrapper re-checks the sb2 machine, so a Cargo triple aimed at the wrong
-    # target cannot silently link against another platform's libc.
+    # The linker wrapper re-checks the machine and uses the platform's compiler driver, so a
+    # Cargo triple aimed at the wrong platform cannot silently link against another libc.
     env['AUDB_EXPECT_MACHINE'] = expected_machine(arch)
+    env['AUDB_CROSS_CC'] = a.cc
     if float_flags:
-        # Link arguments, not bare RUSTFLAGS: the Aurora gcc driver is what selects the
+        # Link arguments, not bare RUSTFLAGS: the compiler driver is what selects the
         # hard-float sysroot and emits the ABI attribute.
         env['CARGO_TARGET_' + a.rust_target.upper().replace('-', '_') + '_RUSTFLAGS'] = ' '.join(
-            shlex.quote('-C link-arg=' + flag) for flag in float_flags
+            '-C link-arg=' + flag for flag in float_flags
         )
     run(['rustup', 'run', 'stable', 'cargo', 'build', '-p', 'audb-agent', '--release', '--target', a.rust_target], env=env)
 
@@ -201,9 +243,8 @@ def main():
     shutil.copy2(ROOT/'packaging/audb-agent.service', service)
     display = stage/'usr/libexec/audb-agent/display'
     display.parent.mkdir(parents=True, exist_ok=True)
-    # pkg-config must run within sb2, so compiler flags refer to the target headers.
     flags = ' '.join(float_flags)
-    compile_cmd = f'g++ -std=c++11 -O2 -Wall -Wextra -Werror -Wno-deprecated-copy -fPIC {flags} ' + shlex.quote(str(ROOT/'audb-agent/native/display.cpp')) + ' -o ' + shlex.quote(str(display)) + ' $(pkg-config --cflags --libs Qt5Gui Qt5Core)'
+    compile_cmd = f'{pkg_env}{a.cxx} -std=c++11 -O2 -Wall -Wextra -Werror -Wno-deprecated-copy -fPIC {flags} ' + shlex.quote(str(ROOT/'audb-agent/native/display.cpp')) + ' -o ' + shlex.quote(str(display)) + ' $(pkg-config --cflags --libs Qt5Gui Qt5Core)'
     sdk(['/bin/sh', '-c', compile_cmd])
     # Maliit background plugin: does not replace or patch the stock keyboard.
     module = stage/qml_rel
@@ -217,12 +258,12 @@ def main():
     native = work/'native-input'
     native.mkdir(exist_ok=True)
     shutil.copy2(source, native/'bridge.cpp')
-    compile_cmd = 'cd ' + shlex.quote(str(native)) + ' && moc bridge.cpp -o bridge.moc && g++ -std=c++11 -shared -fPIC -O2 -Wall -Wextra -Werror -Wno-deprecated-copy ' + flags + ' bridge.cpp -o ' + shlex.quote(str(module/'libaudbinput.so')) + ' $(pkg-config --cflags --libs Qt5Quick Qt5Qml Qt5Network)'
+    compile_cmd = 'cd ' + shlex.quote(str(native)) + ' && moc bridge.cpp -o bridge.moc && ' + pkg_env + a.cxx + ' -std=c++11 -shared -fPIC -O2 -Wall -Wextra -Werror -Wno-deprecated-copy ' + flags + ' bridge.cpp -o ' + shlex.quote(str(module/'libaudbinput.so')) + ' $(pkg-config --cflags --libs Qt5Quick Qt5Qml Qt5Network)'
     sdk(['/bin/sh', '-c', compile_cmd])
 
     # 2. Every shipped ELF must use the platform's float ABI, not just the Rust ones: the
-    #    plugin is what Maliit dlopens and it is built by sb2 g++, which never passes
-    #    through scripts/aurora-linker.sh. Checked on the staged (stripped) files.
+    #    plugin is what Maliit dlopens and it is built by the compiler driver directly. Checked
+    #    on the staged (stripped) files.
     if arch == 'armv7hl':
         elf_checks = [
             ('usr/sbin/audb-agent', True), ('usr/bin/audb-agentctl', True),
@@ -232,7 +273,7 @@ def main():
             path = str(stage/relative)
             attributes = sdk_output(['readelf', '-A', path])
             if not vfp_args_ok(attributes):
-                raise SystemExit(f'{relative} is not Tag_ABI_VFP_args: VFP registers; the target gcc is not hard-float')
+                raise SystemExit(f'{relative} is not Tag_ABI_VFP_args: VFP registers; the compiler is not hard-float')
             if executable:
                 headers = sdk_output(['readelf', '-l', path])
                 if not interpreter_ok(headers):
@@ -241,19 +282,19 @@ def main():
     archive = work/'audb-agent-stage.tar.gz'
     with tarfile.open(archive, 'w:gz') as tar:
         tar.add(stage/'usr', arcname='usr')
-    # Build in the native engine filesystem, as in StrongSwanPortation; sb2 maps
-    # shared host paths differently when rpmbuild executes target postprocessors.
-    # The topdir is removed first so a stale RPM cannot be mistaken for this build's.
+    # Build in the container filesystem, as in StrongSwanPortation; sb2 maps shared host paths
+    # differently when rpmbuild executes target postprocessors. The topdir is removed first so
+    # a stale RPM cannot be mistaken for this build's.
     top = '/home/mersdk/audb-agent-rpmbuild-' + arch
     run(['docker', 'exec', a.container, 'rm', '-rf', top])
     run(['docker', 'exec', '--user', 'mersdk', a.container, 'mkdir', '-p', top+'/SOURCES'])
     run(['docker', 'cp', archive, a.container+':'+top+'/SOURCES/audb-agent-stage.tar.gz'])
     run(['docker', 'cp', ROOT/'packaging/audb-agent.spec', a.container+':'+top+'/audb-agent.spec'])
     run(['docker', 'exec', a.container, 'chown', '-R', 'mersdk:mersdk', top])
-    sdk(['rpmbuild', '-bb', '--define', '_topdir '+top, '--define', '_enable_debug_packages 0', '--define', 'debug_package %{nil}', top+'/audb-agent.spec'])
+    sdk(['rpmbuild', *rpm_target_args, '-bb', '--define', '_topdir '+top, '--define', '_enable_debug_packages 0', '--define', 'debug_package %{nil}', top+'/audb-agent.spec'])
 
-    # 3. Discover what rpmbuild actually produced rather than predicting its layout, then
-    #    assert the architecture and the packaged paths.
+    # 3. Discover what rpmbuild actually produced rather than predicting its layout, then assert
+    #    the architecture and the packaged paths.
     version = next(l.split(':', 1)[1].strip() for l in (ROOT/'packaging/audb-agent.spec').read_text().splitlines() if l.startswith('Version:'))
     release = next(l.split(':', 1)[1].strip() for l in (ROOT/'packaging/audb-agent.spec').read_text().splitlines() if l.startswith('Release:'))
     listing = capture(['docker', 'exec', a.container, 'find', top+'/RPMS', '-name', '*.rpm', '-type', 'f']).split()
@@ -264,7 +305,7 @@ def main():
         raise SystemExit(f'{built} is not labelled {arch}')
     output = work/('audb-agent-'+version+'-'+release+'.'+arch+'.rpm')
     run(['docker', 'cp', a.container+':'+built, output])
-    # Inspect the copied artifact through the target's own rpm; the host may have none.
+    # Inspect the copied artifact through the container's rpm; the macOS host has none.
     header = sdk_output(['rpm', '-qp', '--qf', '%{ARCH}', str(output)]).strip()
     if header != arch:
         raise SystemExit(f'{output} has RPM architecture {header!r}, expected {arch!r}')
@@ -276,8 +317,9 @@ def main():
     if lib64 and libdir == '/usr/lib':
         raise SystemExit(f'{output} contains lib64 paths although the device contract is {libdir}: {lib64}')
     receipt = {
-        'target': a.target, 'rustTarget': a.rust_target, 'arch': arch, 'libdir': libdir,
-        'gccMachine': machine, 'containerOutputDir': str(Path(built).parent),
+        'platform': a.platform, 'target': a.target, 'rustTarget': a.rust_target, 'arch': arch,
+        'libdir': libdir, 'cc': a.cc, 'sysroot': a.sysroot, 'rpmTarget': a.rpm_target,
+        'machine': machine, 'containerOutputDir': str(Path(built).parent),
         'containerOutputName': Path(built).name, 'hostPath': str(output),
         'rpmArchHeader': header, 'payload': sorted(payload),
     }
