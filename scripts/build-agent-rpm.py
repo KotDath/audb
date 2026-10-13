@@ -305,6 +305,17 @@ def main():
         raise SystemExit(f'{built} is not labelled {arch}')
     output = work/('audb-agent-'+version+'-'+release+'.'+arch+'.rpm')
     run(['docker', 'cp', a.container+':'+built, output])
+    # A transfer that silently changes bytes would ship a package whose payload digest no longer
+    # matches its header (seen once with a same-size copy), so compare digests with the original
+    # and let the target's rpm verify the copy before anything signs or installs it.
+    container_md5 = sdk_output(['md5sum', built]).split()[0]
+    host_md5 = sdk_output(['md5sum', str(output)]).split()[0]
+    if container_md5 != host_md5:
+        raise SystemExit(f'{output} differs from the built RPM ({host_md5} != {container_md5}); refusing to use it')
+    checksig = sdk_output(['rpmkeys', '--checksig', '-v', str(output)])
+    bad = [line.strip() for line in checksig.splitlines() if ' BAD' in line]
+    if bad:
+        raise SystemExit(f'{output} failed its own digests: {bad}')
     # Inspect the copied artifact through the container's rpm; the macOS host has none.
     header = sdk_output(['rpm', '-qp', '--qf', '%{ARCH}', str(output)]).strip()
     if header != arch:
