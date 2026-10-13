@@ -6,6 +6,7 @@ pub const PROTOCOL: u32 = 3;
 pub const MAX_FRAME: u64 = 65536;
 pub const MAX_PNG: usize = 16 * 1024 * 1024;
 pub mod input;
+pub mod panel;
 pub mod permission;
 pub mod screenshot;
 
@@ -290,6 +291,35 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
         thread.join().unwrap();
+    }
+    #[test]
+    fn mtkfb_rotation_maps_oriented_landscape_into_native_portrait() {
+        // TrustPhone T1: native panel 720x1600, Qt rotation 90, oriented 1600x720.
+        // fb0/rotate is not a live orientation source; this mapping is per request.
+        let cases = [
+            (0, (720, 1600), (10, 20), (10, 20)),
+            (90, (1600, 720), (10, 20), (699, 10)),
+            (180, (720, 1600), (10, 20), (709, 1579)),
+            (270, (1600, 720), (10, 20), (20, 1589)),
+        ];
+        for (rotation, oriented, point, native) in cases {
+            let display = Display {
+                native_width: 720,
+                native_height: 1600,
+                rotation,
+            };
+            assert_eq!(display.size(), oriented);
+            assert_eq!(display.native_point(point.0, point.1).unwrap(), native);
+        }
+        let landscape = Display {
+            native_width: 720,
+            native_height: 1600,
+            rotation: 90,
+        };
+        assert_eq!(landscape.native_point(0, 0).unwrap(), (719, 0));
+        assert_eq!(landscape.native_point(1599, 719).unwrap(), (0, 1599));
+        assert!(landscape.native_point(1600, 0).is_err());
+        assert!(landscape.native_point(0, 720).is_err());
     }
     #[test]
     fn all_rotations_and_bounds() {
