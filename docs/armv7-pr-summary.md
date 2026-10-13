@@ -83,22 +83,26 @@ aarch64.
   `rpmArchClass: arm`, `rpmLibdir: /usr/lib`, plus the new `architectureBitness` warning.
   Evidence: `target/armv7/evidence/doctor-t1100-private.json`, `verification-battery.txt`.
 
-## Not verified — needs the operator
+## Installed on t1100 — but not yet executable (signing required)
 
-**The on-device install itself.** `t1100` denies root SSH and `devel-su` requires the device
-password, which I will not hunt for in credentials or keystores. Everything before that point
-is verified, including the gate and the privileged-transaction precondition. With the password
-supplied via stdin the remaining commands are:
+The operator installed the armv7hl RPM with the devel-su password. Evidence gathered:
 
-```
-audb --device t1100 setup-device --rpm target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm --check-only --root-password-stdin
-audb --device t1100 setup-device --rpm target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm --root-password-stdin
-rpm -q audb-agent ; systemctl status audb-agent ; audb --device t1100 doctor
-```
+- `rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' audb-agent` → **`audb-agent-0.3.0-10.armv7hl`**
+- `rpm -ql audb-agent` → every Qt/Maliit path under **`/usr/lib`** (the libdir fix lands correctly on real hardware), systemd unit under `/usr/lib/systemd/system`
+- `file /usr/sbin/audb-agent` → `ELF 32-bit LSB pie, ARM, EABI5, interpreter /lib/ld-linux-armhf.so.3`
+- `systemctl is-enabled` → `enabled`; `systemctl is-active` → **`failed`**, `ExecStart` `status=203/EXEC`
+- `audb doctor` → `agent: failed REMOTE_COMMAND_FAILED … /usr/bin/audb-agentctl: Permission denied` (exit 126)
 
-(`--device t1100` must be run against a daemon built from this branch; the shared long-lived
-daemon from `~/.cargo/bin/audb` still serves old code, and `--socket` is the QMP socket, not the
-daemon socket.)
+**Root cause: the package is unsigned, so the device's IMA/EVM appraisal refuses to map its
+files for execution.** `/sys/kernel/security/{ima,evm,lsm}` are present; a stock binary carries
+attestation attributes (`getfattr /usr/sbin/sshd` → `security.appid="openssh-server"`,
+`security.ima=0sAwIS0c/…`) while ours carries none; the loader reports `failed to map segment
+from shared object` and direct execution gives `Permission denied`; and the install warned
+`Plugin sweeper: hook tsm_post failed` — the hook that blesses a trusted package's files.
+
+**Blocked on an approval-gated action:** sign the armv7hl RPM with the existing Regular
+development certificate via `audb package sign` (its documented workflow), then reinstall with
+`--reinstall` (same NVR). Not performed — the brief requires explicit approval for signing.
 
 ## Other findings
 

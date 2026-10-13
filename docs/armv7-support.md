@@ -345,6 +345,16 @@ Reaching the privileged step means the new gate **accepted** the armv7hl package
 returned `Package architecture 'armv7hl' does not match device 'arm'` before any root access.
 Staging was cleaned and `rpm -q audb-agent` still reports the package is not installed.
 
+### 4.5 On-device install outcome (unsigned RPM)
+
+Installed by the operator with the devel-su password supplied at the prompt:
+`rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}'` → **`audb-agent-0.3.0-10.armv7hl`**, and
+`rpm -ql` shows every Qt/Maliit path under `/usr/lib` (proving the libdir fix on real hardware),
+with `file /usr/sbin/audb-agent` → `ELF 32-bit LSB pie, ARM, EABI5, interpreter
+/lib/ld-linux-armhf.so.3`. The service is `enabled` but `failed` and the agent is unreachable,
+for the signing/IMA reason in §7. Evidence:
+`target/armv7/evidence/doctor-t1100-postinstall.json`.
+
 ## 5. Review dispositions
 
 Architect (Sol 6.1) verdict: *conditionally approve the approach, not D2 as written*. Critic
@@ -429,9 +439,25 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 
 ## 7. Residual risks / not yet verified
 
-- **On-device install is the one remaining step and needs the t1100 devel-su password**
-  (root SSH is denied, `--root-password-stdin` is the supported path). Everything up to and
-  including the arch gate and `rpm --test` precondition has been exercised; see §4.4.
+- **On-device install is blocked by package signing, now diagnosed precisely.** The unsigned
+  armv7hl RPM *installs* on t1100 (`rpm -q audb-agent` → `audb-agent-0.3.0-10.armv7hl`, payload
+  under `/usr/lib`, binary `ELF 32-bit LSB pie, ARM, EABI5, interpreter
+  /lib/ld-linux-armhf.so.3`), but its files cannot be **executed**:
+  - `systemctl status audb-agent` → `failed (Result: exit-code)`, `ExecStart` `status=203/EXEC`;
+  - `/lib/ld-linux-armhf.so.3 /usr/sbin/audb-agent` → `failed to map segment from shared object`;
+  - direct execution by any user → `Permission denied`, and `audb doctor` reports
+    `REMOTE_COMMAND_FAILED … /usr/bin/audb-agentctl: Permission denied` (exit 126);
+  - the device enforces IMA/EVM (`/sys/kernel/security/{ima,evm,lsm}` present) and a stock
+    binary carries the attestation attributes while ours carries none:
+    `getfattr /usr/sbin/sshd` → `security.appid="openssh-server"`,
+    `security.ima=0sAwIS0c/…`; `getfattr /usr/sbin/audb-agent` → **no attributes**;
+  - the install itself warned `Plugin sweeper: hook tsm_post failed` — the hook that blesses a
+    trusted package's files is what applies those attributes.
+
+  This is the residual risk predicted earlier, in a sharper form: the unsigned package installs
+  but is not executable, so **signing the RPM (Regular development certificate, via
+  `audb package sign`) is on the critical path** for a working service. Signing is an
+  approval-gated step per the task brief and has not been performed.
 - The container's `sb2` shim discards `-t`; a future re-imaging could change the cross layout.
   `--self-test` asserts the preset paths, and the build re-verifies `-dumpmachine` and the rpm
   contract, so a change fails closed rather than building for the wrong platform.
@@ -440,9 +466,11 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
   device without NEON was tested.
 - Required glibc floor for the Rust binaries is 2.34 (from the sysroot), fine for t1100
   (2.38) but a real constraint for older Aurora 5.x.
-- Unsigned RPM: install runs plain `rpm -ivh`/`-Uvh` with no `--nosignature`
-  (`system_package.rs:260-266`); if t1100 enforces signatures, install fails and signing keys
-  need separate approval.
+- Unsigned RPM: the install path runs plain `rpm -ivh`/`-Uvh` with no `--nosignature`
+  (`system_package.rs:260-266`) and it succeeds on t1100 — but see the IMA/EVM finding above:
+  installation without a valid package signature yields files that the kernel refuses to
+  execute. The signed-RPM workflow in `README.md` (`audb package sign`, Regular development
+  certificate) is therefore required, not optional, on this device class.
 - Device is Aurora 5.2.0.180 while the SDK sysroot is 5.2.1.200 — Qt is 5.6.3 on both sides and
   the needed sonames exist, but the agent has not run there yet.
 - uinput `InputEvent` layout across the 32/64-bit boundary is reasoned and compile-pinned, not
