@@ -29,6 +29,11 @@ struct InputEvent {
     code: u16,
     value: i32,
 }
+// The uinput event layout written here is the 32-bit ARM one: 8-byte timeval plus
+// kind/code/value. An aarch64 kernel translates it through its compat layer, and a
+// wider timeval would silently desync every write. Pin the size at compile time.
+#[cfg(all(target_arch = "arm", target_pointer_width = "32"))]
+const _: () = assert!(std::mem::size_of::<InputEvent>() == 16);
 #[repr(C)]
 struct UinputDevice {
     name: [u8; 80],
