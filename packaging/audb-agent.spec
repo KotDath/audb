@@ -42,8 +42,8 @@ systemctl daemon-reload || :
 /usr/sbin/audb-agent
 /usr/bin/audb-agentctl
 /usr/libexec/audb-agent
-/usr/lib64/qt5/qml/Audb
-/usr/lib64/maliit/plugins/zz-audb-input.qml
+%{_libdir}/qt5/qml/Audb
+%{_libdir}/maliit/plugins/zz-audb-input.qml
 /usr/lib/systemd/system/audb-agent.service
 
 %license /usr/share/licenses/audb-agent/LICENSE
