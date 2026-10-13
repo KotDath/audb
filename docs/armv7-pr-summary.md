@@ -98,16 +98,36 @@ and reinstalling with `--reinstall`:
 | `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-10`, identity reports `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`, `longBit 32`, `architecture aarch64`; `architectureBitness` stays a warning |
 | non-touch command | `audb --device t1100 screenshot` → real PNG **2176×1600, 6336658 bytes** |
 
-`tap`/`swipe` are **not available on this device**, and it is not an armv7 problem: the agent
-derives the touch surface from a DRM panel (`native_display()` enumerates `/sys/class/drm` and
-requires exactly one connected panel with `modes`, `audb-agent.rs:300-323`), while the T1100 is
-fbdev-only (`/dev/dri` and `/sys/class/drm` absent, `/dev/fb0` present). The probe error is
-swallowed at `:555-559`, so `touch` is `None` and every gesture returns
-`CAPABILITY_UNAVAILABLE: "No available uinput touchscreen/DRM panel"`. Key injection works and
-the agent's own `audb-keyboard` uinput node exists, screenshot works (2176×1600), and text is
-available via Maliit — so the 32-bit port, `/dev/uinput`, the unit's device allowance and the
-session geometry are all fine; the only missing input is a panel-size source, i.e. exactly the
-fbdev fallback that integration branch U carries. Touch verification stays with U (`docs/armv7-support.md` §4.7).
+### Touch parity on t1100 (tap and swipe work)
+
+The agent's touch surface comes from the kernel panel, and the T1100 has no DRM class
+(`/dev/dri` and `/sys/class/drm` absent) — it is fbdev-only with `mode` empty and
+`modes = U:1600x2176p-0`. Task A's `panel.rs` fallback is merged here (authorship preserved), so
+the panel is discovered from `/sys/class/graphics/fb0` and the triple-buffered `virtual_size`
+(`1600,6528`) is correctly ignored.
+
+Verified on the signed installed build `audb-agent-0.3.0-11.armv7hl` (running binary md5
+`fe4578c1…` equals the RPM payload — the new agent, not the old installation):
+
+| Check | Result |
+| --- | --- |
+| agent status | `panel: {source: fbdev, node: fb0, nativeWidth: 1600, nativeHeight: 2176, matchesSession: true}`; `tap`/`swipe` true |
+| `/proc/bus/input/devices` | `audb-touchscreen` beside `audb-keyboard` |
+| doctor | `healthy: true`, no `touch` warning, `tap.geometry = {space: oriented, 2176x1600, native 1600x2176, rotation 90, panelSource: fbdev}` |
+| bounds (negative control) | `tap 2176 800`, `tap 1088 1600`, `tap -1 800`, `swipe 100 100 2176 100` → `INVALID_ARGUMENT … outside 2176x1600`, screen byte-identical afterwards (`ef0846df…`) |
+| two taps, two controls | dock 3 (872,1482) → `ru.omp.camera`; dock 7 (1635,1482) → `io.github.ihhub.fheroes2`; verified by process list, app-card strip and screenshots |
+| opposite swipes | Settings list up then down: `s0 c41a677a…` → `s1 2b29c2ce…` → `s2 c41a677a…` (byte-identical return); the centre swipe stayed in Settings |
+| edge gesture | `edge-up` reached home from the landscape Camera app and from Settings |
+| non-touch recheck | `key esc`, `permission list jolla-settings`, screenshot, doctor all ok; `text` still available via Maliit |
+
+Known limitation, measured here: with a portrait-only app foreground the session still reports
+rotation 90, so gestures computed in that space do not land as intended (`edge-up` was a no-op,
+while a client-space horizontal swipe mapped to the native bottom-edge-up swipe and did reach
+home). Gestures are correct in the device orientation that `tap.geometry` advertises.
+
+Also found: replacing an installed package with the **same** NVR now fails on t1100 at the check
+phase (`file … conflicts with file from package audb-agent-0.3.0-10.armv7hl`) once
+`rpm-plugin-external-ima` has attributed the files, which is why this branch bumps Release to 11.
 
 ### Why signing is mandatory here (finding)
 
