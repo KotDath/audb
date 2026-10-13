@@ -196,6 +196,14 @@ an `aarch64` package is rejected. On an aarch64 device tokens are `{aarch64}` (o
   change too).
 - The same NVR (`audb-agent-0.3.0-10`) is kept across architectures; the built file is
   `audb-agent-0.3.0-10.armv7hl.rpm`.
+- `scripts/build-agent-rpm.py --self-test` exercises all of the above decision logic
+  (probe parsing, contract check, Rust-triple/machine cross-check, staging paths, ELF
+  assertions) without Docker, and each build writes `target/agent-rpm/<arch>/build-receipt.json`
+  recording the target, rust target, arch, libdir, `gcc -dumpmachine`, the real container
+  output directory and the packaged payload.
+- `scripts/aurora-linker.sh` refuses to link when the sb2 target's `gcc -dumpmachine` does
+  not match the family implied by the Cargo triple, so a mismatched `--target`/`--rust-target`
+  cannot silently link against another platform's libc.
 
 ### D4 — Doctor: additive, diagnostic only
 
@@ -364,8 +372,11 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 
 ## 7. Residual risks / not yet verified
 
-- SDK container unreachable: the decisive armv7 hard-float sysroot measurement, Qt5/Maliit dev
-  availability, and the build itself are pending.
+- **SDK container unreachable (OrbStack docker socket unresponsive): the armv7 hard-float
+  sysroot measurement, Qt5/Maliit dev availability, and the RPM build itself are pending.**
+  The packaging changes are `py_compile`/`--self-test`/`sh -n` verified only; neither the
+  aarch64 nor the armv7hl rpmbuild path has been re-executed, so `%{_libdir}` expansion in the
+  spec and the probe logic are unproven against the SDK until it is reachable.
 - `aarch64` devices' `%{_target_cpu}` / `%{_libdir}`: unmeasured (no approval to probe
   non-t1100 devices). D2's union makes the gate safe without it; the values are still wanted
   for documentation and for the optional preferred-order narrowing.
@@ -378,7 +389,29 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
   touch verification belongs to branch U.
 - `armv7hnl`/NEON and other 32-bit ARM devices are untested by design.
 
-## 8. Out of scope
+## 8. Implementation status
+
+| Commit | Scope | Verification |
+| --- | --- | --- |
+| `e01efad` | design of record + both reviews | read-only review by Sol 6.1 and grok-4.7 |
+| `af52ec0` | shared arch probe/parse/gate used by both install paths | `cargo test -p audb-core` 51 pass (1 pre-existing macOS-only failure), `cargo clippy` clean |
+| `1f77fbc` | doctor rpm arch / libdir / bitness fields + warning | same suite; new parser and warning tests |
+| `c63d0c9` | spec `%{_libdir}`, target-derived arch/libdir, ELF and payload assertions, linker machine guard | `py_compile`, `--self-test`, `sh -n`. **Not re-executed against the SDK** |
+| `56b02fb` | compile-time pin of the 32-bit uinput event layout | builds for `armv7-unknown-linux-gnueabihf`; assertion fires when perturbed |
+
+Host checks that can be run today: `cargo test -p audb-core -p audb-protocol`,
+`cargo clippy -p audb-core -p audb-protocol -p audb-client --all-targets`,
+`cargo clippy -p audb-agent --target armv7-unknown-linux-gnueabihf --all-targets` (the agent is
+Linux-only, so it cannot be built for the macOS host at all).
+
+`rustc --print cfg --target armv7-unknown-linux-gnueabihf` reports `target_abi="eabihf"`,
+`target_pointer_width="32"` and **no** `feature="neon"`, so `-C target-feature=-neon` is not
+needed; `cargo check -p audb-agent --target armv7-unknown-linux-gnueabihf` compiles cleanly.
+
+Pending: the SDK probe, the armv7hl RPM, its `%{ARCH}`/payload assertions, the t1100
+`--check-only` transaction, and the on-device install/doctor evidence.
+
+## 9. Out of scope
 
 Touch/geometry verification on t1100 (branch U, with A's fbdev fallback); signing and
 publishing; changes to `final-judge`/`architect`/critic role configuration; any push, merge or
