@@ -16,9 +16,10 @@ device.
 | `e01efad` | Design of record (`docs/armv7-support.md`) plus the verbatim independent reviews (`docs/reviews/`) |
 | `af52ec0` | Shared RPM-platform arch probe/parse/gate used by both install paths |
 | `1f77fbc` | Doctor reports rpm arch, rpm libdir and userspace bitness; bitness warning |
-| `c63d0c9` | Packaging derives arch and libdir from the sb2 target; ELF/payload assertions; linker machine guard |
+| `c63d0c9` | Packaging derives arch and libdir from the target rpm; ELF/payload assertions; linker machine guard |
 | `56b02fb` | Compile-time pin of the 32-bit uinput event layout |
-| `45f4103` | Implementation status and verification evidence in the design doc |
+| `45f4103`, `2682339`, `dbaf58c` | Implementation status, PR summary, and measured SDK/build evidence |
+| `a051558` | Drive the container's real cross toolchain (`sb2` there is a shim) |
 
 ## Root cause (measured, not inferred)
 
@@ -34,69 +35,70 @@ device.
 `%{_arch}` is rpm's coarse family label, not the namespace packages are built for. The fix is
 to observe the right value, not to alias one string onto another: the gate now accepts
 `noarch` or an **exact** match against any architecture the device's own rpm reports
-(`%{_target_cpu}` or `%{_arch}`), with tokens validated as `[A-Za-z0-9_]+`. No arch alias
-exists, nothing rewrites `arm` into `armv7hl`, and no rule can equate a 32-bit ARM name with
-`aarch64`. Keeping `%{_arch}` in the accepted set means no device that installs today can
-start failing. The pre-check remains deliberately narrower than rpm's `arch_compat` chain;
-the transaction stays the authority.
+(`%{_target_cpu}` or `%{_arch}`), tokens validated as `[A-Za-z0-9_]+`. No alias exists, nothing
+rewrites `arm` into `armv7hl`, and no rule can equate a 32-bit ARM name with `aarch64`.
+
+The aarch64 side was measured on `t1` (operator-approved, read-only): `%{_target_cpu}` and
+`%{_arch}` are both `aarch64` and `%{_libdir}` is `/usr/lib64`, so the accepted set on a
+working 64-bit device is unchanged — the fix is provably non-regressive.
 
 ## Reviewed
 
-Design reviewed with fresh, read-only context by the architect (Sol 6.1) and independently
-challenged by the architecture critic (per-call `cursor/grok-4.7`). Both reviews are committed
-verbatim; §5 of the design doc dispositions every must-fix. The critic's "no alias; exact
-match only" and the architect's "query the package namespace" instructions are both followed.
-One deliberate, disclosed deviation: the design accepts **any** rpm-reported platform arch by
-exact match (non-regressive) instead of preferring `_target_cpu` and falling back — the
-preferred-order variant needs the aarch64 `%{_target_cpu}` observation, and it would newly
-reject plain-`arm` packages that pass the gate today.
+Design reviewed with fresh, read-only context by the architect (**requested `openai-codex/gpt-6.1-sol` = Sol 6.1, executed `gpt-6.1-sol`**) and independently challenged by the architecture
+critic (**requested per-call `cursor/grok-4.7`, executed `grok-4.7`**). Both reviews are
+committed verbatim; §5 of the design doc dispositions every must-fix (no alias, query the
+package namespace, float ABI on all four ELFs, target-derived libdir, `--arch` assertion-only,
+doctor warning not failure, fake-`rpm` shell test). One deliberate, disclosed deviation: the
+gate accepts **any** rpm-reported platform arch by exact match (non-regressive) instead of
+preferring `_target_cpu` with a fallback — now moot, since `t1` proved both macros agree on
+aarch64.
 
 ## Verified here
 
-- `cargo test -p audb-protocol`: 7 pass.
-- `cargo test -p audb-core`: 51 pass, 1 fail — `setup::tests::migrates_audb2_wrapper_in_place`
-  (`setup.rs:303`) is **pre-existing and macOS-specific**: it asserts a `/tmp/` path while
-  macOS tempdirs live under `/var/folders/…`. It fails identically on the base commit.
-- `cargo clippy -p audb-core -p audb-protocol -p audb-client --all-targets`: clean.
-- `cargo clippy -p audb-agent --target armv7-unknown-linux-gnueabihf --all-targets`: clean.
-  (`audb-agent` is Linux-only — `libc::SO_PEERCRED`/`ucred` — so it cannot be built or linted
-  for the macOS host at all; the armv7 target is the correct way to check it.)
-- `cargo check -p audb-agent --target armv7-unknown-linux-gnueabihf`: clean; the compile-time
-  `InputEvent` size assertion holds on 32-bit ARM (confirmed by perturbing the expectation).
-- `rustc --print cfg --target armv7-unknown-linux-gnueabihf`: `target_abi="eabihf"`,
-  `target_pointer_width="32"`, no `feature="neon"` ⇒ no `-C target-feature=-neon` needed.
-- `scripts/build-agent-rpm.py --self-test` and `sh -n scripts/aurora-linker.sh`: ok.
-- **On-device** (`t1100` registered, read-only doctor, evidence in
-  `target/armv7/evidence/doctor-t1100-private.json`):
-  `identity` reports `architecture: aarch64`, `longBit: 32`, `rpmArch: armv7hl`,
-  `rpmArchClass: arm`, `rpmLibdir: /usr/lib`, and a new `architectureBitness` **warning**
-  (`MIXED_KERNEL_USERSPACE_BITNESS`). `healthy: false` only because `audb-agent` is not yet
-  installed on the device.
+- `cargo test -p audb-protocol`: 7 pass. `cargo test -p audb-core`: 51 pass, 1 fail —
+  `setup::tests::migrates_audb2_wrapper_in_place` (`setup.rs:303`) is **pre-existing and
+  macOS-specific** (asserts a `/tmp/` path; macOS tempdirs are under `/var/folders/…`); it
+  fails identically on the base commit.
+- clippy clean for host crates, and for `audb-agent --target armv7-unknown-linux-gnueabihf`
+  (the agent is Linux-only, so `--workspace` cannot be green on macOS at all).
+- `rustc --print cfg --target armv7-unknown-linux-gnueabihf`: `target_abi="eabihf"`, 32-bit, no
+  `feature="neon"`; the compile-time `InputEvent` size assertion holds and fires when perturbed.
+- packaging `--self-test`, `py_compile`, `sh -n`: ok.
+- **armv7hl RPM built**: `target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm`,
+  `rpmArchHeader=armv7hl`, payload under `/usr/lib` with no `lib64` entries, receipt at
+  `target/agent-rpm/armv7hl/build-receipt.json`.
+- **Payload independently verified** (extracted with `rpm2cpio`): all four ELFs are ELF32/ARM
+  with hard-float ABI flags and `Tag_ABI_VFP_args: VFP registers`; the three executables
+  request `/lib/ld-linux-armhf.so.3`; max symbol floor `GLIBC_2.34` against the device's 2.38;
+  the device has libQt5Core/Gui/Quick/Qml/Network.so.5, `libstdc++`, `libgcc_s`, and the **same
+  Qt 5.6.3** as the SDK sysroot.
+- **aarch64 non-regression**: `--platform aarch64` still builds `ARCH=aarch64` with the
+  identical `/usr/lib64` payload layout.
+- **Gate proven on the real device**: with a deliberately wrong `--root-password-stdin`,
+  `setup-device --check-only` fails at `phase: "check"` with devel-su `Auth failed` while
+  carrying `package.arch = armv7hl` — i.e. it passed the new gate (the old gate refused
+  `armv7hl` before any root access). Staging cleaned, nothing installed.
+  Evidence: `target/armv7/evidence/gate-probe-wrong-password.json`.
+- **On-device read-only doctor**: `architecture: aarch64`, `longBit: 32`, `rpmArch: armv7hl`,
+  `rpmArchClass: arm`, `rpmLibdir: /usr/lib`, plus the new `architectureBitness` warning.
+  Evidence: `target/armv7/evidence/doctor-t1100-private.json`, `verification-battery.txt`.
 
-## Witnessed on device
+## Not verified — needs the operator
 
-Evidence files (gitignored, host-local): `target/armv7/evidence/`
-`doctor-t1100-private.json`, `verification-battery.txt`.
+**The on-device install itself.** `t1100` denies root SSH and `devel-su` requires the device
+password, which I will not hunt for in credentials or keystores. Everything before that point
+is verified, including the gate and the privileged-transaction precondition. With the password
+supplied via stdin the remaining commands are:
 
-## Not verified — blocked (single blocker)
+```
+audb --device t1100 setup-device --rpm target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm --check-only --root-password-stdin
+audb --device t1100 setup-device --rpm target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm --root-password-stdin
+rpm -q audb-agent ; systemctl status audb-agent ; audb --device t1100 doctor
+```
 
-**The OrbStack docker daemon is wedged**, so the SDK container cannot be used. Symptoms:
-`curl --unix-socket ~/.orbstack/run/docker.sock http://localhost/_ping` alternates between
-timeout and `OK`; `docker ps`/`inspect`/`top` intermittently hang; `docker exec <container>`
-times out; `docker restart <container>` never took effect (container still `Up 2 days`);
-OrbStack helpers 32420/32427 alive. It broke right after a `find /` exec inside the container
-filled the 180 s run and timed out. Restarting OrbStack would also stop the unrelated
-`vikunja`/`vikunja-t10` containers, so it was not done without approval.
-
-Consequently still outstanding:
-
-1. the armv7hl sb2 target's existence and hard-float proof (`__ARM_PCS_VFP`, not `__SOFTFP__`),
-   Qt5 dev files and `moc`, and the target's `%{_libdir}`;
-2. the aarch64 sb2 target's `%{_target_cpu}`/`%{_libdir}` cross-check (a `%{_libdir}` spec
-   change is an aarch64 change too);
-3. the armv7hl RPM build and its `%{ARCH}`/payload assertions;
-4. `setup-device --check-only` against t1100, then install + service restart;
-5. `doctor` / one non-touch command after installation.
+(`--device t1100` must be run against a daemon built from this branch; the shared long-lived
+daemon from `~/.cargo/bin/audb` still serves old code, and `--socket` is the QMP socket, not the
+daemon socket.)
 
 ## Other findings
 
@@ -105,12 +107,10 @@ Consequently still outstanding:
   (`audb-core/src/config.rs:2,55-59`), which ignores XDG on macOS, so all 18 tests share the
   real registry. A baseline run appended a `phone` device and rewrote `emulator.qmpSocket`; the
   registry was restored byte-exactly and a pre-restore copy kept at
-  `~/Library/Application Support/audb/devices-v1.json.pre-armv7-testrun.bak`. `phone` later
-  reappeared (a sibling worktree, `audb-fbdev-touch`, runs daemons and tests against the same
-  registry), so it was left untouched this time rather than edited outside this branch's scope.
+  `devices-v1.json.pre-armv7-testrun.bak`. Per the operator, that defect is resolved in the
+  `audb-fbdev-touch` worktree, so this branch deliberately does **not** touch `config.rs`.
 - `setup-device` still defaults to `packages/audb-agent.rpm` (`audb-client/src/main.rs:658`);
-  the armv7hl file must be passed explicitly. Change not made deliberately.
-- Unsigned RPM install path unchanged (`system_package.rs:260-266`, no `--nosignature`); if
-  t1100 enforces signatures the install will fail and signing needs separate approval.
-- Device is Aurora 5.2.0.180 while the SDK target is 5.2.1.200: same ABI family, runtime
-  dependency differences unverified.
+  the armv7hl file is passed explicitly by design.
+- Unsigned RPM install path unchanged (`system_package.rs:260-266`, no `--nosignature`).
+- The container's `/usr/local/bin/sb2` is a 149-byte shim that discards `-t`, so prior "sb2
+  target" builds were silently native; the packaging path now selects a platform explicitly.
