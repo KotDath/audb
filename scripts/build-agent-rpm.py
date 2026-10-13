@@ -352,9 +352,9 @@ def main():
     host_md5 = sdk_output(['md5sum', str(candidate)]).split()[0]
     if container_md5 != host_md5:
         raise SystemExit(f'{candidate} differs from the built RPM ({host_md5} != {container_md5}); refusing to use it')
-    # This gate is for the UNSIGNED artefact only. An externally signed package reports payload
-    # digests as BAD even to the device's own rpmkeys (see docs/armv7-support.md 4.6), so it must
-    # never be reused after signing.
+    # This gate is for the UNSIGNED artefact only: rpmsign-external rewrites the file into the
+    # external-signature layout, after which rpmkeys reports payload digests as BAD even on the
+    # device's own rpm, so it must never be reused after signing.
     checksig = sdk_output(['rpmkeys', '--checksig', '-v', str(candidate)])
     lines = [line.strip() for line in checksig.splitlines()]
     bad = [line for line in lines if 'BAD' in line or 'NOT OK' in line]
