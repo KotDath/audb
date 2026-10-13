@@ -1,7 +1,7 @@
 //! Bounded, read-only readiness checks. Never run setup, input, or root bootstrap.
 use crate::{
-    devices::DeviceKind, physical_input, qmp::QmpClient, transport::DeviceTransport, CoreError,
-    CoreResult,
+    devices::DeviceKind, physical_input, qmp::QmpClient, rpm_arch, transport::DeviceTransport,
+    CoreError, CoreResult,
 };
 use audb_protocol::PROTOCOL_VERSION;
 use serde::Serialize;
@@ -16,7 +16,15 @@ if test -S /run/user/$uid/dbus/user_bus_socket; then printf 'session\ttrue\n'; e
 for tool in gdbus rpm journalctl; do
   if command -v "$tool" >/dev/null 2>&1; then printf 'tool.%s\ttrue\n' "$tool"; else printf 'tool.%s\tfalse\n' "$tool"; fi
 done
-if command -v rpm >/dev/null 2>&1; then printf 'agentRpm\t'; rpm -q --qf '%{VERSION}-%{RELEASE}\n' audb-agent 2>/dev/null || true; fi
+printf 'longBit\t%s\n' "$(getconf LONG_BIT 2>/dev/null)"
+if command -v rpm >/dev/null 2>&1; then
+  # %{_target_cpu} is the architecture rpm builds packages for; %{_arch} is its coarser
+  # family label and can differ (arm vs armv7hl on 32-bit Aurora devices).
+  printf 'rpmArch\t%s\n' "$(rpm --eval '%{_target_cpu}' 2>/dev/null)"
+  printf 'rpmArchClass\t%s\n' "$(rpm --eval '%{_arch}' 2>/dev/null)"
+  printf 'rpmLibdir\t%s\n' "$(rpm --eval '%{_libdir}' 2>/dev/null)"
+  printf 'agentRpm\t'; rpm -q --qf '%{VERSION}-%{RELEASE}\n' audb-agent 2>/dev/null || true
+fi
 "#;
 
 #[derive(Debug, Serialize)]
@@ -151,6 +159,31 @@ fn inventory(raw: &str) -> CoreResult<Value> {
         .is_none_or(str::is_empty)
     {
         return Err(CoreError::runtime("SSH inventory has no architecture"));
+    }
+    // Optional diagnostics: an unresolved rpm macro, a missing tool or a non-numeric
+    // bitness is reported as absent rather than propagated as a malformed observation.
+    for key in ["rpmArch", "rpmArchClass"] {
+        let unusable = fields
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|value| !rpm_arch::usable_arch(value));
+        if unusable {
+            fields.remove(key);
+        }
+    }
+    let bad_libdir = fields
+        .get("rpmLibdir")
+        .and_then(Value::as_str)
+        .is_none_or(|value| !rpm_arch::usable_libdir(value));
+    if bad_libdir {
+        fields.remove("rpmLibdir");
+    }
+    let bad_bitness = fields
+        .get("longBit")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.parse::<u32>().is_err());
+    if bad_bitness {
+        fields.remove("longBit");
     }
     fields.insert("uid".into(), json!(uid));
     Ok(Value::Object(fields))
@@ -317,7 +350,28 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
         &qmp,
     );
     if ssh.ok() {
-        checks.push(Check::passed("identity", json!({"uid":ssh.data["uid"],"architecture":ssh.data["architecture"],"osVersion":files.data["osVersion"],"agentRpm":ssh.data["agentRpm"]})));
+        let mut identity = json!({"uid":ssh.data["uid"],"architecture":ssh.data["architecture"],"osVersion":files.data["osVersion"],"agentRpm":ssh.data["agentRpm"]});
+        // Report the rpm platform and userspace bitness next to `uname -m`: on a 32-bit
+        // ARM userspace an aarch64 kernel makes `architecture` alone misleading.
+        if let Some(object) = identity.as_object_mut() {
+            for key in ["rpmArch", "rpmArchClass", "rpmLibdir", "longBit"] {
+                if !ssh.data[key].is_null() {
+                    object.insert(key.into(), ssh.data[key].clone());
+                }
+            }
+        }
+        checks.push(Check::passed("identity", identity));
+        let bitness = ssh.data["longBit"].as_str();
+        let machine = ssh.data["architecture"].as_str().unwrap_or_default();
+        if bitness == Some("32") && is_64bit_machine(machine) {
+            checks.push(Check::problem(
+                "architectureBitness",
+                "warning",
+                "MIXED_KERNEL_USERSPACE_BITNESS",
+                &format!("32-bit userspace runs on a 64-bit {machine} kernel"),
+                "",
+            ));
+        }
         checks.push(if ssh.data["session"] == "true" {
             Check::passed("userSession", json!({"busSocketPresent":true}))
         } else {
@@ -362,6 +416,24 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
 
 fn skipped(name: &str, message: &str, fix: &str) -> Check {
     Check::problem(name, "skipped", "CHECK_SKIPPED", message, fix)
+}
+
+/// `uname -m` values that denote a 64-bit kernel. A 32-bit userspace on such a kernel
+/// is a supported configuration, so this only ever produces an informational warning.
+fn is_64bit_machine(name: &str) -> bool {
+    matches!(
+        name,
+        "aarch64"
+            | "arm64"
+            | "x86_64"
+            | "amd64"
+            | "riscv64"
+            | "ppc64"
+            | "ppc64le"
+            | "s390x"
+            | "mips64"
+            | "loongarch64"
+    ) || name.ends_with("64")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,6 +729,35 @@ mod tests {
             100000
         );
     }
+    #[test]
+    fn inventory_reports_rpm_platform_and_userspace_bitness() {
+        // Measured shape on an Fplus T1100: aarch64 kernel, 32-bit armv7hl userspace.
+        let data = inventory(
+            "uid\t100000\narchitecture\taarch64\nsession\ttrue\nlongBit\t32\nrpmArch\tarmv7hl\nrpmArchClass\tarm\nrpmLibdir\t/usr/lib",
+        )
+        .unwrap();
+        assert_eq!(data["architecture"], "aarch64");
+        assert_eq!(data["rpmArch"], "armv7hl");
+        assert_eq!(data["rpmArchClass"], "arm");
+        assert_eq!(data["rpmLibdir"], "/usr/lib");
+        assert_eq!(data["longBit"], "32");
+        // The mixed kernel/userspace warning must not fire on a genuine 32-bit device.
+        assert!(is_64bit_machine("aarch64") && is_64bit_machine("x86_64"));
+        assert!(!is_64bit_machine("armv7hl") && !is_64bit_machine("i686"));
+    }
+
+    #[test]
+    fn unusable_optional_inventory_fields_are_absent_not_malformed() {
+        let data = inventory(
+            "uid\t100000\narchitecture\tarmv7hl\nlongBit\tunknown\nrpmArch\t%{_target_cpu}\nrpmArchClass\t%{_arch}\nrpmLibdir\t%{_libdir}",
+        )
+        .unwrap();
+        assert!(data.get("longBit").is_none());
+        assert!(data.get("rpmArch").is_none());
+        assert!(data.get("rpmArchClass").is_none());
+        assert!(data.get("rpmLibdir").is_none());
+    }
+
     #[tokio::test]
     async fn check_timeout_is_explicit_and_does_not_retry() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
