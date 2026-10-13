@@ -98,9 +98,16 @@ and reinstalling with `--reinstall`:
 | `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-10`, identity reports `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`, `longBit 32`, `architecture aarch64`; `architectureBitness` stays a warning |
 | non-touch command | `audb --device t1100 screenshot` → real PNG **2176×1600, 6336658 bytes** |
 
-`tap`/`swipe` report `available=false` while the screen is off and locked
-(`DISPLAY_NOT_READY`) — documented readiness behaviour; touch/geometry verification belongs to
-branch U.
+`tap`/`swipe` are **not available on this device**, and it is not an armv7 problem: the agent
+derives the touch surface from a DRM panel (`native_display()` enumerates `/sys/class/drm` and
+requires exactly one connected panel with `modes`, `audb-agent.rs:300-323`), while the T1100 is
+fbdev-only (`/dev/dri` and `/sys/class/drm` absent, `/dev/fb0` present). The probe error is
+swallowed at `:555-559`, so `touch` is `None` and every gesture returns
+`CAPABILITY_UNAVAILABLE: "No available uinput touchscreen/DRM panel"`. Key injection works and
+the agent's own `audb-keyboard` uinput node exists, screenshot works (2176×1600), and text is
+available via Maliit — so the 32-bit port, `/dev/uinput`, the unit's device allowance and the
+session geometry are all fine; the only missing input is a panel-size source, i.e. exactly the
+fbdev fallback that integration branch U carries. Touch verification stays with U (`docs/armv7-support.md` §4.7).
 
 ### Why signing is mandatory here (finding)
 

@@ -382,6 +382,35 @@ reproducible for the aarch64 RPM and with both build-tools images, so it is a pr
 external-signature layout, not of this build. The freshly built, unsigned RPM verifies cleanly,
 and that is the check the build script now enforces (§3 D3).
 
+### 4.7 Tap/swipe on t1100 (checked on request)
+
+**Taps and swipes do not work on this device, and it is not an armv7 issue.** The agent's touch
+backend derives the touch surface from a DRM panel: `native_display()` enumerates
+`/sys/class/drm`, keeps entries whose `status` is `connected`, requires exactly one and reads
+`modes` (`audb-agent/src/bin/audb-agent.rs:300-323`). The T1100 is **fbdev-only** — `/dev/dri`
+and `/sys/class/drm` do not exist, `/dev/fb0` does — so that probe fails, the error is swallowed
+at `:555-559` (`Input unavailable; permission service remains available`), `touch` stays `None`,
+`capabilities.tap/swipe` are reported `false`, and every gesture is refused with
+`CAPABILITY_UNAVAILABLE: "No available uinput touchscreen/DRM panel"` (`:528-530`).
+
+Measured on the device:
+
+| Probe | Result |
+| --- | --- |
+| `ls /dev/dri /sys/class/drm` | both absent |
+| `ls /dev/fb0` | present (MediaTek mt6771 fbdev) |
+| `/proc/bus/input/devices` | `mtk-tpd` (event5, `ABS=2000000 1000003`), `himax-touchscreen` (event4), **`audb-keyboard` (event6)** |
+| `audb tap 300 300` | `CAPABILITY_UNAVAILABLE … No available uinput touchscreen/DRM panel` |
+| `key` capability | `true` |
+| `screenshot` capability | `true` (real 2176×1600 PNG) |
+
+That the agent's own `audb-keyboard` uinput node exists proves `/dev/uinput`, the uinput ABI and
+the unit's `DeviceAllow=/dev/uinput rw` all work on this device, and the graphical session
+already supplies geometry (2176×1600, rotation 90). The single missing input is a panel-size
+source, i.e. exactly the fbdev fallback that integration branch U carries; this branch does not
+implement it (one writer per worktree). Touch/geometry verification therefore stays with U, as
+the task brief assigned it.
+
 ## 5. Review dispositions
 
 Architect (Sol 6.1) verdict: *conditionally approve the approach, not D2 as written*. Critic
