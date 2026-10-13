@@ -67,29 +67,44 @@ default. We record the observed values and do **not** derive `_target_cpu` from 
   `…/libaudbinput.so` (`:61`). The two C++ objects are compiled by sb2 `g++` and never pass
   through `scripts/aurora-linker.sh` (`:3-4`).
 
-### 1.3 SDK container — still blocked at design time
+### 1.3 aarch64 control device `t1` (Mashtab T1, read-only, operator-approved)
 
-`docker` (OrbStack) stopped answering mid-session (`docker version`, `docker ps`, and a raw
-`curl --unix-socket ~/.orbstack/run/docker.sock http://localhost/_ping` all time out; via the
-socket the ping times out after 12 s). It had answered earlier in the session; a `find /`
-exec inside the container filled the run and timed out just before the socket went
-unresponsive. OrbStack helper PIDs 32420/32427 remain alive. **Restarting OrbStack would stop
-the unrelated `vikunja`/`vikunja-t10` containers, so it was not done — operator approval
-requested.**
+Measured to prove the new arch rule cannot regress working 64-bit devices, and that the
+`%{_libdir}` spec change preserves their paths:
 
-Therefore, at design time the following are **unmeasured** and gate the packaging work:
+| Property | Value |
+| --- | --- |
+| `uname -m` / `getconf LONG_BIT` | `aarch64` / `64` |
+| `%{_target_cpu}` / `%{_arch}` | **`aarch64` / `aarch64`** (identical) |
+| `%{_libdir}` / `%{_lib}` | `/usr/lib64` / `lib64` |
+| `%{_target_platform}` / `/etc/rpm/platform` | `aarch64-meego-linux` |
+| loader / installed `glibc` ARCH | `/lib/ld-linux-aarch64.so.1` / `aarch64` |
 
-1. that sb2 target `armv7hl-meego-linux-gnueabi` exists and is usable (an early probe printed
-   `aarch64-meego-linux-gnu`, which is the *aarch64* target's value — a failed measurement,
-   not evidence);
-2. `gcc -dumpmachine` and the target's default float ABI (`__ARM_PCS_VFP` vs `__SOFTFP__`);
-3. Qt5 dev files (`Qt5Gui/Qt5Core/Qt5Quick/Qt5Qml/Qt5Network`) and `moc` for that target;
-4. `rpm --eval '%{_target_cpu} %{_arch} %{_libdir}'` **inside that target**;
-5. the effective rpmbuild output directory.
+Consequences: (1) D2's accepted set on an aarch64 device is exactly `{aarch64}` — the same
+value today's gate uses — so the union is provably non-regressive there, and the reviewers'
+"preferred-order" variant would be equally safe; (2) `%{_libdir}` resolves to `/usr/lib64` on
+aarch64 devices, so the spec change keeps their Qt/Maliit paths unchanged, provided the
+aarch64 **sb2 target** also reports `/usr/lib64` (checked before the spec change).
 
-The float-ABI question is independently answered by the device (§1.1), so (2) only decides
-whether explicit `-march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16` must be passed to the
-`g++` and link commands.
+### 1.4 SDK container `aurora-os-build-engine-5.2.1.200-mb2_kotdath` (measured after OrbStack recovery)
+
+| Property | Value |
+| --- | --- |
+| container arch / native rpm | `aarch64`; `rpm --eval` → `aarch64 aarch64 /usr/lib64` |
+| `sb2` | **`/usr/local/bin/sb2` is a 149-byte shim that discards `-t`/`-m` and execs its argv** — no sb2 targets exist in this container, so every earlier `sb2 -t <target>` probe silently ran the native aarch64 toolchain |
+| armv7 toolchain | `cross-armv7hl-gcc`/`cross-armv7hl-binutils` (GCC 12.3.1) → `/opt/cross/bin/armv7hl-meego-linux-gnueabi-{gcc,g++,readelf,ld,…}` |
+| `-dumpmachine` | **`armv7hl-meego-linux-gnueabi`** |
+| sysroot | `/opt/cross/armv7hl-meego-linux-gnueabi/sys-root` (loader `lib/ld-linux-armhf.so.3` present) |
+| default float ABI | **`__ARM_PCS_VFP 1`, no `__SOFTFP__`** → already hard-float |
+| default FPU | `__ARM_NEON 1` — **not** Aurora's baseline; rpm optflags are `-mfpu=vfpv3-d16`, so the flags are passed explicitly |
+| Qt5 dev in sysroot | `Qt5Core/Gui/Quick/Qml/Network = 5.6.3`, headers and `.pc` files present under `usr/lib/pkgconfig` |
+| `moc` | `/usr/bin/moc` in the container (host tool, arch-independent) |
+| Maliit dev | not needed: the RPM only installs a QML wrapper file into `%{_libdir}/maliit/plugins` |
+| `rpm --target armv7hl-meego-linux --eval` | **`target_cpu=armv7hl arch=arm libdir=/usr/lib lib=lib`** — reproduces the device divergence exactly |
+| trivial link | `ELF32`, `ARM`, `Flags: … hard-float ABI`, `Tag_ABI_VFP_args: VFP registers`, interpreter `/lib/ld-linux-armhf.so.3` |
+| Qt5 compile **and link** smoke test | executable and shared object both link; both carry `Tag_ABI_VFP_args` and the armhf interpreter |
+
+This is why the design no longer treats `--target` as a target selector: the container selects a platform through its **compiler driver** and through `rpm --target`, and the build script asserts both.
 
 ---
 
@@ -119,6 +134,11 @@ whether explicit `-march=armv7-a -mfloat-abi=hard -mfpu=vfpv3-d16` must be passe
   is a vendor string, not the ABI: the device runs `/lib/ld-linux-armhf.so.3` with
   `-mfloat-abi=hard -mfpu=vfpv3-d16`. A soft-float Rust target would ask for
   `/lib/ld-linux.so.3` and is wrong.
+- Compiler driver (measured, §1.4): `/opt/cross/bin/armv7hl-meego-linux-gnueabi-gcc`. It is
+  hard-float **by default** (`__ARM_PCS_VFP`, no `__SOFTFP__`), but its default FPU is NEON,
+  which is *not* Aurora's `armv7hl` baseline — so `-march=armv7-a -mfloat-abi=hard
+  -mfpu=vfpv3-d16` is passed explicitly to both `g++` commands and to the Rust link line
+  (`-C link-arg=…`, so the driver applies it).
 - `libc::timeval` is 8 bytes on 32-bit ARM and 16 on aarch64, so the `#[repr(C)] InputEvent`
   in `audb-agent/src/bin/audb-agent.rs:26-31` (16 bytes on this triple) matches what an
   aarch64 kernel's compat `input_event` expects. A `cfg`-gated compile-time assertion pins
@@ -180,11 +200,13 @@ an `aarch64` package is rejected. On an aarch64 device tokens are `{aarch64}` (o
 
 - `packaging/audb-agent.spec:45-46` → `%{_libdir}/qt5/qml/Audb` and
   `%{_libdir}/maliit/plugins/zz-audb-input.qml`. `spec:47` stays literal.
-- `scripts/build-agent-rpm.py` probes `rpm --eval '%{_target_cpu} %{_arch} %{_libdir}'` **in
-  the selected sb2 target** (the same rpm that runs rpmbuild) and uses the resulting libdir
-  for the staging path — stripping the leading `/` before joining it onto the staging dir, so
-  a target `_libdir` can never escape the staging tree. `%{_libdir}` is an install path inside
-  the payload and is never used as a host or sb2 filesystem path.
+- `scripts/build-agent-rpm.py` selects a platform preset (`--platform aarch64|armv7hl`)
+  that fixes the compiler driver, sysroot, Rust triple and `rpm --target`, then probes
+  `rpm [--target T] --eval '%{_target_cpu} %{_arch} %{_libdir}'` **in the container** (the
+  same rpm that runs rpmbuild). `%{_libdir}` from that probe is the staging path — with the
+  leading `/` stripped before joining it onto the staging dir, so a target libdir can never
+  escape the staging tree — and `%{_libdir}` is never used as a host or container filesystem
+  path.
 - `--arch` becomes **assertion-only** (it may fail a build, never choose a path); it must not
   override the probe. The effective rpmbuild context is discovered, not predicted: the topdir
   is wiped before the build and the single produced RPM is found by glob, then asserted with
@@ -201,9 +223,9 @@ an `aarch64` package is rejected. On an aarch64 device tokens are `{aarch64}` (o
   assertions) without Docker, and each build writes `target/agent-rpm/<arch>/build-receipt.json`
   recording the target, rust target, arch, libdir, `gcc -dumpmachine`, the real container
   output directory and the packaged payload.
-- `scripts/aurora-linker.sh` refuses to link when the sb2 target's `gcc -dumpmachine` does
-  not match the family implied by the Cargo triple, so a mismatched `--target`/`--rust-target`
-  cannot silently link against another platform's libc.
+- `scripts/aurora-linker.sh` refuses to link when the selected compiler driver's
+  `-dumpmachine` does not match the family implied by the Cargo triple, so a mismatched
+  platform/Rust triple cannot silently link against another platform's libc.
 
 ### D4 — Doctor: additive, diagnostic only
 
@@ -287,6 +309,41 @@ future libc `timeval` change cannot silently desync the uinput compat ABI. `Uinp
 has no `time_t`/pointer fields and needs none.
 
 ---
+
+### 4.4 Measured results (commit `a051558`)
+
+**armv7hl RPM built**: `target/agent-rpm/armv7hl/audb-agent-0.3.0-10.armv7hl.rpm`
+(receipt `build-receipt.json`: platform armv7hl, libdir `/usr/lib`, cc the cross gcc,
+`machine=armv7hl-meego-linux-gnueabi`, container output dir
+`/home/mersdk/audb-agent-rpmbuild-armv7hl/RPMS/armv7hl`, `rpmArchHeader=armv7hl`, payload
+all under `/usr/lib` with no `lib64` entries).
+
+Independent payload verification (extracted with `rpm2cpio`, not trusting the script):
+
+| ELF | class/machine | ABI flags | VFP args | interpreter |
+| --- | --- | --- | --- | --- |
+| `usr/sbin/audb-agent` | ELF32/ARM | `0x5000400`, hard-float ABI | 1 | `/lib/ld-linux-armhf.so.3` |
+| `usr/bin/audb-agentctl` | ELF32/ARM | same | 1 | `/lib/ld-linux-armhf.so.3` |
+| `usr/libexec/audb-agent/display` | ELF32/ARM | same | 1 | `/lib/ld-linux-armhf.so.3` |
+| `usr/lib/qt5/qml/Audb/Input/libaudbinput.so` | ELF32/ARM | same | 1 | none (shared object) |
+
+Symbol floors: Rust binaries require at most `GLIBC_2.34`; the C++ artifacts require
+`CXXABI_1.3`/`GLIBCXX_3.4`. Device glibc is 2.38 and `libstdc++-12.3.1…armv7hl` is present, so
+both are satisfied. Device runtime dependencies all resolve: `libQt5Core/Gui/Quick/Qml/
+Network.so.5` exist in `/usr/lib`, device Qt is **5.6.3 — the same version as the SDK sysroot**,
+and `libgcc_s.so.1`/`libstdc++.so.6` are present.
+
+**aarch64 non-regression**: `--platform aarch64` builds `ARCH=aarch64` with libdir
+`/usr/lib64` and a payload identical in layout to the previous hardcoded paths
+(`/usr/lib64/qt5/qml/Audb…`, `/usr/lib64/maliit/plugins/…`, `/usr/lib/systemd/system/…`).
+
+**Gate proven on the real device, without the password.** With a deliberately wrong
+`--root-password-stdin`, `setup-device --check-only` fails at `phase: "check"` with devel-su
+`Auth failed`/`OUTCOME_UNKNOWN`, carrying `package.arch = armv7hl`, `retried: false`,
+`stagingCleanup: true` (evidence `target/armv7/evidence/gate-probe-wrong-password.json`).
+Reaching the privileged step means the new gate **accepted** the armv7hl package; the old gate
+returned `Package architecture 'armv7hl' does not match device 'arm'` before any root access.
+Staging was cleaned and `rpm -q audb-agent` still reports the package is not installed.
 
 ## 5. Review dispositions
 
@@ -372,21 +429,24 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 
 ## 7. Residual risks / not yet verified
 
-- **SDK container unreachable (OrbStack docker socket unresponsive): the armv7 hard-float
-  sysroot measurement, Qt5/Maliit dev availability, and the RPM build itself are pending.**
-  The packaging changes are `py_compile`/`--self-test`/`sh -n` verified only; neither the
-  aarch64 nor the armv7hl rpmbuild path has been re-executed, so `%{_libdir}` expansion in the
-  spec and the probe logic are unproven against the SDK until it is reachable.
-- `aarch64` devices' `%{_target_cpu}` / `%{_libdir}`: unmeasured (no approval to probe
-  non-t1100 devices). D2's union makes the gate safe without it; the values are still wanted
-  for documentation and for the optional preferred-order narrowing.
+- **On-device install is the one remaining step and needs the t1100 devel-su password**
+  (root SSH is denied, `--root-password-stdin` is the supported path). Everything up to and
+  including the arch gate and `rpm --test` precondition has been exercised; see §4.4.
+- The container's `sb2` shim discards `-t`; a future re-imaging could change the cross layout.
+  `--self-test` asserts the preset paths, and the build re-verifies `-dumpmachine` and the rpm
+  contract, so a change fails closed rather than building for the wrong platform.
+- The armv7 cross gcc defaults to NEON while Aurora's baseline is `vfpv3-d16`; the flags are
+  passed explicitly, and the device CPU does advertise NEON (`asimd`), but no second armv7hl
+  device without NEON was tested.
+- Required glibc floor for the Rust binaries is 2.34 (from the sysroot), fine for t1100
+  (2.38) but a real constraint for older Aurora 5.x.
 - Unsigned RPM: install runs plain `rpm -ivh`/`-Uvh` with no `--nosignature`
   (`system_package.rs:260-266`); if t1100 enforces signatures, install fails and signing keys
   need separate approval.
-- Device is Aurora 5.2.0.180 while the SDK target is 5.2.1.200 — same ABI family, unverified
-  runtime dependency differences (Qt5/Maliit, GLIBCXX floors).
-- uinput `InputEvent` layout across the 32/64-bit boundary is reasoned, not device-verified;
-  touch verification belongs to branch U.
+- Device is Aurora 5.2.0.180 while the SDK sysroot is 5.2.1.200 — Qt is 5.6.3 on both sides and
+  the needed sonames exist, but the agent has not run there yet.
+- uinput `InputEvent` layout across the 32/64-bit boundary is reasoned and compile-pinned, not
+  device-verified; touch verification belongs to branch U.
 - `armv7hnl`/NEON and other 32-bit ARM devices are untested by design.
 
 ## 8. Implementation status
@@ -398,6 +458,7 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 | `1f77fbc` | doctor rpm arch / libdir / bitness fields + warning | same suite; new parser and warning tests |
 | `c63d0c9` | spec `%{_libdir}`, target-derived arch/libdir, ELF and payload assertions, linker machine guard | `py_compile`, `--self-test`, `sh -n`. **Not re-executed against the SDK** |
 | `56b02fb` | compile-time pin of the 32-bit uinput event layout | builds for `armv7-unknown-linux-gnueabihf`; assertion fires when perturbed |
+| `a051558` | real cross toolchain driver: `--platform` presets, `rpm --target` probe, `AUDB_CROSS_CC` | armv7hl RPM built and verified; aarch64 rebuild unchanged (§4.4) |
 
 Host checks that can be run today: `cargo test -p audb-core -p audb-protocol`,
 `cargo clippy -p audb-core -p audb-protocol -p audb-client --all-targets`,
@@ -408,8 +469,9 @@ Linux-only, so it cannot be built for the macOS host at all).
 `target_pointer_width="32"` and **no** `feature="neon"`, so `-C target-feature=-neon` is not
 needed; `cargo check -p audb-agent --target armv7-unknown-linux-gnueabihf` compiles cleanly.
 
-Pending: the SDK probe, the armv7hl RPM, its `%{ARCH}`/payload assertions, the t1100
-`--check-only` transaction, and the on-device install/doctor evidence.
+Pending: the on-device install + service restart + post-install doctor and non-touch command
+(needs the t1100 devel-su password); everything before that point is verified, including the
+arch gate on the real device (§4.4).
 
 ### 8.1 Done since the reviews
 
