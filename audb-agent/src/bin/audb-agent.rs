@@ -52,7 +52,6 @@ struct Touch {
     file: File,
     active: bool,
     tracking: i32,
-    display: Display,
 }
 impl Touch {
     fn create(display: Display) -> io::Result<Self> {
@@ -105,7 +104,6 @@ impl Touch {
             file,
             active: false,
             tracking: 100,
-            display,
         })
     }
     fn event(&mut self, kind: u16, code: u16, value: i32) -> io::Result<()> {
@@ -300,13 +298,13 @@ fn pause(duration: Duration, socket: &UnixStream) -> io::Result<()> {
         std::thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
+#[cfg(not(target_os = "linux"))]
+fn peer_allowed(_socket: &UnixStream, _input_gid: libc::gid_t) -> Option<libc::uid_t> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn peer_allowed(socket: &UnixStream, input_gid: libc::gid_t) -> Option<libc::uid_t> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (socket, input_gid);
-        None
-    }
-    #[cfg(target_os = "linux")]
     {
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -521,9 +519,15 @@ fn handle(
                 });
             };
             // Only gestures depend on the kernel panel: a discovered-but-mismatched panel must
-            // not block an otherwise working screenshot.
-            if display.native_width != touch.display.native_width
-                || display.native_height != touch.display.native_height
+            // not block an otherwise working screenshot. The session is compared against the
+            // discovered panel (not the uinput node) so the readiness report and this guard read
+            // one source of truth; `touch` exists only when discovery succeeded.
+            let Ok(geometry) = panel else {
+                error_code = "CAPABILITY_UNAVAILABLE";
+                return Err("No available uinput touchscreen".into());
+            };
+            if display.native_width != geometry.display.native_width
+                || display.native_height != geometry.display.native_height
             {
                 return Err("Graphical session geometry does not match kernel panel".into());
             }
@@ -680,11 +684,6 @@ mod tests {
             file,
             active: false,
             tracking: 100,
-            display: Display {
-                native_width: 1200,
-                native_height: 2000,
-                rotation: 0,
-            },
         };
         let (server, client) = UnixStream::pair().unwrap();
         let t = std::thread::spawn(move || {
@@ -736,11 +735,10 @@ mod tests {
                 rotation: 0,
             },
             source: audb_agent::panel::PanelSource::Fbdev,
-            node: "fb0".into(),
-        })
+            node: "fb0".into(),        })
     }
 
-    fn response(
+    fn agent_response(
         touch: &mut Option<Touch>,
         panel: &Result<PanelGeometry, PanelError>,
         body: &str,
@@ -757,23 +755,19 @@ mod tests {
         handle(touch, panel, &mut keyboard, &agent, 0)
     }
 
-    fn touch_node(width: i32, height: i32) -> Touch {
+    /// The uinput node carries no geometry: the kernel panel is the single source of truth.
+    fn touch_node() -> Touch {
         Touch {
             file: tempfile::tempfile().unwrap(),
             active: false,
             tracking: 100,
-            display: Display {
-                native_width: width,
-                native_height: height,
-                rotation: 0,
-            },
         }
     }
 
     #[test]
     fn session_geometry_mismatch_stays_input_failed() {
-        let mut touch = Some(touch_node(720, 1600));
-        let response = response(
+        let mut touch = Some(touch_node());
+        let response = agent_response(
             &mut touch,
             &panel_stub(720, 1600),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
@@ -790,7 +784,7 @@ mod tests {
     fn status_reports_panel_failure_without_using_request_display() {
         let mut touch = None;
         let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
-        let response = response(
+        let response = agent_response(
             &mut touch,
             &Err(error),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":720,"rotation":90},"action":{"command":"status"}}"#,
@@ -809,7 +803,7 @@ mod tests {
     fn tap_without_panel_names_geometry_reason() {
         let mut touch = None;
         let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
-        let response = response(
+        let response = agent_response(
             &mut touch,
             &Err(error),
             r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
@@ -824,8 +818,8 @@ mod tests {
     /// geometry guard belongs to gestures only.
     #[test]
     fn mismatched_panel_does_not_block_screenshot() {
-        let mut touch = Some(touch_node(720, 1600));
-        let response = response(
+        let mut touch = Some(touch_node());
+        let response = agent_response(
             &mut touch,
             &panel_stub(720, 1600),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"screenshot"}}"#,
@@ -840,8 +834,8 @@ mod tests {
     /// Readiness must be able to see a session/panel disagreement before the next gesture fails.
     #[test]
     fn status_reports_panel_provenance_and_session_match() {
-        let mut touch = Some(touch_node(1600, 2176));
-        let matched = response(
+        let mut touch = Some(touch_node());
+        let matched = agent_response(
             &mut touch,
             &panel_stub(1600, 2176),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":2176,"rotation":90},"action":{"command":"status"}}"#,
@@ -853,11 +847,26 @@ mod tests {
         assert_eq!(matched["data"]["panel"]["matchesSession"], true);
         assert_eq!(matched["data"]["capabilities"]["tap"], true);
 
-        let mismatched = response(
+        let mismatched = agent_response(
             &mut touch,
             &panel_stub(1600, 2176),
             r#"{"protocolVersion":3,"display":{"nativeWidth":2176,"nativeHeight":1600,"rotation":90},"action":{"command":"status"}}"#,
         );
         assert_eq!(mismatched["data"]["panel"]["matchesSession"], false);
+    }
+
+    /// A status request without session geometry has nothing to compare, so it must not claim a
+    /// session match either way.
+    #[test]
+    fn status_without_session_geometry_omits_matches_session() {
+        let mut touch = Some(touch_node());
+        let response = agent_response(
+            &mut touch,
+            &panel_stub(1600, 2176),
+            r#"{"protocolVersion":3,"action":{"command":"status"}}"#,
+        );
+        assert_eq!(response["data"]["panel"]["source"], "fbdev");
+        assert_eq!(response["data"]["panel"]["nativeWidth"], 1600);
+        assert!(response["data"]["panel"].get("matchesSession").is_none());
     }
 }

@@ -27,14 +27,14 @@ impl PanelSource {
 }
 
 /// The kernel panel together with the node it was read from.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PanelGeometry {
     pub display: Display,
     pub source: PanelSource,
     pub node: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PanelError {
     Unavailable(String),
     Ambiguous(String),
@@ -71,6 +71,7 @@ impl std::fmt::Display for PanelError {
     }
 }
 
+impl std::error::Error for PanelError {}
 struct DrmScan {
     connected: Vec<PathBuf>,
     saw_connector: bool,
@@ -143,15 +144,36 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         let entry = entry.map_err(|error| {
             PanelError::ReadFailed(format!("Cannot read {}: {error}", dir.display()))
         })?;
-        // `version` is a file. Connectors are directories. Sysfs publishes
-        // them as symlinks, and `DirEntry::metadata` does not follow those.
-        let metadata = fs::metadata(entry.path()).map_err(|error| {
-            PanelError::ReadFailed(format!("Cannot read {}: {error}", entry.path().display()))
-        })?;
+        // A dangling connector symlink is a leftover rather than a panel, so skip that entry
+        // instead of failing the whole scan.
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(PanelError::ReadFailed(format!(
+                    "Cannot read {}: {error}",
+                    entry.path().display()
+                )))
+            }
+        };
         if !metadata.is_dir() {
             continue;
         }
+        // `version` is a file and `cardN` is the card node; connectors are
+        // `card<N>-<connector>-<type>-<id>`. A connector must be honoured even when its status
+        // file cannot be read, otherwise an unreadable connector would silently fall back to
+        // fbdev on a device that does have DRM.
+        let connector = is_connector(&entry.file_name().to_string_lossy());
+        if connector {
+            scan.saw_connector = true;
+        }
         match read_text(&entry.path().join("status"))? {
+            None if connector => {
+                return Err(PanelError::ReadFailed(format!(
+                    "DRM connector {} is missing its status file",
+                    entry.path().display()
+                )))
+            }
             None => {}
             Some(status) => {
                 scan.saw_connector = true;
@@ -162,6 +184,16 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         }
     }
     Ok(scan)
+}
+
+/// DRM connectors are published as `card<N>-<connector>-<type>-<id>` (for example
+/// `card0-DSI-1`). `card0` itself and `version` are not connectors.
+fn is_connector(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("card") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest.as_bytes().get(digits) == Some(&b'-')
 }
 
 fn fbdev_panel(sysfs: &Path) -> Result<PanelGeometry, PanelError> {
@@ -389,6 +421,43 @@ mod tests {
             panel.display.native_height, 6528,
             "virtual_size is a buffer, not the panel"
         );
+    }
+
+    /// A connector whose status file cannot be read must not silently fall back to fbdev.
+    #[test]
+    fn unreadable_connector_status_does_not_fall_back_to_fbdev() {
+        let dir = sysfs(&[
+            ("class/drm/card0-DSI-1/modes", "1080x2340\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        let error = panel_geometry(dir.path()).unwrap_err();
+        assert_eq!(error.reason_code(), "PANEL_GEOMETRY_READ_FAILED");
+    }
+
+    /// A dangling connector symlink is a leftover, not a panel: fbdev stays usable.
+    #[test]
+    fn dangling_connector_symlink_still_uses_fbdev() {
+        let dir = sysfs(&[
+            ("class/drm/version", "drm 1.1.0 20060810\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        std::os::unix::fs::symlink(
+            dir.path().join("devices/missing"),
+            dir.path().join("class/drm/card0-DSI-1"),
+        )
+        .unwrap();
+        assert_eq!(geometry(dir.path()).unwrap(), (720, 1600));
+    }
+
+    /// The card node and the `version` file are not connectors, so fbdev is still selected.
+    #[test]
+    fn card_node_and_version_are_not_connectors() {
+        let dir = sysfs(&[
+            ("class/drm/version", "drm 1.1.0 20060810\n"),
+            ("class/drm/card0/uevent", "DEVTYPE=drm_minor\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        assert_eq!(geometry(dir.path()).unwrap(), (720, 1600));
     }
 
     /// Ambiguous framebuffers must name the nodes, not only the count.
