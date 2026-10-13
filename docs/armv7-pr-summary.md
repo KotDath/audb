@@ -83,26 +83,40 @@ aarch64.
   `rpmArchClass: arm`, `rpmLibdir: /usr/lib`, plus the new `architectureBitness` warning.
   Evidence: `target/armv7/evidence/doctor-t1100-private.json`, `verification-battery.txt`.
 
-## Installed on t1100 — but not yet executable (signing required)
+## Working end-to-end on t1100
 
-The operator installed the armv7hl RPM with the devel-su password. Evidence gathered:
+After signing the armv7hl RPM with the Regular development certificate (`audb package sign`)
+and reinstalling with `--reinstall`:
 
-- `rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}' audb-agent` → **`audb-agent-0.3.0-10.armv7hl`**
-- `rpm -ql audb-agent` → every Qt/Maliit path under **`/usr/lib`** (the libdir fix lands correctly on real hardware), systemd unit under `/usr/lib/systemd/system`
-- `file /usr/sbin/audb-agent` → `ELF 32-bit LSB pie, ARM, EABI5, interpreter /lib/ld-linux-armhf.so.3`
-- `systemctl is-enabled` → `enabled`; `systemctl is-active` → **`failed`**, `ExecStart` `status=203/EXEC`
-- `audb doctor` → `agent: failed REMOTE_COMMAND_FAILED … /usr/bin/audb-agentctl: Permission denied` (exit 126)
+| Evidence | Result |
+| --- | --- |
+| `rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}'` | `audb-agent-0.3.0-10.armv7hl` |
+| `rpm -ql` | Qt/Maliit paths under `/usr/lib` (libdir fix on real hardware) |
+| `systemctl status audb-agent` | **`active (running)`**, `/usr/sbin/audb-agent` |
+| `rpm -V audb-agent` | clean — installed files match the package |
+| `getfattr` on all four payload files | `security.appid="audb-agent"` + `security.ima=0s…` |
+| `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-10`, identity reports `rpmArch armv7hl`, `rpmArchClass arm`, `rpmLibdir /usr/lib`, `longBit 32`, `architecture aarch64`; `architectureBitness` stays a warning |
+| non-touch command | `audb --device t1100 screenshot` → real PNG **2176×1600, 6336658 bytes** |
 
-**Root cause: the package is unsigned, so the device's IMA/EVM appraisal refuses to map its
-files for execution.** `/sys/kernel/security/{ima,evm,lsm}` are present; a stock binary carries
-attestation attributes (`getfattr /usr/sbin/sshd` → `security.appid="openssh-server"`,
-`security.ima=0sAwIS0c/…`) while ours carries none; the loader reports `failed to map segment
-from shared object` and direct execution gives `Permission denied`; and the install warned
-`Plugin sweeper: hook tsm_post failed` — the hook that blesses a trusted package's files.
+`tap`/`swipe` report `available=false` while the screen is off and locked
+(`DISPLAY_NOT_READY`) — documented readiness behaviour; touch/geometry verification belongs to
+branch U.
 
-**Blocked on an approval-gated action:** sign the armv7hl RPM with the existing Regular
-development certificate via `audb package sign` (its documented workflow), then reinstall with
-`--reinstall` (same NVR). Not performed — the brief requires explicit approval for signing.
+### Why signing is mandatory here (finding)
+
+The unsigned package installed fine but its files could not execute. The device boots with
+`ima_appraise=enforce` and ships `rpm-plugin-external-ima`, which applies
+`security.ima`/`security.appid` from the package's **external signature**; unsigned, there is
+nothing to apply, so IMA appraisal denies execution (`203/EXEC`, loader `failed to map segment
+from shared object`, `Permission denied`, exit 126) and the install warns
+`Plugin sweeper: hook tsm_post failed`. After signing, all four files are attributed and the
+service runs.
+
+`rpmkeys --checksig` reports `Payload … digest: BAD` for externally signed packages — on the
+device's own rpm as well as in the SDK, for aarch64 too and with both build-tools images — so
+that is a property of Aurora's external-signature layout, not of this build. The freshly built
+unsigned RPM verifies cleanly, and the build script now enforces exactly that (plus a
+container-vs-host digest comparison) before anything can sign or ship it.
 
 ## Other findings
 

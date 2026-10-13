@@ -345,15 +345,42 @@ Reaching the privileged step means the new gate **accepted** the armv7hl package
 returned `Package architecture 'armv7hl' does not match device 'arm'` before any root access.
 Staging was cleaned and `rpm -q audb-agent` still reports the package is not installed.
 
-### 4.5 On-device install outcome (unsigned RPM)
+### 4.5 On-device outcome (signed RPM)
 
-Installed by the operator with the devel-su password supplied at the prompt:
-`rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}'` → **`audb-agent-0.3.0-10.armv7hl`**, and
-`rpm -ql` shows every Qt/Maliit path under `/usr/lib` (proving the libdir fix on real hardware),
-with `file /usr/sbin/audb-agent` → `ELF 32-bit LSB pie, ARM, EABI5, interpreter
-/lib/ld-linux-armhf.so.3`. The service is `enabled` but `failed` and the agent is unreachable,
-for the signing/IMA reason in §7. Evidence:
-`target/armv7/evidence/doctor-t1100-postinstall.json`.
+Signed with the Regular development certificate (`audb package sign`) and reinstalled with
+`--reinstall`: **`audb-agent-0.3.0-10.armv7hl`** is installed and the service is
+**active (running)**.
+
+| Evidence | Result |
+| --- | --- |
+| `systemctl status audb-agent` | `active (running)`, `Main PID 4754 /usr/sbin/audb-agent` |
+| `rpm -V audb-agent` | clean — every installed file matches the package |
+| `getfattr` on all four payload files | each carries `security.appid="audb-agent"` and `security.ima=0s…` |
+| `audb-agentctl` execution | runs (previously `Permission denied`) |
+| `audb doctor` | **`healthy: true`**, `agent: passed` (backend `uinput`), `agentRpm 0.3.0-10`, `identity` reports `rpmArch armv7hl` / `rpmArchClass arm` / `rpmLibdir /usr/lib` / `longBit 32` / `architecture aarch64`, and `architectureBitness` is a warning — so it does not make the device unhealthy, as designed |
+| non-touch command | `audb --device t1100 screenshot` → real PNG, **2176×1600, 6336658 bytes** |
+
+`tap`/`swipe` report `available=false` with the screen off and locked (`DISPLAY_NOT_READY`) —
+the documented readiness behaviour; touch/geometry verification belongs to branch U.
+
+Evidence files: `target/armv7/evidence/doctor-t1100-signed-install.json`,
+`screenshot-t1100.{json,png}`.
+
+### 4.6 Signing is mandatory on this device class (finding)
+
+The unsigned package installed but its files could not execute: the device boots with
+`ima_appraise=enforce` on the kernel command line and ships `rpm-plugin-external-ima`, which
+applies `security.ima`/`security.appid` from the package's **external signature**. Without a
+signature there is nothing to apply, so IMA appraisal denies execution (`systemctl`
+`203/EXEC`, loader `failed to map segment from shared object`, `Permission denied`, exit 126),
+and the install warns `Plugin sweeper: hook tsm_post failed`. After signing, all four files are
+attributed and the service runs.
+
+Note: `rpmkeys --checksig` reports `Payload … digest: BAD` for **externally signed** packages
+(Aurora's `rpmsign-external` layout) on the device's own rpm 4.16.1.3 as well as in the SDK —
+reproducible for the aarch64 RPM and with both build-tools images, so it is a property of the
+external-signature layout, not of this build. The freshly built, unsigned RPM verifies cleanly,
+and that is the check the build script now enforces (§3 D3).
 
 ## 5. Review dispositions
 
@@ -439,38 +466,23 @@ config discovery honours `XDG_CONFIG_HOME` when set — the intent the tests alr
 
 ## 7. Residual risks / not yet verified
 
-- **On-device install is blocked by package signing, now diagnosed precisely.** The unsigned
-  armv7hl RPM *installs* on t1100 (`rpm -q audb-agent` → `audb-agent-0.3.0-10.armv7hl`, payload
-  under `/usr/lib`, binary `ELF 32-bit LSB pie, ARM, EABI5, interpreter
-  /lib/ld-linux-armhf.so.3`), but its files cannot be **executed**:
-  - `systemctl status audb-agent` → `failed (Result: exit-code)`, `ExecStart` `status=203/EXEC`;
-  - `/lib/ld-linux-armhf.so.3 /usr/sbin/audb-agent` → `failed to map segment from shared object`;
-  - direct execution by any user → `Permission denied`, and `audb doctor` reports
-    `REMOTE_COMMAND_FAILED … /usr/bin/audb-agentctl: Permission denied` (exit 126);
-  - the device enforces IMA/EVM (`/sys/kernel/security/{ima,evm,lsm}` present) and a stock
-    binary carries the attestation attributes while ours carries none:
-    `getfattr /usr/sbin/sshd` → `security.appid="openssh-server"`,
-    `security.ima=0sAwIS0c/…`; `getfattr /usr/sbin/audb-agent` → **no attributes**;
-  - the install itself warned `Plugin sweeper: hook tsm_post failed` — the hook that blesses a
-    trusted package's files is what applies those attributes.
-
-  This is the residual risk predicted earlier, in a sharper form: the unsigned package installs
-  but is not executable, so **signing the RPM (Regular development certificate, via
-  `audb package sign`) is on the critical path** for a working service. Signing is an
-  approval-gated step per the task brief and has not been performed.
+- **On-device install is done** (signed, service running, doctor healthy, screenshot captured —
+  §4.5). Signing the RPM is not optional on this device class (§4.6): the unsigned package
+  installs but cannot execute.
 - The container's `sb2` shim discards `-t`; a future re-imaging could change the cross layout.
-  `--self-test` asserts the preset paths, and the build re-verifies `-dumpmachine` and the rpm
-  contract, so a change fails closed rather than building for the wrong platform.
+  `--self-test` asserts the preset paths, and the build re-verifies `-dumpmachine`, the rpm
+  contract, the transferred copy's digest and the copy's own checksig, so a change fails closed
+  rather than building or shipping for the wrong platform.
 - The armv7 cross gcc defaults to NEON while Aurora's baseline is `vfpv3-d16`; the flags are
   passed explicitly, and the device CPU does advertise NEON (`asimd`), but no second armv7hl
   device without NEON was tested.
 - Required glibc floor for the Rust binaries is 2.34 (from the sysroot), fine for t1100
   (2.38) but a real constraint for older Aurora 5.x.
 - Unsigned RPM: the install path runs plain `rpm -ivh`/`-Uvh` with no `--nosignature`
-  (`system_package.rs:260-266`) and it succeeds on t1100 — but see the IMA/EVM finding above:
-  installation without a valid package signature yields files that the kernel refuses to
-  execute. The signed-RPM workflow in `README.md` (`audb package sign`, Regular development
-  certificate) is therefore required, not optional, on this device class.
+  (`system_package.rs:260-266`) and it succeeds on t1100 — but the files are then not
+  executable, because the device enforces IMA appraisal and only a signed package's files
+  receive `security.ima` (§4.6). On this device class the signed-RPM workflow in `README.md`
+  (`audb package sign`) is required, not optional.
 - Device is Aurora 5.2.0.180 while the SDK sysroot is 5.2.1.200 — Qt is 5.6.3 on both sides and
   the needed sonames exist, but the agent has not run there yet.
 - uinput `InputEvent` layout across the 32/64-bit boundary is reasoned and compile-pinned, not
