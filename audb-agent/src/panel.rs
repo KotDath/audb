@@ -9,6 +9,31 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Where the kernel-native panel size was read from. Reported so a device can be
+/// diagnosed without inferring the source from which probe happened to succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelSource {
+    Drm,
+    Fbdev,
+}
+
+impl PanelSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drm => "drm",
+            Self::Fbdev => "fbdev",
+        }
+    }
+}
+
+/// The kernel panel together with the node it was read from.
+#[derive(Debug, Clone)]
+pub struct PanelGeometry {
+    pub display: Display,
+    pub source: PanelSource,
+    pub node: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum PanelError {
     Unavailable(String),
@@ -51,12 +76,13 @@ struct DrmScan {
     saw_connector: bool,
 }
 
-pub fn panel_geometry(sysfs: &Path) -> Result<Display, PanelError> {
+pub fn panel_geometry(sysfs: &Path) -> Result<PanelGeometry, PanelError> {
     let scan = drm_scan(sysfs)?;
     if scan.connected.len() > 1 {
         return Err(PanelError::Ambiguous(format!(
-            "Expected one connected DRM panel, found {}",
-            scan.connected.len()
+            "Expected one connected DRM panel, found {}: {}",
+            scan.connected.len(),
+            node_names(&scan.connected)
         )));
     }
     if let Some(connector) = scan.connected.first() {
@@ -67,7 +93,7 @@ pub fn panel_geometry(sysfs: &Path) -> Result<Display, PanelError> {
             ))
         })?;
         let (width, height) = parse_drm_mode(&modes)?;
-        return display_from(width, height);
+        return geometry_from(width, height, PanelSource::Drm, connector);
     }
     if scan.saw_connector {
         return Err(PanelError::Unavailable(
@@ -75,6 +101,21 @@ pub fn panel_geometry(sysfs: &Path) -> Result<Display, PanelError> {
         ));
     }
     fbdev_panel(sysfs)
+}
+
+fn node_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("panel")
+        .to_owned()
+}
+
+fn node_names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| node_name(path))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
@@ -123,7 +164,7 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
     Ok(scan)
 }
 
-fn fbdev_panel(sysfs: &Path) -> Result<Display, PanelError> {
+fn fbdev_panel(sysfs: &Path) -> Result<PanelGeometry, PanelError> {
     let dir = sysfs.join("class/graphics");
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -153,8 +194,9 @@ fn fbdev_panel(sysfs: &Path) -> Result<Display, PanelError> {
     }
     if framebuffers.len() > 1 {
         return Err(PanelError::Ambiguous(format!(
-            "Expected one framebuffer, found {}",
-            framebuffers.len()
+            "Expected one framebuffer, found {}: {}",
+            framebuffers.len(),
+            node_names(&framebuffers)
         )));
     }
     let Some(framebuffer) = framebuffers.first() else {
@@ -172,7 +214,7 @@ fn is_framebuffer(name: &str) -> bool {
     !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn framebuffer_size(fb: &Path) -> Result<Display, PanelError> {
+fn framebuffer_size(fb: &Path) -> Result<PanelGeometry, PanelError> {
     let mode = read_text(&fb.join("mode"))?;
     let text = match mode {
         Some(text) if !text.trim().is_empty() => text,
@@ -189,7 +231,7 @@ fn framebuffer_size(fb: &Path) -> Result<Display, PanelError> {
         },
     };
     let (width, height) = parse_fbdev_mode(&text)?;
-    display_from(width, height)
+    geometry_from(width, height, PanelSource::Fbdev, fb)
 }
 
 fn read_text(path: &Path) -> Result<Option<String>, PanelError> {
@@ -274,7 +316,12 @@ fn parse_fb_i32(token: &str) -> Result<i32, PanelError> {
     })
 }
 
-fn display_from(width: i32, height: i32) -> Result<Display, PanelError> {
+fn geometry_from(
+    width: i32,
+    height: i32,
+    source: PanelSource,
+    node: &Path,
+) -> Result<PanelGeometry, PanelError> {
     let display = Display {
         native_width: width,
         native_height: height,
@@ -283,7 +330,11 @@ fn display_from(width: i32, height: i32) -> Result<Display, PanelError> {
     display.validate().map_err(|_| {
         PanelError::OutOfRange(format!("Panel size {width}x{height} is outside 2..=16384"))
     })?;
-    Ok(display)
+    Ok(PanelGeometry {
+        display,
+        source,
+        node: node_name(node),
+    })
 }
 
 #[cfg(test)]
@@ -304,10 +355,56 @@ mod tests {
     }
 
     fn geometry(sysfs_root: &Path) -> Result<(i32, i32), PanelError> {
-        panel_geometry(sysfs_root).map(|display| {
-            assert_eq!(display.rotation, 0, "kernel geometry is not orientation");
-            (display.native_width, display.native_height)
+        panel_geometry(sysfs_root).map(|panel| {
+            assert_eq!(
+                panel.display.rotation, 0,
+                "kernel geometry is not orientation"
+            );
+            (panel.display.native_width, panel.display.native_height)
         })
+    }
+
+    /// Measured on the Fplus T1100 (mtkfb): there is no DRM class at all, `mode` is
+    /// empty, `modes` carries the panel, and `virtual_size` is a triple buffer
+    /// (2176 x 3) that must never be mistaken for the panel.
+    #[test]
+    fn t1100_mtkfb_uses_modes_and_rejects_virtual_size() {
+        let dir = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "U:1600x2176p-0\n"),
+            ("class/graphics/fb0/virtual_size", "1600,6528\n"),
+            ("class/graphics/fb0/stride", "6400\n"),
+            ("class/graphics/fb0/bits_per_pixel", "32\n"),
+            ("class/graphics/fb0/name", "mtkfb\n"),
+        ]);
+        assert!(!dir.path().join("class/drm").exists());
+        let panel = panel_geometry(dir.path()).unwrap();
+        assert_eq!(
+            (panel.display.native_width, panel.display.native_height),
+            (1600, 2176)
+        );
+        assert_eq!(panel.source, PanelSource::Fbdev);
+        assert_eq!(panel.node, "fb0");
+        assert_ne!(
+            panel.display.native_height, 6528,
+            "virtual_size is a buffer, not the panel"
+        );
+    }
+
+    /// Ambiguous framebuffers must name the nodes, not only the count.
+    #[test]
+    fn multiple_framebuffers_name_the_nodes() {
+        let dir = sysfs(&[
+            ("class/graphics/fb0/modes", "U:1600x2176p-0\n"),
+            ("class/graphics/fb1/modes", "U:1280x720p-0\n"),
+        ]);
+        let error = panel_geometry(dir.path()).unwrap_err();
+        assert_eq!(error.reason_code(), "PANEL_GEOMETRY_AMBIGUOUS");
+        let message = error.to_string();
+        assert!(
+            message.contains("fb0") && message.contains("fb1"),
+            "{message}"
+        );
     }
 
     #[test]

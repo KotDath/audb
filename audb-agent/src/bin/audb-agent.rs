@@ -1,6 +1,8 @@
 //! Privileged, narrow input service. No shell execution or arbitrary file API.
 use audb_agent::{
-    gesture, panel::PanelError, read_socket_frame, Display, Gesture, Request, PROTOCOL, SOCKET,
+    gesture,
+    panel::{PanelError, PanelGeometry},
+    read_socket_frame, Display, Gesture, Request, PROTOCOL, SOCKET,
 };
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
@@ -429,7 +431,7 @@ fn permission_request(uid: u32, action: &audb_agent::Action) -> Value {
 }
 fn handle(
     touch: &mut Option<Touch>,
-    panel_error: Option<&PanelError>,
+    panel: &Result<PanelGeometry, PanelError>,
     keyboard: &mut Option<Keyboard>,
     socket: &UnixStream,
     uid: libc::uid_t,
@@ -483,20 +485,24 @@ fn handle(
             let display = req.display.map(|d| { let (w,h) = d.size(); json!({"width":w,"height":h,"nativeWidth":d.native_width,"nativeHeight":d.native_height,"rotation":d.rotation}) });
             let mut data = json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
                 "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action});
-            if let Some(error) = panel_error {
-                data["panel"] =
-                    json!({"reasonCode":error.reason_code(),"message":error.to_string()});
-            }
+            // Discovery failure keeps its reason code; discovery success reports provenance and
+            // the native size, plus whether the session geometry agrees, so readiness cannot
+            // advertise touch that the next gesture would refuse.
+            data["panel"] = match panel {
+                Ok(geometry) => {
+                    let mut value = json!({"source":geometry.source.as_str(),"node":geometry.node,
+                        "nativeWidth":geometry.display.native_width,"nativeHeight":geometry.display.native_height});
+                    if let Some(display) = req.display {
+                        value["matchesSession"] = json!(display.native_width == geometry.display.native_width
+                            && display.native_height == geometry.display.native_height);
+                    }
+                    value
+                }
+                Err(error) => json!({"reasonCode":error.reason_code(),"message":error.to_string()}),
+            };
             return Ok(data);
         }
         let display = req.display.ok_or("Missing graphical session geometry")?;
-        if let Some(touch) = touch.as_ref() {
-            if display.native_width != touch.display.native_width
-                || display.native_height != touch.display.native_height
-            {
-                return Err("Graphical session geometry does not match kernel panel".into());
-            }
-        }
         if let audb_agent::Action::Screenshot { directory } = &req.action {
             error_code = "SCREENSHOT_FAILED";
             audb_agent::screenshot::request(
@@ -509,11 +515,18 @@ fn handle(
         if let Some(g) = gesture(display, &req.action)? {
             let Some(touch) = touch.as_mut() else {
                 error_code = "CAPABILITY_UNAVAILABLE";
-                return Err(match panel_error {
-                    Some(error) => format!("{}: {error}", error.reason_code()),
-                    None => "No available uinput touchscreen/DRM panel".into(),
+                return Err(match panel {
+                    Err(error) => format!("{}: {error}", error.reason_code()),
+                    Ok(_) => "No available uinput touchscreen".into(),
                 });
             };
+            // Only gestures depend on the kernel panel: a discovered-but-mismatched panel must
+            // not block an otherwise working screenshot.
+            if display.native_width != touch.display.native_width
+                || display.native_height != touch.display.native_height
+            {
+                return Err("Graphical session geometry does not match kernel panel".into());
+            }
             touch.perform(g, socket)?;
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -540,9 +553,8 @@ fn run() -> Result<(), String> {
     let gid = unsafe { (*group).gr_gid };
     // Root-local geometry only. A client Request.display must not size this node.
     let panel = audb_agent::panel::panel_geometry(std::path::Path::new("/sys"));
-    let panel_error = panel.as_ref().err().cloned();
-    let mut touch = match panel {
-        Ok(display) => Touch::create(display)
+    let mut touch = match panel.as_ref() {
+        Ok(geometry) => Touch::create(geometry.display)
             .map_err(|e| eprintln!("Input unavailable; permission service remains available: {e}"))
             .ok(),
         Err(error) => {
@@ -594,7 +606,7 @@ fn run() -> Result<(), String> {
                 };
                 let response = handle(
                     &mut touch,
-                    panel_error.as_ref(),
+                    &panel,
                     &mut keyboard,
                     &socket,
                     uid,
@@ -716,7 +728,23 @@ mod tests {
         assert_eq!((last[2].kind, last[2].code, last[2].value), (EV_SYN, 0, 0));
     }
 
-    fn response(touch: &mut Option<Touch>, panel_error: Option<&PanelError>, body: &str) -> Value {
+    fn panel_stub(width: i32, height: i32) -> Result<PanelGeometry, PanelError> {
+        Ok(PanelGeometry {
+            display: Display {
+                native_width: width,
+                native_height: height,
+                rotation: 0,
+            },
+            source: audb_agent::panel::PanelSource::Fbdev,
+            node: "fb0".into(),
+        })
+    }
+
+    fn response(
+        touch: &mut Option<Touch>,
+        panel: &Result<PanelGeometry, PanelError>,
+        body: &str,
+    ) -> Value {
         let (agent, mut client) = UnixStream::pair().unwrap();
         client.write_all(body.as_bytes()).unwrap();
         client
@@ -726,7 +754,7 @@ mod tests {
             )
             .unwrap();
         let mut keyboard = None;
-        handle(touch, panel_error, &mut keyboard, &agent, 0)
+        handle(touch, panel, &mut keyboard, &agent, 0)
     }
 
     fn touch_node(width: i32, height: i32) -> Touch {
@@ -747,7 +775,7 @@ mod tests {
         let mut touch = Some(touch_node(720, 1600));
         let response = response(
             &mut touch,
-            None,
+            &panel_stub(720, 1600),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
         );
         assert_eq!(response["ok"], false);
@@ -764,7 +792,7 @@ mod tests {
         let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
         let response = response(
             &mut touch,
-            Some(&error),
+            &Err(error),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":720,"rotation":90},"action":{"command":"status"}}"#,
         );
         assert_eq!(response["ok"], true);
@@ -783,12 +811,53 @@ mod tests {
         let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
         let response = response(
             &mut touch,
-            Some(&error),
+            &Err(error),
             r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
         );
         assert_eq!(response["error"]["code"], "CAPABILITY_UNAVAILABLE");
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("PANEL_GEOMETRY_UNAVAILABLE"), "{message}");
         assert!(touch.is_none());
+    }
+
+    /// A discovered panel that disagrees with the session must not block screenshots: the
+    /// geometry guard belongs to gestures only.
+    #[test]
+    fn mismatched_panel_does_not_block_screenshot() {
+        let mut touch = Some(touch_node(720, 1600));
+        let response = response(
+            &mut touch,
+            &panel_stub(720, 1600),
+            r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"screenshot"}}"#,
+        );
+        assert_eq!(response["error"]["code"], "SCREENSHOT_FAILED");
+        assert_eq!(
+            response["error"]["message"],
+            "Missing screenshot staging directory"
+        );
+    }
+
+    /// Readiness must be able to see a session/panel disagreement before the next gesture fails.
+    #[test]
+    fn status_reports_panel_provenance_and_session_match() {
+        let mut touch = Some(touch_node(1600, 2176));
+        let matched = response(
+            &mut touch,
+            &panel_stub(1600, 2176),
+            r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":2176,"rotation":90},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(matched["data"]["panel"]["source"], "fbdev");
+        assert_eq!(matched["data"]["panel"]["node"], "fb0");
+        assert_eq!(matched["data"]["panel"]["nativeWidth"], 1600);
+        assert_eq!(matched["data"]["panel"]["nativeHeight"], 2176);
+        assert_eq!(matched["data"]["panel"]["matchesSession"], true);
+        assert_eq!(matched["data"]["capabilities"]["tap"], true);
+
+        let mismatched = response(
+            &mut touch,
+            &panel_stub(1600, 2176),
+            r#"{"protocolVersion":3,"display":{"nativeWidth":2176,"nativeHeight":1600,"rotation":90},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(mismatched["data"]["panel"]["matchesSession"], false);
     }
 }

@@ -440,6 +440,30 @@ fn is_64bit_machine(name: &str) -> bool {
     ) || name.ends_with("64")
 }
 
+/// The kernel panel and the session geometry disagree, so gestures would land elsewhere. The
+/// agent reports this as `matchesSession: false`; an absent field means no comparison was
+/// possible (for example no graphical session).
+fn panel_mismatch(agent: &Check) -> bool {
+    agent.ok() && agent.data["panel"]["matchesSession"] == false
+}
+
+/// Oriented command space for gestures together with the kernel panel it maps onto.
+fn touch_geometry(agent: &Check) -> Option<Value> {
+    let display = &agent.data["display"];
+    let mut value = json!({
+        "space": "oriented",
+        "width": display["width"].as_i64()?,
+        "height": display["height"].as_i64()?,
+        "nativeWidth": display["nativeWidth"].as_i64()?,
+        "nativeHeight": display["nativeHeight"].as_i64()?,
+        "rotation": display["rotation"],
+    });
+    if let Some(source) = agent.data["panel"]["source"].as_str() {
+        value["panelSource"] = json!(source);
+    }
+    Some(value)
+}
+
 fn touch_warning(agent: &Check) -> Option<Check> {
     if !agent.ok() {
         return None;
@@ -577,10 +601,19 @@ fn capabilities(
                     "No compatible editor is focused",
                     "Tap an editable field before text.",
                 );
+            } else if matches!(name, "tap" | "swipe") && panel_mismatch(agent) {
+                cap = cap.blocked(
+                    "PANEL_GEOMETRY_MISMATCH",
+                    "The graphical session geometry does not match the kernel panel, so gestures would land elsewhere",
+                    "Restart audb-agent after a panel or session geometry change; the session must report the kernel panel's native size.",
+                );
             } else if matches!(name, "tap" | "swipe")
                 && (!screen_ready || agent.data["display"].is_null())
             {
                 cap = cap.blocked("DISPLAY_NOT_READY", "Touch readiness requires graphical geometry, an awake screen and an unlocked session", "Wake/unlock the device and check display status; PIN entry remains manual.");
+            }
+            if matches!(name, "tap" | "swipe") {
+                cap.geometry = touch_geometry(agent);
             }
             if name == "screenshot" {
                 cap = cap.notes(&["Geometry/backend readiness was probed without capturing an image; screen-off or locked content may differ."]);
@@ -924,6 +957,69 @@ mod tests {
     fn physical(agent: &Check, display: &Check) -> BTreeMap<String, Capability> {
         let ssh = Check::passed("ssh", json!({}));
         evaluate(false, &ssh, agent, display, &skipped("qmp", "physical", ""))
+    }
+
+    #[test]
+    fn panel_mismatch_blocks_gestures_but_not_screenshots() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "nativeWidth": 1600, "nativeHeight": 2176, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {"source": "fbdev", "node": "fb0", "nativeWidth": 1600, "nativeHeight": 2176, "matchesSession": false}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        for name in ["tap", "swipe"] {
+            assert_eq!(caps[name].available, Some(true), "{name}");
+            assert_eq!(caps[name].ready, Some(false), "{name}");
+            assert_eq!(
+                caps[name].reason_code.as_deref(),
+                Some("PANEL_GEOMETRY_MISMATCH"),
+                "{name}"
+            );
+            assert!(!caps[name]
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("setup-device"));
+        }
+        // Screenshots and keys do not depend on the touchscreen geometry.
+        assert_eq!(caps["screenshot"].ready, Some(true));
+        assert_eq!(caps["key"].ready, Some(true));
+    }
+
+    #[test]
+    fn touch_geometry_reports_oriented_space_and_panel_source() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "nativeWidth": 1600, "nativeHeight": 2176, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {"source": "fbdev", "node": "fb0", "nativeWidth": 1600, "nativeHeight": 2176, "matchesSession": true}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        let geometry = caps["tap"].geometry.as_ref().unwrap();
+        assert_eq!(caps["tap"].ready, Some(true));
+        assert_eq!(geometry["space"], "oriented");
+        assert_eq!(geometry["width"], 2176);
+        assert_eq!(geometry["height"], 1600);
+        assert_eq!(geometry["nativeWidth"], 1600);
+        assert_eq!(geometry["nativeHeight"], 2176);
+        assert_eq!(geometry["panelSource"], "fbdev");
+        // Successful discovery must not raise a touch warning.
+        assert!(touch_warning(&agent).is_none());
     }
 
     #[test]
