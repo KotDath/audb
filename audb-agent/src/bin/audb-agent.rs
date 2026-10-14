@@ -6,6 +6,7 @@ use std::io::{self, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -292,9 +293,40 @@ fn pause(duration: Duration, socket: &UnixStream) -> io::Result<()> {
     }
 }
 fn native_display() -> Result<Display, String> {
+    let (connector, display) = native_display_from(Path::new("/sys/class/drm"))?;
+    eprintln!(
+        "Using DRM panel {connector} {}x{}",
+        display.native_width, display.native_height
+    );
+    Ok(display)
+}
+
+fn is_writeback_connector(name: &str) -> bool {
+    let Some((card, connector)) = name.split_once('-') else {
+        return false;
+    };
+    let Some(card_index) = card.strip_prefix("card") else {
+        return false;
+    };
+    let Some((kind, connector_index)) = connector.rsplit_once('-') else {
+        return false;
+    };
+    let is_index =
+        |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    is_index(card_index) && kind.eq_ignore_ascii_case("writeback") && is_index(connector_index)
+}
+
+fn native_display_from(drm_dir: &Path) -> Result<(String, Display), String> {
     let mut modes = Vec::new();
-    for entry in fs::read_dir("/sys/class/drm").map_err(|e| e.to_string())? {
-        let path = entry.map_err(|e| e.to_string())?.path();
+    for entry in fs::read_dir(drm_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Writeback captures CRTC output into memory; it is not a physical
+        // display, even when its status is "connected" and it lists modes.
+        if is_writeback_connector(&name) {
+            continue;
+        }
+        let path = entry.path();
         if fs::read_to_string(path.join("status"))
             .unwrap_or_default()
             .trim()
@@ -305,6 +337,7 @@ fn native_display() -> Result<Display, String> {
         let text = fs::read_to_string(path.join("modes")).map_err(|e| e.to_string())?;
         if let Some((w, h)) = text.lines().next().and_then(|s| s.split_once('x')) {
             modes.push((
+                name,
                 w.parse::<i32>().map_err(|e| e.to_string())?,
                 h.parse::<i32>().map_err(|e| e.to_string())?,
             ));
@@ -312,17 +345,30 @@ fn native_display() -> Result<Display, String> {
     }
     if modes.len() != 1 {
         return Err(format!(
-            "Expected one connected DRM panel, found {}",
-            modes.len()
+            "Expected one connected DRM panel, found {}{}",
+            modes.len(),
+            if modes.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    modes
+                        .iter()
+                        .map(|(name, _, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
         ));
     }
+    let (connector, width, height) = modes.remove(0);
     let d = Display {
-        native_width: modes[0].0,
-        native_height: modes[0].1,
+        native_width: width,
+        native_height: height,
         rotation: 0,
     };
     d.validate()?;
-    Ok(d)
+    Ok((connector, d))
 }
 fn peer_allowed(socket: &UnixStream, input_gid: libc::gid_t) -> Option<libc::uid_t> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -625,6 +671,92 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    fn connector(root: &Path, name: &str, status: &str, modes: &str) {
+        let path = root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("status"), status).unwrap();
+        fs::write(path.join("modes"), modes).unwrap();
+    }
+
+    #[test]
+    fn dialog_panel_is_selected_among_writeback_connectors() {
+        let root = tempfile::tempdir().unwrap();
+        let drm = root.path().join("class/drm");
+        fs::create_dir_all(&drm).unwrap();
+        let device = root.path().join("devices");
+        connector(&device, "panel", "connected\n", "1080x2460\n");
+        std::os::unix::fs::symlink(device.join("panel"), drm.join("card0-DSI-1")).unwrap();
+        for name in ["card0-Writeback-1", "card0-Writeback-2"] {
+            connector(&drm, name, "connected\n", "4096x2160\n");
+        }
+        connector(&drm, "card0-HDMI-A-1", "disconnected\n", "800x600\n");
+
+        let (name, display) = native_display_from(&drm).unwrap();
+        assert_eq!(name, "card0-DSI-1");
+        assert_eq!((display.native_width, display.native_height), (1080, 2460));
+        assert_eq!(display.rotation, 0);
+    }
+
+    #[test]
+    fn writeback_only_does_not_supply_panel_geometry() {
+        let drm = tempfile::tempdir().unwrap();
+        connector(
+            drm.path(),
+            "card0-Writeback-1",
+            "connected\n",
+            "4096x2160\n",
+        );
+        connector(
+            drm.path(),
+            "card0-Writeback-2",
+            "connected\n",
+            "invalid-mode\n",
+        );
+        assert_eq!(
+            native_display_from(drm.path()).unwrap_err(),
+            "Expected one connected DRM panel, found 0"
+        );
+    }
+
+    #[test]
+    fn multiple_physical_outputs_remain_ambiguous() {
+        let drm = tempfile::tempdir().unwrap();
+        connector(drm.path(), "card0-DSI-1", "connected\n", "1080x2460\n");
+        connector(drm.path(), "card0-HDMI-A-1", "connected\n", "800x600\n");
+        connector(
+            drm.path(),
+            "card0-Writeback-1",
+            "connected\n",
+            "4096x2160\n",
+        );
+        let error = native_display_from(drm.path()).unwrap_err();
+        assert!(error.contains("found 2"), "{error}");
+        assert!(error.contains("card0-DSI-1"), "{error}");
+        assert!(error.contains("card0-HDMI-A-1"), "{error}");
+        assert!(!error.contains("Writeback"), "{error}");
+    }
+
+    #[test]
+    fn writeback_filter_matches_connector_type_not_arbitrary_substrings() {
+        for name in [
+            "card0-Writeback-1",
+            "card12-writeback-2",
+            "card1-WRITEBACK-10",
+        ] {
+            assert!(is_writeback_connector(name), "{name}");
+        }
+        for name in [
+            "card0-DSI-1",
+            "card0-HDMI-Writeback-1",
+            "card-Writeback-1",
+            "card0-Writeback-",
+            "card0-Writeback-one",
+        ] {
+            assert!(!is_writeback_connector(name), "{name}");
+        }
+    }
+
     #[test]
     fn keyboard_disconnect_releases_pressed_key() {
         let file = tempfile::tempfile().unwrap();
