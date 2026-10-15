@@ -954,6 +954,31 @@ mod tests {
     }
 
     #[test]
+    fn informational_panel_reading_is_not_a_warning() {
+        // panel.source and panel.note alone must not make doctor warn.
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 720, "height": 1600, "nativeWidth": 720, "nativeHeight": 1600, "rotation": 0},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {
+                    "source": "fbdev-modes",
+                    "note": "Framebuffer var 736x1600 was not used: it is not one of the modes the kernel lists"
+                }
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        assert_eq!(caps["tap"].ready, Some(true));
+        assert_eq!(caps["swipe"].ready, Some(true));
+        assert!(touch_warning(&agent).is_none());
+    }
+
+    #[test]
     fn failed_agent_still_prescribes_setup_device() {
         let agent = Check::problem(
             "agent",

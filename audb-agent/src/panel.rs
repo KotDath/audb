@@ -229,12 +229,14 @@ fn framebuffer_size(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("fb");
-    let mode = read_text(&fb.join("mode"))?;
+    // `modes` is read first because it validates the var. `mode` is lower
+    // priority, so it is read only after the var has been rejected: an
+    // unreadable `mode` must not block a usable var.
     let modes = read_text(&fb.join("modes"))?;
-    let listed = modes.as_deref().map(listed_sizes).unwrap_or_default();
+    let listed = listed_sizes(modes.as_deref());
     let mut note = None;
     if let Some(size) = fb_var_size(fb) {
-        match fb_var_reject_reason(fb, size, &listed) {
+        match fb_var_reject_reason(fb, size, listed.as_deref()) {
             None => {
                 return Ok(PanelGeometry {
                     display: display_from(size.0, size.1)?,
@@ -250,6 +252,7 @@ fn framebuffer_size(
             }
         }
     }
+    let mode = read_text(&fb.join("mode"))?;
     if let Some(text) = mode.as_deref().filter(|text| !text.trim().is_empty()) {
         let (width, height) = parse_fbdev_mode(text)?;
         return Ok(PanelGeometry {
@@ -278,21 +281,36 @@ fn framebuffer_size(
 /// The var is the current size, but the node needs native axes and a size the
 /// kernel itself declares: `mtkfb` swaps `xres`/`yres` in `mtkfb_check_var`
 /// when rotate is 90 or 270, and a driver may report a stride-aligned value.
-fn fb_var_reject_reason(fb: &Path, size: (i32, i32), listed: &[(i32, i32)]) -> Option<String> {
+///
+/// `listed` is `None` when the kernel publishes no `modes` list at all, which
+/// is the only case where the var is accepted without a membership check.
+fn fb_var_reject_reason(
+    fb: &Path,
+    size: (i32, i32),
+    listed: Option<&[(i32, i32)]>,
+) -> Option<String> {
     if display_from(size.0, size.1).is_err() {
         return Some("it is outside the supported 2..=16384 range".into());
     }
+    // `fb_var_screeninfo.rotate` is documented in degrees and drivers use the
+    // quarter turns. Only 0 and 180 keep the axis order, so allow exactly
+    // those: an unexpected value must not be treated as "not rotated".
     match fb_rotate(fb) {
-        Some(degrees) if degrees == 90 || degrees == 270 => {
+        Some(0 | 180) => {}
+        Some(degrees) => {
             return Some(format!(
-                "fb rotate is {degrees}, so the var axes are not native"
+                "fb rotate is {degrees}; only 0 and 180 keep the var axes native"
             ))
         }
-        Some(_) => {}
         None => return Some("the fb rotate value is unreadable".into()),
     }
-    if !listed.is_empty() && !listed.contains(&size) {
-        return Some("it is not one of the modes the kernel lists".into());
+    match listed {
+        None => {}
+        Some([]) => return Some("the kernel modes list has no usable entry".into()),
+        Some(listed) if !listed.contains(&size) => {
+            return Some("it is not one of the modes the kernel lists".into())
+        }
+        Some(_) => {}
     }
     None
 }
@@ -305,11 +323,17 @@ fn fb_rotate(fb: &Path) -> Option<i32> {
         .ok()
 }
 
-/// Every distinct size the kernel lists, skipping lines that do not parse.
+/// The sizes the kernel lists, or `None` when there is no `modes` text or it
+/// is blank.
 ///
-/// This is a membership test for the framebuffer var, not a selection rule, so
-/// a malformed line is ignored instead of failing the framebuffer.
-fn listed_sizes(text: &str) -> Vec<(i32, i32)> {
+/// An empty vector therefore means the file exists but holds no usable mode,
+/// which is deliberately different from no list at all: a wholly malformed
+/// list must not silently disable the membership check.
+fn listed_sizes(text: Option<&str>) -> Option<Vec<(i32, i32)>> {
+    let text = text?;
+    if text.trim().is_empty() {
+        return None;
+    }
     let mut sizes = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         if let Ok(size) = first_wxh(line) {
@@ -318,7 +342,7 @@ fn listed_sizes(text: &str) -> Vec<(i32, i32)> {
             }
         }
     }
-    sizes
+    Some(sizes)
 }
 
 /// `FBIOGET_VSCREENINFO` from `linux/fb.h`.
@@ -337,10 +361,17 @@ fn fb_var_size(fb: &Path) -> Option<(i32, i32)> {
     let name = fb.file_name()?.to_str()?;
     let file = fs::File::open(Path::new("/dev").join(name)).ok()?;
     let mut buffer = [0u8; FB_VAR_SCREENINFO_LEN];
-    // `xres` and `yres` are the first two fields of the struct.
     if unsafe { libc::ioctl(file.as_raw_fd(), FBIOGET_VSCREENINFO, buffer.as_mut_ptr()) } < 0 {
         return None;
     }
+    decode_fb_var(&buffer)
+}
+
+/// `xres`/`yres`, the visible resolution, from a `struct fb_var_screeninfo`.
+///
+/// `xres_virtual`/`yres_virtual` at offsets 8 and 12 are the aligned buffer and
+/// are deliberately not read.
+fn decode_fb_var(buffer: &[u8; FB_VAR_SCREENINFO_LEN]) -> Option<(i32, i32)> {
     let xres = u32::from_ne_bytes(buffer[0..4].try_into().ok()?);
     let yres = u32::from_ne_bytes(buffer[4..8].try_into().ok()?);
     let size = (i32::try_from(xres).ok()?, i32::try_from(yres).ok()?);
@@ -612,17 +643,73 @@ mod tests {
     }
 
     #[test]
-    fn rotated_framebuffer_var_is_not_native_geometry() {
-        // mtkfb swaps xres/yres at rotate 90/270, so the var axes are oriented.
+    fn framebuffer_var_rotation_allowlist() {
+        // Only 0 and 180 keep the var axes native. 90 and 270 swap them in
+        // mtkfb's mtkfb_check_var, and any other integer is not a documented
+        // quarter turn, so it must not be accepted as "not rotated".
+        for degrees in [0, 180] {
+            let rotate = format!("{degrees}\n");
+            let dir = sysfs(&[
+                ("class/graphics/fb0/mode", ""),
+                ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
+                ("class/graphics/fb0/rotate", rotate.as_str()),
+            ]);
+            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            assert_eq!(panel.source, PanelSource::FbdevVar, "rotate {degrees}");
+        }
+        for degrees in [90, 270, 1, 3, -90, 999] {
+            let rotate = format!("{degrees}\n");
+            let dir = sysfs(&[
+                ("class/graphics/fb0/mode", ""),
+                ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
+                ("class/graphics/fb0/rotate", rotate.as_str()),
+            ]);
+            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            assert_eq!(panel.source, PanelSource::FbdevModes, "rotate {degrees}");
+            let note = panel.note.unwrap();
+            assert!(note.contains(&format!("rotate is {degrees}")), "{note}");
+        }
+    }
+
+    #[test]
+    fn malformed_modes_do_not_disable_membership() {
+        // A non-empty but unusable list must not be treated as "no list".
         let dir = sysfs(&[
-            ("class/graphics/fb0/mode", ""),
-            ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
-            ("class/graphics/fb0/rotate", "90\n"),
+            ("class/graphics/fb0/mode", "U:720x1600p-60\n"),
+            ("class/graphics/fb0/modes", "bogus\n"),
+            ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((1600, 720))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| Some((736, 1600))).unwrap();
         assert_eq!(size(&panel), (720, 1600));
-        assert_eq!(panel.source, PanelSource::FbdevModes);
-        assert!(panel.note.unwrap().contains("rotate is 90"));
+        assert_eq!(panel.source, PanelSource::FbdevMode);
+        let note = panel.note.unwrap();
+        assert!(note.contains("736x1600"), "{note}");
+        assert!(note.contains("no usable entry"), "{note}");
+    }
+
+    #[test]
+    fn framebuffer_var_is_used_when_mode_is_unreadable() {
+        // `mode` is lower priority than the var, so its read error must not
+        // block an otherwise acceptable var.
+        let dir = sysfs(&[
+            ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
+            ("class/graphics/fb0/rotate", "0\n"),
+        ]);
+        fs::create_dir(dir.path().join("class/graphics/fb0/mode")).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+        assert_eq!(size(&panel), (720, 1600));
+        assert_eq!(panel.source, PanelSource::FbdevVar);
+    }
+
+    #[test]
+    fn decode_fb_var_reads_the_visible_resolution() {
+        let mut buffer = [0u8; FB_VAR_SCREENINFO_LEN];
+        buffer[0..4].copy_from_slice(&720u32.to_ne_bytes());
+        buffer[4..8].copy_from_slice(&1600u32.to_ne_bytes());
+        buffer[8..12].copy_from_slice(&736u32.to_ne_bytes());
+        buffer[12..16].copy_from_slice(&4800u32.to_ne_bytes());
+        assert_eq!(decode_fb_var(&buffer), Some((720, 1600)));
+        assert_eq!(decode_fb_var(&[0u8; FB_VAR_SCREENINFO_LEN]), None);
     }
 
     #[test]

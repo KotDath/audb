@@ -11,11 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The framebuffer panel size now comes from the framebuffer var
   (`FBIOGET_VSCREENINFO`) when the service unit allows `/dev/fb0`, falling back
-  to a non-empty `mode` and then to the first `modes` line. The var is used only
-  when `rotate` is 0 or 180 and the size is one the kernel lists, so a
-  stride-aligned or rotated value cannot become the uinput node size. The unit
-  adds a read-only `DeviceAllow=/dev/fb0 r` for this. `status` reports the
-  `panel.source` and, when the var was rejected, a `panel.note`.
+  to a non-empty `mode` and then to the first `modes` line. The var is rejected
+  when `rotate` is neither 0 nor 180, when the size is outside the supported
+  range, or when the kernel publishes a `modes` list that does not contain it;
+  a non-empty but unusable list is not treated as no list. With no list at all
+  the driver value is taken as the visible size. These are conditional checks,
+  not a guarantee that an accepted size is native geometry. The unit adds a
+  read-only `DeviceAllow=/dev/fb0 r` for this. `status` reports `panel.source`
+  and, when the var was rejected, a `panel.note`.
 - Panel geometry stays a best-effort kernel reading. When a framebuffer has no
   active `mode`, the first line of `modes` is used; the kernel prepends only
   unmatched modes, so a multi-mode list can keep a non-active mode first. No
