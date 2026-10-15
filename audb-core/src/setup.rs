@@ -302,7 +302,7 @@ mod tests {
         install(&config).unwrap();
         assert!(fs::read_to_string(config.qemu_bin())
             .unwrap()
-            .contains("/tmp/"));
+            .contains(config.qmp_socket.to_str().unwrap()));
     }
 
     #[test]

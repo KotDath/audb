@@ -15,13 +15,14 @@ struct Workspace {
 }
 impl Workspace {
     fn new() -> Self {
-        Self {
-            dir: tempfile::tempdir().unwrap(),
-        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("home")).unwrap();
+        Self { dir }
     }
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_audb"));
-        c.env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+        c.env("HOME", self.dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_CACHE_HOME", self.dir.path().join("cache"))
             .stdin(std::process::Stdio::null())
             .args(args);
@@ -54,7 +55,16 @@ impl Workspace {
         serde_json::from_slice(&output.stdout).unwrap()
     }
     fn registry(&self) -> PathBuf {
-        self.dir.path().join("config/audb/devices-v1.json")
+        // directories::BaseDirs uses XDG_CONFIG_HOME on Linux and
+        // $HOME/Library/Application Support on macOS.
+        let root = if cfg!(target_os = "macos") {
+            self.dir
+                .path()
+                .join("home/Library/Application Support/audb")
+        } else {
+            self.dir.path().join("config/audb")
+        };
+        root.join("devices-v1.json")
     }
 }
 

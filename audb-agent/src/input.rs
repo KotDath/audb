@@ -2,6 +2,7 @@
 use crate::{read_socket_frame_cancellable, Action};
 use serde_json::Value;
 use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
@@ -18,6 +19,27 @@ pub fn call(
     let path = format!("/run/user/{uid}/audb-input.sock");
     let mut socket = UnixStream::connect(path).map_err(|e| (
         "CAPABILITY_UNAVAILABLE", format!("Maliit input bridge unavailable: {e}; upgrade audb-agent and restart the user maliit-server service")))?;
+    require_peer(&socket, uid)?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|e| ("CAPABILITY_UNAVAILABLE", e.to_string()))?;
+    let mut bytes = serde_json::to_vec(action).map_err(|e| ("INVALID_ARGUMENT", e.to_string()))?;
+    bytes.push(b'\n');
+    socket
+        .write_all(&bytes)
+        .map_err(|e| ("OUTCOME_UNKNOWN", e.to_string()))?;
+    let bytes = read_socket_frame_cancellable(&socket, Duration::from_secs(13), cancelled)
+        .map_err(|e| {
+            (
+                "OUTCOME_UNKNOWN",
+                format!("Text outcome unknown; not repeated: {e}"),
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|e| ("OUTCOME_UNKNOWN", e.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn require_peer(socket: &UnixStream, uid: libc::uid_t) -> Result<(), (&'static str, String)> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     if unsafe {
@@ -36,20 +58,14 @@ pub fn call(
             "Input socket is not owned by this user".into(),
         ));
     }
-    socket
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| ("CAPABILITY_UNAVAILABLE", e.to_string()))?;
-    let mut bytes = serde_json::to_vec(action).map_err(|e| ("INVALID_ARGUMENT", e.to_string()))?;
-    bytes.push(b'\n');
-    socket
-        .write_all(&bytes)
-        .map_err(|e| ("OUTCOME_UNKNOWN", e.to_string()))?;
-    let bytes = read_socket_frame_cancellable(&socket, Duration::from_secs(13), cancelled)
-        .map_err(|e| {
-            (
-                "OUTCOME_UNKNOWN",
-                format!("Text outcome unknown; not repeated: {e}"),
-            )
-        })?;
-    serde_json::from_slice(&bytes).map_err(|e| ("OUTCOME_UNKNOWN", e.to_string()))
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn require_peer(socket: &UnixStream, uid: libc::uid_t) -> Result<(), (&'static str, String)> {
+    let _ = (socket, uid);
+    Err((
+        "CAPABILITY_UNAVAILABLE",
+        "Maliit peer credentials require Linux".into(),
+    ))
 }
