@@ -346,6 +346,11 @@ fn listed_sizes(text: Option<&str>) -> Option<Vec<(i32, i32)>> {
 }
 
 /// `FBIOGET_VSCREENINFO` from `linux/fb.h`.
+///
+/// The header defines the classic fbdev requests as plain 16-bit values, with
+/// the comment "ioctls 0x46 is 'F'": this is NOT `_IOR('F', 0, ...)` encoded.
+/// `0x80A04600` and other derived values are rejected with `ENOTTY`, and
+/// `FBIO_CURSOR` is the newer request that does use `_IOWR`.
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 
 /// `sizeof(struct fb_var_screeninfo)`. The struct is all `__u32` fields, so the
@@ -699,6 +704,15 @@ mod tests {
         let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevVar);
+    }
+
+    #[test]
+    fn fb_get_vscreeninfo_uses_the_legacy_fb_encoding() {
+        // Guards against "fixing" this into an _IOR-derived value such as
+        // 0x80A04600, which the kernel answers with ENOTTY. linux/fb.h:
+        // "ioctls 0x46 is 'F'", then #define FBIOGET_VSCREENINFO 0x4600;
+        // FBIO_CURSOR is the request that uses _IOWR.
+        assert_eq!(FBIOGET_VSCREENINFO, 0x4600);
     }
 
     #[test]
