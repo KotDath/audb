@@ -5,7 +5,8 @@
 //! `mode` can exist and be empty; `modes` is the required fallback. Within
 //! fbdev the order is the framebuffer var (`FBIOGET_VSCREENINFO`), then a
 //! non-empty `mode`, then the first `modes` line. The var is used only when the
-//! axes are native and the kernel's own `modes` list agrees.
+//! axes are native (`rotate` 0 or 180) and, when the kernel publishes a `modes`
+//! list, when the size is in it; with no list at all the var is kept unchecked.
 //! `virtual_size` and `stride` describe a stride-aligned buffer, not the panel.
 use crate::Display;
 use std::fs;
@@ -612,6 +613,50 @@ mod tests {
         ]);
         assert_eq!(geometry(first.path()).unwrap(), (1080, 2400));
         assert_eq!(geometry(second.path()).unwrap(), (720, 1600));
+    }
+
+    #[test]
+    fn absent_or_blank_modes_list_does_not_reject_the_var() {
+        // No published list is the only case that skips membership.
+        for modes in [None, Some(""), Some("\n  \n")] {
+            let mut files = vec![
+                ("class/graphics/fb0/mode", ""),
+                ("class/graphics/fb0/rotate", "0\n"),
+            ];
+            if let Some(text) = modes {
+                files.push(("class/graphics/fb0/modes", text));
+            }
+            let dir = sysfs(&files);
+            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            assert_eq!(panel.source, PanelSource::FbdevVar, "modes {modes:?}");
+            assert!(panel.note.is_none(), "modes {modes:?}");
+        }
+    }
+
+    #[test]
+    fn mixed_valid_and_malformed_modes_lines_still_constrain_the_var() {
+        // A usable line establishes membership even when another line is junk.
+        let valid_first = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "U:720x1600p-60\nbogus\n"),
+            ("class/graphics/fb0/rotate", "0\n"),
+        ]);
+        let panel = geometry_with_probe(valid_first.path(), &|_| Some((720, 1600))).unwrap();
+        assert_eq!(panel.source, PanelSource::FbdevVar);
+        let panel = geometry_with_probe(valid_first.path(), &|_| Some((736, 1600))).unwrap();
+        assert_eq!(size(&panel), (720, 1600));
+        assert_eq!(panel.source, PanelSource::FbdevModes);
+        assert!(panel.note.unwrap().contains("not one of the modes"));
+
+        // With the junk line first the fallback text itself is malformed, but
+        // membership still rejects the var before that fallback is reached.
+        let junk_first = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "bogus\nU:720x1600p-60\n"),
+            ("class/graphics/fb0/rotate", "0\n"),
+        ]);
+        let error = geometry_with_probe(junk_first.path(), &|_| Some((736, 1600))).unwrap_err();
+        assert_eq!(error.reason_code(), "PANEL_GEOMETRY_INVALID");
     }
 
     #[test]
