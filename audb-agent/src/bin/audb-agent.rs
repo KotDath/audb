@@ -422,6 +422,17 @@ fn permission_request(uid: u32, action: &audb_agent::Action) -> Value {
     })();
     result.unwrap_or_else(|message| json!({"ok":false,"error":{"code":"OUTCOME_UNKNOWN","message":message},"data":{"phase":"permission_worker","mayHaveChanged":true}}))
 }
+/// The startup panel reading, for status diagnostics.
+///
+/// `error` means no size could be resolved at all, so no uinput node exists.
+/// `source` and `note` describe the reading that sized the node.
+#[derive(Clone, Default)]
+struct PanelState {
+    error: Option<PanelError>,
+    source: Option<&'static str>,
+    note: Option<String>,
+}
+
 /// Session geometry versus the size fixed into the uinput node at startup.
 ///
 /// Rotation is not part of it: the node keeps native axes and `native_point`
@@ -440,7 +451,7 @@ fn geometry_mismatch(
 }
 fn handle(
     touch: &mut Option<Touch>,
-    panel_error: Option<&PanelError>,
+    panel: &PanelState,
     keyboard: &mut Option<Keyboard>,
     socket: &UnixStream,
     uid: libc::uid_t,
@@ -498,20 +509,33 @@ fn handle(
             let ready = touch.is_some() && mismatch.is_none();
             let mut data = json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
                 "capabilities":{"tap":ready,"swipe":ready,"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action});
-            if let Some(error) = panel_error {
-                data["panel"] =
-                    json!({"reasonCode":error.reason_code(),"message":error.to_string()});
+            let mut panel_json = json!({});
+            if let Some(error) = panel.error.as_ref() {
+                panel_json["reasonCode"] = json!(error.reason_code());
+                panel_json["message"] = json!(error.to_string());
             } else if let Some(((session_width, session_height), (kernel_width, kernel_height))) =
                 mismatch
             {
-                data["panel"] = json!({
-                    "reasonCode": "PANEL_GEOMETRY_MISMATCH",
-                    "message": format!("Session geometry {session_width}x{session_height} differs from the kernel geometry {kernel_width}x{kernel_height} chosen at startup"),
-                    "sessionWidth": session_width,
-                    "sessionHeight": session_height,
-                    "nativeWidth": kernel_width,
-                    "nativeHeight": kernel_height,
-                });
+                panel_json["reasonCode"] = json!("PANEL_GEOMETRY_MISMATCH");
+                panel_json["message"] = json!(format!("Session geometry {session_width}x{session_height} differs from the kernel geometry {kernel_width}x{kernel_height} chosen at startup"));
+                panel_json["sessionWidth"] = json!(session_width);
+                panel_json["sessionHeight"] = json!(session_height);
+                panel_json["nativeWidth"] = json!(kernel_width);
+                panel_json["nativeHeight"] = json!(kernel_height);
+            }
+            // Informational: which kernel reading sized the node, including a
+            // framebuffer var that was read and deliberately not used.
+            if let Some(source) = panel.source {
+                panel_json["source"] = json!(source);
+            }
+            if let Some(note) = panel.note.as_ref() {
+                panel_json["note"] = json!(note);
+            }
+            if panel_json
+                .as_object()
+                .is_some_and(|object| !object.is_empty())
+            {
+                data["panel"] = panel_json;
             }
             return Ok(data);
         }
@@ -530,7 +554,7 @@ fn handle(
         if let Some(g) = gesture(display, &req.action)? {
             let Some(touch) = touch.as_mut() else {
                 error_code = "CAPABILITY_UNAVAILABLE";
-                return Err(match panel_error {
+                return Err(match panel.error.as_ref() {
                     Some(error) => format!("{}: {error}", error.reason_code()),
                     None => "No available uinput touchscreen/DRM panel".into(),
                 });
@@ -568,16 +592,23 @@ fn run() -> Result<(), String> {
     let gid = unsafe { (*group).gr_gid };
     // Root-local geometry only. A client Request.display must not size this node.
     let panel = audb_agent::panel::panel_geometry(std::path::Path::new("/sys"));
-    let panel_error = panel.as_ref().err().cloned();
+    let mut panel_state = PanelState::default();
     let mut touch = match panel {
-        Ok(display) => Touch::create(display)
-            .map_err(|e| eprintln!("Input unavailable; permission service remains available: {e}"))
-            .ok(),
+        Ok(geometry) => {
+            panel_state.source = Some(geometry.source.as_str());
+            panel_state.note = geometry.note;
+            Touch::create(geometry.display)
+                .map_err(|e| {
+                    eprintln!("Input unavailable; permission service remains available: {e}")
+                })
+                .ok()
+        }
         Err(error) => {
             eprintln!(
                 "Input unavailable; permission service remains available: {}: {error}",
                 error.reason_code()
             );
+            panel_state.error = Some(error);
             None
         }
     };
@@ -620,13 +651,7 @@ fn run() -> Result<(), String> {
                 let Some(uid) = peer_allowed(&socket, gid) else {
                     continue;
                 };
-                let response = handle(
-                    &mut touch,
-                    panel_error.as_ref(),
-                    &mut keyboard,
-                    &socket,
-                    uid,
-                );
+                let response = handle(&mut touch, &panel_state, &mut keyboard, &socket, uid);
                 let _ = writeln!(socket, "{response}");
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -744,7 +769,7 @@ mod tests {
         assert_eq!((last[2].kind, last[2].code, last[2].value), (EV_SYN, 0, 0));
     }
 
-    fn response(touch: &mut Option<Touch>, panel_error: Option<&PanelError>, body: &str) -> Value {
+    fn response(touch: &mut Option<Touch>, panel: &PanelState, body: &str) -> Value {
         let (agent, mut client) = UnixStream::pair().unwrap();
         client.write_all(body.as_bytes()).unwrap();
         client
@@ -754,7 +779,7 @@ mod tests {
             )
             .unwrap();
         let mut keyboard = None;
-        handle(touch, panel_error, &mut keyboard, &agent, 0)
+        handle(touch, panel, &mut keyboard, &agent, 0)
     }
 
     fn touch_node(width: i32, height: i32) -> Touch {
@@ -776,7 +801,7 @@ mod tests {
     fn mismatched(action: &str) -> (Value, u64) {
         let mut touch = Some(touch_node(720, 1600));
         let payload = format!("{{\"protocolVersion\":3,{MISMATCHED_DISPLAY},\"action\":{action}}}");
-        let response = response(&mut touch, None, &payload);
+        let response = response(&mut touch, &PanelState::default(), &payload);
         let written = touch.as_ref().unwrap().file.metadata().unwrap().len();
         (response, written)
     }
@@ -814,7 +839,7 @@ mod tests {
     fn status_reports_a_geometry_mismatch_without_advertising_touch() {
         let response = response(
             &mut Some(touch_node(720, 1600)),
-            None,
+            &PanelState::default(),
             r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"status"}}"#,
         );
         assert_eq!(response["ok"], true);
@@ -833,7 +858,7 @@ mod tests {
     fn status_reports_touch_ready_when_the_geometry_matches() {
         let response = response(
             &mut Some(touch_node(720, 1600)),
-            None,
+            &PanelState::default(),
             r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":90},"action":{"command":"status"}}"#,
         );
         assert_eq!(response["data"]["capabilities"]["tap"], true);
@@ -841,12 +866,37 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_the_reading_that_sized_the_node() {
+        let panel = PanelState {
+            source: Some("fbdev-modes"),
+            note: Some("Framebuffer var 736x1600 was not used: it is not one of the modes the kernel lists".into()),
+            ..Default::default()
+        };
+        let response = response(
+            &mut Some(touch_node(720, 1600)),
+            &panel,
+            r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":0},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(response["data"]["capabilities"]["tap"], true);
+        assert_eq!(response["data"]["panel"]["source"], "fbdev-modes");
+        let note = response["data"]["panel"]["note"].as_str().unwrap();
+        assert!(note.contains("736x1600"), "{note}");
+        // A note alone is not a failure reason.
+        assert!(response["data"]["panel"]["reasonCode"].is_null());
+    }
+
+    #[test]
     fn status_reports_panel_failure_without_using_request_display() {
         let mut touch = None;
-        let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
+        let panel = PanelState {
+            error: Some(PanelError::Unavailable(
+                "No DRM connector or framebuffer was found".into(),
+            )),
+            ..Default::default()
+        };
         let response = response(
             &mut touch,
-            Some(&error),
+            &panel,
             r#"{"protocolVersion":3,"display":{"nativeWidth":1600,"nativeHeight":720,"rotation":90},"action":{"command":"status"}}"#,
         );
         assert_eq!(response["ok"], true);
@@ -862,10 +912,15 @@ mod tests {
     #[test]
     fn tap_without_panel_names_geometry_reason() {
         let mut touch = None;
-        let error = PanelError::Unavailable("No DRM connector or framebuffer was found".into());
+        let panel = PanelState {
+            error: Some(PanelError::Unavailable(
+                "No DRM connector or framebuffer was found".into(),
+            )),
+            ..Default::default()
+        };
         let response = response(
             &mut touch,
-            Some(&error),
+            &panel,
             r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
         );
         assert_eq!(response["error"]["code"], "CAPABILITY_UNAVAILABLE");

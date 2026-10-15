@@ -19,6 +19,8 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_UNIX
 DevicePolicy=closed
 DeviceAllow=/dev/uinput rw
+# Read-only panel geometry (FBIOGET_VSCREENINFO) on framebuffer devices.
+DeviceAllow=/dev/fb0 r
 ReadWritePaths=/run/audb-agent
 
 [Install]
