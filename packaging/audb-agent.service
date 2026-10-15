@@ -19,7 +19,8 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_UNIX
 DevicePolicy=closed
 DeviceAllow=/dev/uinput rw
-# Read-only panel geometry (FBIOGET_VSCREENINFO) on framebuffer devices.
+# Read-open framebuffer access for one startup geometry getter; not an
+# ioctl-only or geometry-only boundary.
 DeviceAllow=/dev/fb0 r
 ReadWritePaths=/run/audb-agent
 

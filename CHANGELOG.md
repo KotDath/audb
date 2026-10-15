@@ -18,7 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the driver value is taken as the visible size. These are conditional checks,
   not a guarantee that an accepted size is native geometry. The unit adds a
   read-only `DeviceAllow=/dev/fb0 r` for this. `status` reports `panel.source`
-  and, when the var was rejected, a `panel.note`.
+  and, when the var was rejected or unusable, a `panel.note`.
+- The agent service unit grants the root service read-open access to `/dev/fb0`
+  through `DeviceAllow=/dev/fb0 r`. That permission applies for the lifetime of
+  the unit on every deployment, not only while the startup geometry getter runs,
+  and it is not an ioctl-only or geometry-only boundary: it permits reading the
+  framebuffer and whatever a read-only descriptor on that driver permits. It is
+  an accepted developer-device trade-off, not production hardening.
 - Panel geometry stays a best-effort kernel reading. When a framebuffer has no
   active `mode`, the first line of `modes` is used; the kernel prepends only
   unmatched modes, so a multi-mode list can keep a non-active mode first. No

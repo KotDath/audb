@@ -56,6 +56,21 @@ struct DrmScan {
     saw_connector: bool,
 }
 
+/// What asking the kernel for the framebuffer var produced.
+///
+/// `Unavailable` and `Unusable` are deliberately distinct: a var that was read
+/// but cannot be decoded still produces a diagnostic note instead of a silent
+/// fallback with no explanation.
+#[derive(Debug, PartialEq, Eq)]
+enum FbVar {
+    /// Missing device node, denied open, or a rejected ioctl.
+    Unavailable,
+    /// The visible size the ioctl reported.
+    Size(i32, i32),
+    /// The ioctl answered, but the value cannot be used.
+    Unusable(String),
+}
+
 /// Where the kernel panel size came from. Reported by agent status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelSource {
@@ -89,11 +104,11 @@ pub fn panel_geometry(sysfs: &Path) -> Result<PanelGeometry, PanelError> {
     panel_geometry_with(sysfs, &fb_var_size)
 }
 
-/// `fb_var_size` is a seam: the agent passes the framebuffer ioctl, while tests
+/// `fb_var` is a seam: the agent passes the framebuffer ioctl, while tests
 /// pass a fake so a sysfs fixture never reads the host's own framebuffer.
 fn panel_geometry_with(
     sysfs: &Path,
-    fb_var_size: &dyn Fn(&Path) -> Option<(i32, i32)>,
+    fb_var: &dyn Fn(&Path) -> FbVar,
 ) -> Result<PanelGeometry, PanelError> {
     let scan = drm_scan(sysfs)?;
     if scan.connected.len() > 1 {
@@ -121,7 +136,7 @@ fn panel_geometry_with(
             "Expected one connected DRM panel, found 0".into(),
         ));
     }
-    fbdev_panel(sysfs, fb_var_size)
+    fbdev_panel(sysfs, fb_var)
 }
 
 fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
@@ -170,10 +185,7 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
     Ok(scan)
 }
 
-fn fbdev_panel(
-    sysfs: &Path,
-    fb_var_size: &dyn Fn(&Path) -> Option<(i32, i32)>,
-) -> Result<PanelGeometry, PanelError> {
+fn fbdev_panel(sysfs: &Path, fb_var: &dyn Fn(&Path) -> FbVar) -> Result<PanelGeometry, PanelError> {
     let dir = sysfs.join("class/graphics");
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -212,7 +224,7 @@ fn fbdev_panel(
             "No DRM connector or framebuffer was found".into(),
         ));
     };
-    framebuffer_size(framebuffer, fb_var_size)
+    framebuffer_size(framebuffer, fb_var)
 }
 
 fn is_framebuffer(name: &str) -> bool {
@@ -224,7 +236,7 @@ fn is_framebuffer(name: &str) -> bool {
 
 fn framebuffer_size(
     fb: &Path,
-    fb_var_size: &dyn Fn(&Path) -> Option<(i32, i32)>,
+    fb_var: &dyn Fn(&Path) -> FbVar,
 ) -> Result<PanelGeometry, PanelError> {
     let name = fb
         .file_name()
@@ -236,22 +248,29 @@ fn framebuffer_size(
     let modes = read_text(&fb.join("modes"))?;
     let listed = listed_sizes(modes.as_deref());
     let mut note = None;
-    if let Some(size) = fb_var_size(fb) {
-        match fb_var_reject_reason(fb, size, listed.as_deref()) {
-            None => {
-                return Ok(PanelGeometry {
-                    display: display_from(size.0, size.1)?,
-                    source: PanelSource::FbdevVar,
-                    note: None,
-                })
-            }
-            Some(reason) => {
-                note = Some(format!(
-                    "Framebuffer var {}x{} was not used: {reason}",
-                    size.0, size.1
-                ));
+    match fb_var(fb) {
+        FbVar::Size(width, height) => {
+            match fb_var_reject_reason(fb, (width, height), listed.as_deref()) {
+                None => {
+                    return Ok(PanelGeometry {
+                        display: display_from(width, height)?,
+                        source: PanelSource::FbdevVar,
+                        note: None,
+                    })
+                }
+                Some(reason) => {
+                    note = Some(format!(
+                        "Framebuffer var {width}x{height} was not used: {reason}"
+                    ));
+                }
             }
         }
+        FbVar::Unusable(reason) => {
+            note = Some(format!(
+                "Framebuffer var was read but is unusable: {reason}"
+            ))
+        }
+        FbVar::Unavailable => {}
     }
     let mode = read_text(&fb.join("mode"))?;
     if let Some(text) = mode.as_deref().filter(|text| !text.trim().is_empty()) {
@@ -361,14 +380,18 @@ const FB_VAR_SCREENINFO_LEN: usize = 160;
 /// The current framebuffer size from `FBIOGET_VSCREENINFO`.
 ///
 /// Best effort: a missing device node, a denied open (the service unit allows
-/// only `/dev/uinput` unless `/dev/fb0` is added), or a driver that rejects the
-/// ioctl all yield `None`, so the text fallbacks keep working.
-fn fb_var_size(fb: &Path) -> Option<(i32, i32)> {
-    let name = fb.file_name()?.to_str()?;
-    let file = fs::File::open(Path::new("/dev").join(name)).ok()?;
+/// only `/dev/uinput` and `/dev/fb0`), or a driver that rejects the ioctl all
+/// yield `FbVar::Unavailable`, so the text fallbacks keep working.
+fn fb_var_size(fb: &Path) -> FbVar {
+    let Some(name) = fb.file_name().and_then(|name| name.to_str()) else {
+        return FbVar::Unavailable;
+    };
+    let Ok(file) = fs::File::open(Path::new("/dev").join(name)) else {
+        return FbVar::Unavailable;
+    };
     let mut buffer = [0u8; FB_VAR_SCREENINFO_LEN];
     if unsafe { libc::ioctl(file.as_raw_fd(), FBIOGET_VSCREENINFO, buffer.as_mut_ptr()) } < 0 {
-        return None;
+        return FbVar::Unavailable;
     }
     decode_fb_var(&buffer)
 }
@@ -376,12 +399,18 @@ fn fb_var_size(fb: &Path) -> Option<(i32, i32)> {
 /// `xres`/`yres`, the visible resolution, from a `struct fb_var_screeninfo`.
 ///
 /// `xres_virtual`/`yres_virtual` at offsets 8 and 12 are the aligned buffer and
-/// are deliberately not read.
-fn decode_fb_var(buffer: &[u8; FB_VAR_SCREENINFO_LEN]) -> Option<(i32, i32)> {
-    let xres = u32::from_ne_bytes(buffer[0..4].try_into().ok()?);
-    let yres = u32::from_ne_bytes(buffer[4..8].try_into().ok()?);
-    let size = (i32::try_from(xres).ok()?, i32::try_from(yres).ok()?);
-    (size.0 > 0 && size.1 > 0).then_some(size)
+/// are deliberately not read. Fixed-index reads on a fixed-size array cannot
+/// panic, so no error path is needed for the slice itself.
+fn decode_fb_var(buffer: &[u8; FB_VAR_SCREENINFO_LEN]) -> FbVar {
+    let xres = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    let yres = u32::from_ne_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+    let (Ok(width), Ok(height)) = (i32::try_from(xres), i32::try_from(yres)) else {
+        return FbVar::Unusable(format!("it reports {xres}x{yres}, not a 32-bit size"));
+    };
+    if width <= 0 || height <= 0 {
+        return FbVar::Unusable(format!("it reports {width}x{height}"));
+    }
+    FbVar::Size(width, height)
 }
 
 fn read_text(path: &Path) -> Result<Option<String>, PanelError> {
@@ -508,13 +537,13 @@ mod tests {
     /// reading the host's own `/dev/fb0`, which only the agent does.
     fn geometry_with_probe(
         sysfs_root: &Path,
-        probe: &dyn Fn(&Path) -> Option<(i32, i32)>,
+        probe: &dyn Fn(&Path) -> FbVar,
     ) -> Result<PanelGeometry, PanelError> {
         panel_geometry_with(sysfs_root, probe)
     }
 
     fn geometry(sysfs_root: &Path) -> Result<(i32, i32), PanelError> {
-        geometry_with_probe(sysfs_root, &|_| None).map(|panel| {
+        geometry_with_probe(sysfs_root, &|_| FbVar::Unavailable).map(|panel| {
             assert_eq!(
                 panel.display.rotation, 0,
                 "kernel geometry is not orientation"
@@ -627,7 +656,7 @@ mod tests {
                 files.push(("class/graphics/fb0/modes", text));
             }
             let dir = sysfs(&files);
-            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
             assert_eq!(panel.source, PanelSource::FbdevVar, "modes {modes:?}");
             assert!(panel.note.is_none(), "modes {modes:?}");
         }
@@ -641,9 +670,9 @@ mod tests {
             ("class/graphics/fb0/modes", "U:720x1600p-60\nbogus\n"),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(valid_first.path(), &|_| Some((720, 1600))).unwrap();
+        let panel = geometry_with_probe(valid_first.path(), &|_| FbVar::Size(720, 1600)).unwrap();
         assert_eq!(panel.source, PanelSource::FbdevVar);
-        let panel = geometry_with_probe(valid_first.path(), &|_| Some((736, 1600))).unwrap();
+        let panel = geometry_with_probe(valid_first.path(), &|_| FbVar::Size(736, 1600)).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevModes);
         assert!(panel.note.unwrap().contains("not one of the modes"));
@@ -655,7 +684,8 @@ mod tests {
             ("class/graphics/fb0/modes", "bogus\nU:720x1600p-60\n"),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let error = geometry_with_probe(junk_first.path(), &|_| Some((736, 1600))).unwrap_err();
+        let error =
+            geometry_with_probe(junk_first.path(), &|_| FbVar::Size(736, 1600)).unwrap_err();
         assert_eq!(error.reason_code(), "PANEL_GEOMETRY_INVALID");
     }
 
@@ -670,7 +700,7 @@ mod tests {
             ),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((1080, 2400))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(1080, 2400)).unwrap();
         assert_eq!(size(&panel), (1080, 2400));
         assert_eq!(panel.source, PanelSource::FbdevVar);
         assert!(panel.note.is_none());
@@ -684,7 +714,7 @@ mod tests {
             ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((736, 1600))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(736, 1600)).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevModes);
         let note = panel.note.unwrap();
@@ -704,7 +734,7 @@ mod tests {
                 ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
                 ("class/graphics/fb0/rotate", rotate.as_str()),
             ]);
-            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
             assert_eq!(panel.source, PanelSource::FbdevVar, "rotate {degrees}");
         }
         for degrees in [90, 270, 1, 3, -90, 999] {
@@ -714,7 +744,7 @@ mod tests {
                 ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
                 ("class/graphics/fb0/rotate", rotate.as_str()),
             ]);
-            let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+            let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
             assert_eq!(panel.source, PanelSource::FbdevModes, "rotate {degrees}");
             let note = panel.note.unwrap();
             assert!(note.contains(&format!("rotate is {degrees}")), "{note}");
@@ -729,7 +759,7 @@ mod tests {
             ("class/graphics/fb0/modes", "bogus\n"),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((736, 1600))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(736, 1600)).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevMode);
         let note = panel.note.unwrap();
@@ -746,7 +776,7 @@ mod tests {
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
         fs::create_dir(dir.path().join("class/graphics/fb0/mode")).unwrap();
-        let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevVar);
     }
@@ -767,8 +797,36 @@ mod tests {
         buffer[4..8].copy_from_slice(&1600u32.to_ne_bytes());
         buffer[8..12].copy_from_slice(&736u32.to_ne_bytes());
         buffer[12..16].copy_from_slice(&4800u32.to_ne_bytes());
-        assert_eq!(decode_fb_var(&buffer), Some((720, 1600)));
-        assert_eq!(decode_fb_var(&[0u8; FB_VAR_SCREENINFO_LEN]), None);
+        assert_eq!(decode_fb_var(&buffer), FbVar::Size(720, 1600));
+        // Unusable values carry a reason instead of vanishing into a fallback.
+        assert_eq!(
+            decode_fb_var(&[0u8; FB_VAR_SCREENINFO_LEN]),
+            FbVar::Unusable("it reports 0x0".into())
+        );
+        let mut overflow = [0u8; FB_VAR_SCREENINFO_LEN];
+        overflow[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        overflow[4..8].copy_from_slice(&1600u32.to_ne_bytes());
+        assert_eq!(
+            decode_fb_var(&overflow),
+            FbVar::Unusable("it reports 4294967295x1600, not a 32-bit size".into())
+        );
+    }
+
+    #[test]
+    fn unusable_framebuffer_var_still_produces_a_note() {
+        // Read but undecodable: the fallback must still explain itself.
+        let dir = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
+            ("class/graphics/fb0/rotate", "0\n"),
+        ]);
+        let probe = &|_: &Path| FbVar::Unusable("it reports 0x0".into());
+        let panel = geometry_with_probe(dir.path(), probe).unwrap();
+        assert_eq!(size(&panel), (720, 1600));
+        assert_eq!(panel.source, PanelSource::FbdevModes);
+        let note = panel.note.unwrap();
+        assert!(note.contains("unusable"), "{note}");
+        assert!(note.contains("0x0"), "{note}");
     }
 
     #[test]
@@ -779,7 +837,7 @@ mod tests {
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
         for bad in [(0, 0), (1, 1600), (20000, 1600)] {
-            let panel = geometry_with_probe(dir.path(), &|_| Some(bad)).unwrap();
+            let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(bad.0, bad.1)).unwrap();
             assert_eq!(panel.source, PanelSource::FbdevMode, "{bad:?}");
             assert_eq!(size(&panel), (1080, 2400), "{bad:?}");
             assert!(panel.note.is_some(), "{bad:?}");
@@ -792,7 +850,7 @@ mod tests {
             ("class/graphics/fb0/mode", ""),
             ("class/graphics/fb0/modes", "U:720x1600p-60\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
         assert_eq!(panel.source, PanelSource::FbdevModes);
         assert!(panel.note.unwrap().contains("rotate"));
     }
@@ -804,7 +862,7 @@ mod tests {
             ("class/graphics/fb0/modes", ""),
             ("class/graphics/fb0/rotate", "0\n"),
         ]);
-        let panel = geometry_with_probe(dir.path(), &|_| Some((720, 1600))).unwrap();
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Size(720, 1600)).unwrap();
         assert_eq!(size(&panel), (720, 1600));
         assert_eq!(panel.source, PanelSource::FbdevVar);
     }
