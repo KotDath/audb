@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the driver value is taken as the visible size. These are conditional checks,
   not a guarantee that an accepted size is native geometry. The unit adds a
   read-only `DeviceAllow=/dev/fb0 r` for this. `status` reports `panel.source`
-  and, when the var was rejected or unusable, a `panel.note`.
+  and, when the var was rejected or unusable and a text source still resolves a
+  size, a `panel.note`; if no source resolves one, status reports the panel
+  error instead.
 - The agent service unit grants the root service read-open access to `/dev/fb0`
   through `DeviceAllow=/dev/fb0 r`. That permission applies for the lifetime of
   the unit on every deployment, not only while the startup geometry getter runs,
