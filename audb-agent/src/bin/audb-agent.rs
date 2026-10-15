@@ -489,7 +489,13 @@ fn handle(
             if display.native_width != touch.display.native_width
                 || display.native_height != touch.display.native_height
             {
-                return Err("Graphical session geometry does not match kernel panel".into());
+                return Err(format!(
+                    "Graphical session native geometry {}x{} differs from the kernel geometry {}x{} chosen at startup; the action was rejected. A framebuffer mode list can start with a mode that is not active, and a panel mode change needs an agent restart.",
+                    display.native_width,
+                    display.native_height,
+                    touch.display.native_width,
+                    touch.display.native_height
+                ));
             }
         }
         if let audb_agent::Action::Screenshot { directory } = &req.action {
@@ -747,10 +753,11 @@ mod tests {
         );
         assert_eq!(response["ok"], false);
         assert_eq!(response["error"]["code"], "INPUT_FAILED");
-        assert_eq!(
-            response["error"]["message"],
-            "Graphical session geometry does not match kernel panel"
-        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("1080x2340"), "{message}");
+        assert!(message.contains("720x1600"), "{message}");
+        // A rejected request must not write any uinput event.
+        assert_eq!(touch.as_ref().unwrap().file.metadata().unwrap().len(), 0);
     }
 
     #[test]

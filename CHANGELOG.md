@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The kernel-geometry mismatch error reports both the session and the startup
+  panel size plus the rejected action, instead of only "does not match kernel
+  panel". The fbdev fallback keeps using the first listed mode: the kernel
+  prepends the active mode, and treating multi-mode lists as ambiguous would
+  disable physical input on panels that work today.
+
 ### Fixed
 
 - Physical touch on framebuffer panels that have no DRM connector. The agent

@@ -226,6 +226,13 @@ fn parse_drm_i32(token: &str, line: &str) -> Result<i32, PanelError> {
         .map_err(|_| PanelError::Invalid(format!("DRM connector mode is malformed: {line}")))
 }
 
+/// The first non-empty line of the fbdev `modes` list.
+///
+/// The kernel core prepends the active mode to `fb_info->modelist`
+/// (`fb_var_to_videomode` in `do_register_framebuffer` and in `fb_set_var`),
+/// and `fb_add_videomode` uses `list_add`, so the first line is normally the
+/// active mode. Linux does not document that order, so a disagreement with the
+/// session geometry is reported by the agent instead of guessing another line.
 fn parse_fbdev_mode(text: &str) -> Result<(i32, i32), PanelError> {
     let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
         return Err(PanelError::Invalid("fbdev mode is empty".into()));
@@ -372,6 +379,18 @@ mod tests {
             ("class/graphics/fb0/modes", FB_MODES),
         ]);
         assert_eq!(geometry(dir.path()).unwrap(), (720, 1600));
+    }
+
+    #[test]
+    fn multi_line_fbdev_modes_uses_the_first_listed_size() {
+        // The kernel prepends the active mode, so the first line is normally
+        // the active one. The order is not a documented guarantee; a wrong
+        // pick fail-closes in the agent as INPUT_FAILED, not as a wrong tap.
+        let dir = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "U:1080x2400p-60\nU:720x1600p-60\n"),
+        ]);
+        assert_eq!(geometry(dir.path()).unwrap(), (1080, 2400));
     }
 
     #[test]
