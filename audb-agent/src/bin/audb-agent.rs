@@ -175,17 +175,24 @@ impl Drop for Touch {
         }
     }
 }
-// Persistent keyboard; every click releases the key even after disconnect.
+// Only register a keyboard during a key request. An idle physical keyboard
+// suppresses Aurora's on-screen keyboard, including in unrelated applications.
 struct Keyboard {
     file: File,
     pressed: Option<u16>,
 }
 impl Keyboard {
-    fn create() -> io::Result<Self> {
-        let mut file = OpenOptions::new()
+    fn available() -> bool {
+        Self::open().is_ok()
+    }
+    fn open() -> io::Result<File> {
+        OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open("/dev/uinput")?;
+            .open("/dev/uinput")
+    }
+    fn create() -> io::Result<Self> {
+        let mut file = Self::open()?;
         let fd = file.as_raw_fd();
         for event in [EV_SYN, EV_KEY] {
             if unsafe { libc::ioctl(fd, 0x40045564 as libc::c_ulong, event as i32) } < 0 {
@@ -446,7 +453,7 @@ fn permission_request(uid: u32, action: &audb_agent::Action) -> Value {
 }
 fn handle(
     touch: &mut Option<Touch>,
-    keyboard: &mut Option<Keyboard>,
+    keyboard_available: bool,
     socket: &UnixStream,
     uid: libc::uid_t,
 ) -> Value {
@@ -472,10 +479,24 @@ fn handle(
         let Some((code, canonical)) = audb_protocol::input::key_code(name) else {
             return json!({"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Unsupported key name"}});
         };
-        let Some(keyboard) = keyboard.as_mut() else {
+        if !keyboard_available {
             return json!({"ok":false,"error":{"code":"CAPABILITY_UNAVAILABLE","message":"No available uinput keyboard"}});
+        }
+        let mut keyboard = match Keyboard::create() {
+            Ok(keyboard) => keyboard,
+            Err(e) => {
+                return json!({"ok":false,"error":{"code":"CAPABILITY_UNAVAILABLE","message":e.to_string()}});
+            }
         };
-        return match keyboard.click(code, socket) {
+        let result = (|| {
+            // Let udev/compositor discover this device before submitting events.
+            pause(Duration::from_millis(700), socket)?;
+            keyboard.click(code, socket)?;
+            // Let the compositor consume the release before removing the device.
+            pause(Duration::from_millis(100), socket)
+        })();
+        drop(keyboard);
+        return match result {
             Ok(()) => {
                 json!({"ok":true,"data":{"backend":"uinput","key":canonical,"delivery":"submitted","released":true}})
             }
@@ -499,7 +520,7 @@ fn handle(
             let display = req.display.map(|d| { let (w,h) = d.size(); json!({"width":w,"height":h,"nativeWidth":d.native_width,"nativeHeight":d.native_height,"rotation":d.rotation}) });
             return Ok(
                 json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
-                "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action}),
+                "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard_available,"screenshot":req.display.is_some(),"permissions":true},"action":req.action}),
             );
         }
         let display = req.display.ok_or("Missing graphical session geometry")?;
@@ -531,7 +552,7 @@ fn handle(
         Ok(
             json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput",
             "display":{"width":w,"height":h,"nativeWidth":display.native_width,"nativeHeight":display.native_height,"rotation":display.rotation},
-            "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":true,"permissions":true},"action":req.action}),
+            "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard_available,"screenshot":true,"permissions":true},"action":req.action}),
         )
     })();
     match result {
@@ -552,10 +573,8 @@ fn run() -> Result<(), String> {
         .and_then(|display| Touch::create(display).map_err(|e| e.to_string()))
         .map_err(|e| eprintln!("Input unavailable; permission service remains available: {e}"))
         .ok();
-    let mut keyboard = Keyboard::create()
-        .map_err(|e| eprintln!("Keyboard unavailable: {e}"))
-        .ok();
-    // Allow compositor/udev to discover the persistent device before serving.
+    let keyboard_available = Keyboard::available();
+    // Allow compositor/udev to discover the persistent touchscreen before serving.
     std::thread::sleep(Duration::from_millis(700));
     let dir = std::path::Path::new(SOCKET).parent().unwrap();
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -591,7 +610,7 @@ fn run() -> Result<(), String> {
                 let Some(uid) = peer_allowed(&socket, gid) else {
                     continue;
                 };
-                let response = handle(&mut touch, &mut keyboard, &socket, uid);
+                let response = handle(&mut touch, keyboard_available, &socket, uid);
                 let _ = writeln!(socket, "{response}");
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -625,6 +644,33 @@ fn main() {
 mod tests {
     use super::*;
     use std::io::Read;
+    #[test]
+    fn dropping_keyboard_releases_a_pending_key() {
+        let file = tempfile::tempfile().unwrap();
+        let mut observer = file.try_clone().unwrap();
+        let keyboard = Keyboard {
+            file,
+            pressed: Some(28),
+        };
+        drop(keyboard);
+        observer.rewind().unwrap();
+        let mut bytes = Vec::new();
+        observer.read_to_end(&mut bytes).unwrap();
+        let size = std::mem::size_of::<InputEvent>();
+        assert_eq!(bytes.len(), 2 * size);
+        let events = bytes
+            .chunks_exact(size)
+            .map(|chunk| unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<InputEvent>()) })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (events[0].kind, events[0].code, events[0].value),
+            (EV_KEY, 28, 0)
+        );
+        assert_eq!(
+            (events[1].kind, events[1].code, events[1].value),
+            (EV_SYN, 0, 0)
+        );
+    }
     #[test]
     fn keyboard_disconnect_releases_pressed_key() {
         let file = tempfile::tempfile().unwrap();

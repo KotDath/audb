@@ -1,6 +1,6 @@
 Name: audb-agent
 Version: 0.3.0
-Release: 10
+Release: 14
 Summary: Device automation service for Aurora Debug Bridge
 License: MIT
 Source0: audb-agent-stage.tar.gz
