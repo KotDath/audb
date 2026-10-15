@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The kernel-geometry mismatch error reports both the session and the startup
-  panel size plus the rejected action, instead of only "does not match kernel
-  panel". The fbdev fallback keeps using the first listed mode: the kernel
-  prepends the active mode, and treating multi-mode lists as ambiguous would
-  disable physical input on panels that work today.
+- Panel geometry stays a best-effort kernel reading. When a framebuffer has no
+  active `mode`, the first line of `modes` is used; the kernel prepends only
+  unmatched modes, so a multi-mode list can keep a non-active mode first. No
+  multi-mode device has been demonstrated, and treating such lists as ambiguous
+  would disable panels that work today.
+- A session geometry that disagrees with the startup node is reported on
+  `status` as `PANEL_GEOMETRY_MISMATCH` with both native sizes, `tap` and `swipe`
+  are no longer advertised as ready, and doctor shows a touch warning without
+  asking for a reinstall. Gestures stay fail-closed with `INPUT_FAILED`, while
+  screenshots, keyboard and permissions are unaffected even when the two
+  geometries disagree.
 
 ### Fixed
 

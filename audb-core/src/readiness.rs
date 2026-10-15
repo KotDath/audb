@@ -908,6 +908,52 @@ mod tests {
     }
 
     #[test]
+    fn session_geometry_mismatch_is_a_touch_warning_that_keeps_other_capabilities() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2340, "height": 1080, "nativeWidth": 1080, "nativeHeight": 2340, "rotation": 90},
+                "capabilities": {"tap": false, "swipe": false, "key": true, "text": true, "screenshot": true},
+                "panel": {
+                    "reasonCode": "PANEL_GEOMETRY_MISMATCH",
+                    "message": "Session geometry 1080x2340 differs from the kernel geometry 720x1600 chosen at startup",
+                    "sessionWidth": 1080,
+                    "sessionHeight": 2340,
+                    "nativeWidth": 720,
+                    "nativeHeight": 1600
+                }
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        assert_eq!(caps["tap"].ready, Some(false));
+        assert_eq!(
+            caps["tap"].reason_code.as_deref(),
+            Some("PANEL_GEOMETRY_MISMATCH")
+        );
+        assert_eq!(
+            caps["tap"].reason.as_deref(),
+            Some("Session geometry 1080x2340 differs from the kernel geometry 720x1600 chosen at startup")
+        );
+        assert_eq!(
+            caps["swipe"].reason_code.as_deref(),
+            Some("PANEL_GEOMETRY_MISMATCH")
+        );
+        assert!(!caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
+        assert_eq!(caps["key"].ready, Some(true));
+        assert_eq!(caps["screenshot"].ready, Some(true));
+        let warning = touch_warning(&agent).unwrap();
+        assert_eq!(warning.name, "touch");
+        assert_eq!(warning.status, "warning");
+        assert_eq!(warning.code.as_deref(), Some("PANEL_GEOMETRY_MISMATCH"));
+        assert!(!warning.fix.as_deref().unwrap().contains("setup-device"));
+    }
+
+    #[test]
     fn failed_agent_still_prescribes_setup_device() {
         let agent = Check::problem(
             "agent",

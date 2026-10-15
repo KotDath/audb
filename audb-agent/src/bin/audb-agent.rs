@@ -422,6 +422,22 @@ fn permission_request(uid: u32, action: &audb_agent::Action) -> Value {
     })();
     result.unwrap_or_else(|message| json!({"ok":false,"error":{"code":"OUTCOME_UNKNOWN","message":message},"data":{"phase":"permission_worker","mayHaveChanged":true}}))
 }
+/// Session geometry versus the size fixed into the uinput node at startup.
+///
+/// Rotation is not part of it: the node keeps native axes and `native_point`
+/// applies the per-request rotation.
+fn geometry_mismatch(
+    session: Option<&Display>,
+    touch: Option<&Touch>,
+) -> Option<((i32, i32), (i32, i32))> {
+    let (session, touch) = (session?, touch?);
+    (session.native_width != touch.display.native_width
+        || session.native_height != touch.display.native_height)
+        .then_some((
+            (session.native_width, session.native_height),
+            (touch.display.native_width, touch.display.native_height),
+        ))
+}
 fn handle(
     touch: &mut Option<Touch>,
     panel_error: Option<&PanelError>,
@@ -476,28 +492,32 @@ fn handle(
         }
         if matches!(req.action, audb_agent::Action::Status) {
             let display = req.display.map(|d| { let (w,h) = d.size(); json!({"width":w,"height":h,"nativeWidth":d.native_width,"nativeHeight":d.native_height,"rotation":d.rotation}) });
+            // A gesture is rejected when the session size and the startup node
+            // disagree, so status must not advertise touch as ready then.
+            let mismatch = geometry_mismatch(req.display.as_ref(), touch.as_ref());
+            let ready = touch.is_some() && mismatch.is_none();
             let mut data = json!({"protocolVersion":PROTOCOL,"version":env!("CARGO_PKG_VERSION"),"backend":"uinput","display":display,
-                "capabilities":{"tap":touch.is_some(),"swipe":touch.is_some(),"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action});
+                "capabilities":{"tap":ready,"swipe":ready,"key":keyboard.is_some(),"screenshot":req.display.is_some(),"permissions":true},"action":req.action});
             if let Some(error) = panel_error {
                 data["panel"] =
                     json!({"reasonCode":error.reason_code(),"message":error.to_string()});
+            } else if let Some(((session_width, session_height), (kernel_width, kernel_height))) =
+                mismatch
+            {
+                data["panel"] = json!({
+                    "reasonCode": "PANEL_GEOMETRY_MISMATCH",
+                    "message": format!("Session geometry {session_width}x{session_height} differs from the kernel geometry {kernel_width}x{kernel_height} chosen at startup"),
+                    "sessionWidth": session_width,
+                    "sessionHeight": session_height,
+                    "nativeWidth": kernel_width,
+                    "nativeHeight": kernel_height,
+                });
             }
             return Ok(data);
         }
         let display = req.display.ok_or("Missing graphical session geometry")?;
-        if let Some(touch) = touch.as_ref() {
-            if display.native_width != touch.display.native_width
-                || display.native_height != touch.display.native_height
-            {
-                return Err(format!(
-                    "Graphical session native geometry {}x{} differs from the kernel geometry {}x{} chosen at startup; the action was rejected. A framebuffer mode list can start with a mode that is not active, and a panel mode change needs an agent restart.",
-                    display.native_width,
-                    display.native_height,
-                    touch.display.native_width,
-                    touch.display.native_height
-                ));
-            }
-        }
+        // Only gestures depend on the uinput node size, so only they are gated
+        // by it. Screenshots must stay reachable when the two disagree.
         if let audb_agent::Action::Screenshot { directory } = &req.action {
             error_code = "SCREENSHOT_FAILED";
             audb_agent::screenshot::request(
@@ -515,6 +535,13 @@ fn handle(
                     None => "No available uinput touchscreen/DRM panel".into(),
                 });
             };
+            if let Some(((session_width, session_height), (kernel_width, kernel_height))) =
+                geometry_mismatch(Some(&display), Some(&*touch))
+            {
+                return Err(format!(
+                    "Graphical session native geometry {session_width}x{session_height} differs from the kernel geometry {kernel_width}x{kernel_height} chosen at startup; the action was rejected. The startup size is a best-effort kernel reading: a framebuffer mode list can start with a mode that is not active, and a panel mode change needs an agent restart."
+                ));
+            }
             touch.perform(g, socket)?;
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -743,21 +770,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_geometry_mismatch_stays_input_failed() {
+    const MISMATCHED_DISPLAY: &str =
+        r#""display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0}"#;
+
+    fn mismatched(action: &str) -> (Value, u64) {
         let mut touch = Some(touch_node(720, 1600));
-        let response = response(
-            &mut touch,
-            None,
-            r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"tap","x":1,"y":1,"duration_ms":40}}"#,
-        );
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["error"]["code"], "INPUT_FAILED");
+        let payload = format!("{{\"protocolVersion\":3,{MISMATCHED_DISPLAY},\"action\":{action}}}");
+        let response = response(&mut touch, None, &payload);
+        let written = touch.as_ref().unwrap().file.metadata().unwrap().len();
+        (response, written)
+    }
+
+    #[test]
+    fn mismatched_tap_and_swipe_write_no_input_events() {
+        for action in [
+            r#"{"command":"tap","x":1,"y":1,"duration_ms":40}"#,
+            r#"{"command":"swipe","args":["up"],"duration_ms":800}"#,
+        ] {
+            let (response, written) = mismatched(action);
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], "INPUT_FAILED");
+            let message = response["error"]["message"].as_str().unwrap();
+            assert!(message.contains("1080x2340"), "{message}");
+            assert!(message.contains("720x1600"), "{message}");
+            assert_eq!(
+                written, 0,
+                "a rejected gesture must not write uinput events"
+            );
+        }
+    }
+
+    #[test]
+    fn mismatched_screenshot_does_not_use_the_touch_geometry_guard() {
+        // The token is rejected by the screenshot path itself, which proves the
+        // request reached it instead of the touch-node guard.
+        let (response, _) = mismatched(r#"{"command":"screenshot","directory":"bogus"}"#);
+        assert_eq!(response["error"]["code"], "SCREENSHOT_FAILED", "{response}");
         let message = response["error"]["message"].as_str().unwrap();
-        assert!(message.contains("1080x2340"), "{message}");
-        assert!(message.contains("720x1600"), "{message}");
-        // A rejected request must not write any uinput event.
-        assert_eq!(touch.as_ref().unwrap().file.metadata().unwrap().len(), 0);
+        assert!(!message.contains("kernel geometry"), "{message}");
+    }
+
+    #[test]
+    fn status_reports_a_geometry_mismatch_without_advertising_touch() {
+        let response = response(
+            &mut Some(touch_node(720, 1600)),
+            None,
+            r#"{"protocolVersion":3,"display":{"nativeWidth":1080,"nativeHeight":2340,"rotation":0},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data"]["capabilities"]["tap"], false);
+        assert_eq!(response["data"]["capabilities"]["swipe"], false);
+        assert_eq!(response["data"]["capabilities"]["screenshot"], true);
+        let panel = &response["data"]["panel"];
+        assert_eq!(panel["reasonCode"], "PANEL_GEOMETRY_MISMATCH");
+        assert_eq!(panel["sessionWidth"], 1080);
+        assert_eq!(panel["sessionHeight"], 2340);
+        assert_eq!(panel["nativeWidth"], 720);
+        assert_eq!(panel["nativeHeight"], 1600);
+    }
+
+    #[test]
+    fn status_reports_touch_ready_when_the_geometry_matches() {
+        let response = response(
+            &mut Some(touch_node(720, 1600)),
+            None,
+            r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":90},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(response["data"]["capabilities"]["tap"], true);
+        assert!(response["data"]["panel"].is_null(), "{}", response["data"]);
     }
 
     #[test]
