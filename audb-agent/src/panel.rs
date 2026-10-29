@@ -127,6 +127,7 @@ fn panel_geometry_with(
             ))
         })?;
         let (width, height) = parse_drm_mode(&modes)?;
+        eprintln!("Using DRM panel {} {width}x{height}", node_name(connector));
         return Ok(PanelGeometry {
             display: display_from(width, height)?,
             source: PanelSource::Drm,
@@ -157,6 +158,21 @@ fn node_names(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
+fn is_writeback_connector(name: &str) -> bool {
+    let Some((card, connector)) = name.split_once('-') else {
+        return false;
+    };
+    let Some(card_index) = card.strip_prefix("card") else {
+        return false;
+    };
+    let Some((kind, connector_index)) = connector.rsplit_once('-') else {
+        return false;
+    };
+    let is_index =
+        |value: &str| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit());
+    is_index(card_index) && kind.eq_ignore_ascii_case("writeback") && is_index(connector_index)
+}
+
 fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
     let dir = sysfs.join("class/drm");
     let entries = match fs::read_dir(&dir) {
@@ -182,6 +198,9 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         let entry = entry.map_err(|error| {
             PanelError::ReadFailed(format!("Cannot read {}: {error}", dir.display()))
         })?;
+        if is_writeback_connector(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         // A dangling connector symlink is a leftover rather than a panel, so skip that entry
         // instead of failing the whole scan.
         let metadata = match fs::metadata(entry.path()) {
@@ -651,6 +670,84 @@ mod tests {
             message.contains("fb0") && message.contains("fb1"),
             "{message}"
         );
+    }
+
+    fn connector(root: &Path, name: &str, status: &str, modes: &str) {
+        let path = root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("status"), status).unwrap();
+        fs::write(path.join("modes"), modes).unwrap();
+    }
+
+    #[test]
+    fn dialog_panel_is_selected_among_writeback_connectors() {
+        let root = tempfile::tempdir().unwrap();
+        let drm = root.path().join("class/drm");
+        fs::create_dir_all(&drm).unwrap();
+        let device = root.path().join("devices");
+        connector(&device, "panel", "connected\n", "1080x2460\n");
+        std::os::unix::fs::symlink(device.join("panel"), drm.join("card0-DSI-1")).unwrap();
+        for name in ["card0-Writeback-1", "card0-Writeback-2"] {
+            connector(&drm, name, "connected\n", "4096x2160\n");
+        }
+        connector(&drm, "card0-HDMI-A-1", "disconnected\n", "800x600\n");
+
+        let panel = geometry_with_probe(root.path(), &|_| FbVar::Unavailable).unwrap();
+        let name = panel.node;
+        let display = panel.display;
+        assert_eq!(name, "card0-DSI-1");
+        assert_eq!((display.native_width, display.native_height), (1080, 2460));
+        assert_eq!(display.rotation, 0);
+    }
+
+    #[test]
+    fn writeback_only_does_not_supply_panel_geometry() {
+        let root = tempfile::tempdir().unwrap();
+        let drm = root.path().join("class/drm");
+        connector(&drm, "card0-Writeback-1", "connected\n", "4096x2160\n");
+        connector(&drm, "card0-Writeback-2", "connected\n", "invalid-mode\n");
+        assert_eq!(
+            geometry_with_probe(root.path(), &|_| FbVar::Unavailable)
+                .unwrap_err()
+                .to_string(),
+            "No DRM connector or framebuffer was found"
+        );
+    }
+
+    #[test]
+    fn multiple_physical_outputs_remain_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let drm = root.path().join("class/drm");
+        connector(&drm, "card0-DSI-1", "connected\n", "1080x2460\n");
+        connector(&drm, "card0-HDMI-A-1", "connected\n", "800x600\n");
+        connector(&drm, "card0-Writeback-1", "connected\n", "4096x2160\n");
+        let error = geometry_with_probe(root.path(), &|_| FbVar::Unavailable)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("found 2"), "{error}");
+        assert!(error.contains("card0-DSI-1"), "{error}");
+        assert!(error.contains("card0-HDMI-A-1"), "{error}");
+        assert!(!error.contains("Writeback"), "{error}");
+    }
+
+    #[test]
+    fn writeback_filter_matches_connector_type_not_arbitrary_substrings() {
+        for name in [
+            "card0-Writeback-1",
+            "card12-writeback-2",
+            "card1-WRITEBACK-10",
+        ] {
+            assert!(is_writeback_connector(name), "{name}");
+        }
+        for name in [
+            "card0-DSI-1",
+            "card0-HDMI-Writeback-1",
+            "card-Writeback-1",
+            "card0-Writeback-",
+            "card0-Writeback-one",
+        ] {
+            assert!(!is_writeback_connector(name), "{name}");
+        }
     }
 
     /// Measured on mtkfb: 14 bytes, including the trailing newline.
