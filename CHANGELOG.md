@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The framebuffer panel size now comes from the framebuffer var
+  (`FBIOGET_VSCREENINFO`) when the service unit allows `/dev/fb0`, falling back
+  to a non-empty `mode` and then to the first `modes` line. The var is rejected
+  when `rotate` is neither 0 nor 180, when the size is outside the supported
+  range, or when the kernel publishes a `modes` list that does not contain it;
+  a non-empty but unusable list is not treated as no list. With no list at all
+  the driver value is taken as the visible size. These are conditional checks,
+  not a guarantee that an accepted size is native geometry. The unit adds a
+  read-only `DeviceAllow=/dev/fb0 r` for this. `status` reports `panel.source`
+  and, when the var was rejected or unusable and a text source still resolves a
+  size, a `panel.note`; if no source resolves one, status reports the panel
+  error instead.
+- The agent service unit grants the root service read-open access to `/dev/fb0`
+  through `DeviceAllow=/dev/fb0 r`. That permission applies for the lifetime of
+  the unit on every deployment, not only while the startup geometry getter runs,
+  and it is not an ioctl-only or geometry-only boundary: it permits reading the
+  framebuffer and whatever a read-only descriptor on that driver permits. It is
+  an accepted developer-device trade-off, not production hardening.
+- Panel geometry stays a best-effort kernel reading. When a framebuffer has no
+  active `mode`, the first line of `modes` is used; the kernel prepends only
+  unmatched modes, so a multi-mode list can keep a non-active mode first. No
+  multi-mode device has been demonstrated, and treating such lists as ambiguous
+  would disable panels that work today.
+- A session geometry that disagrees with the startup node is reported on
+  `status` as `PANEL_GEOMETRY_MISMATCH` with both native sizes, `tap` and `swipe`
+  are no longer advertised as ready, and doctor shows a touch warning without
+  asking for a reinstall. Gestures stay fail-closed with `INPUT_FAILED`, while
+  screenshots, keyboard and permissions are unaffected even when the two
+  geometries disagree.
+
+### Fixed
+
+- Physical touch on framebuffer panels that have no DRM connector. The agent
+  reads the fbdev mode file and falls back to modes. Keyboard, permissions and
+  screenshots stay available when no panel mode exists. doctor stays healthy
+  and reports a touch warning instead of asking for another device setup after
+  the agent is already installed.
+- DRM connector symlinks are followed, so an existing KMS panel is not replaced
+  by a framebuffer mode.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added
