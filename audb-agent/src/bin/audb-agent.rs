@@ -31,6 +31,8 @@ struct InputEvent {
     code: u16,
     value: i32,
 }
+#[cfg(all(target_arch = "arm", target_pointer_width = "32"))]
+const _: () = assert!(std::mem::size_of::<InputEvent>() == 16);
 #[repr(C)]
 struct UinputDevice {
     name: [u8; 80],
@@ -431,6 +433,8 @@ struct PanelState {
     error: Option<PanelError>,
     source: Option<&'static str>,
     note: Option<String>,
+    node: Option<String>,
+    display: Option<Display>,
 }
 
 /// Session geometry versus the size fixed into the uinput node at startup.
@@ -528,6 +532,19 @@ fn handle(
             if let Some(source) = panel.source {
                 panel_json["source"] = json!(source);
             }
+            if let Some(node) = &panel.node {
+                panel_json["node"] = json!(node);
+            }
+            if let Some(native) = panel.display {
+                panel_json["nativeWidth"] = json!(native.native_width);
+                panel_json["nativeHeight"] = json!(native.native_height);
+                if let Some(session) = req.display {
+                    panel_json["matchesSession"] = json!(
+                        session.native_width == native.native_width
+                            && session.native_height == native.native_height
+                    );
+                }
+            }
             if let Some(note) = panel.note.as_ref() {
                 panel_json["note"] = json!(note);
             }
@@ -597,6 +614,8 @@ fn run() -> Result<(), String> {
         Ok(geometry) => {
             panel_state.source = Some(geometry.source.as_str());
             panel_state.note = geometry.note;
+            panel_state.node = Some(geometry.node);
+            panel_state.display = Some(geometry.display);
             Touch::create(geometry.display)
                 .map_err(|e| {
                     eprintln!("Input unavailable; permission service remains available: {e}")

@@ -96,6 +96,7 @@ impl PanelSource {
 pub struct PanelGeometry {
     pub display: Display,
     pub source: PanelSource,
+    pub node: String,
     /// Set when the framebuffer var was readable but deliberately not used.
     pub note: Option<String>,
 }
@@ -113,8 +114,9 @@ fn panel_geometry_with(
     let scan = drm_scan(sysfs)?;
     if scan.connected.len() > 1 {
         return Err(PanelError::Ambiguous(format!(
-            "Expected one connected DRM panel, found {}",
-            scan.connected.len()
+            "Expected one connected DRM panel, found {}: {}",
+            scan.connected.len(),
+            node_names(&scan.connected)
         )));
     }
     if let Some(connector) = scan.connected.first() {
@@ -128,6 +130,7 @@ fn panel_geometry_with(
         return Ok(PanelGeometry {
             display: display_from(width, height)?,
             source: PanelSource::Drm,
+            node: node_name(connector),
             note: None,
         });
     }
@@ -137,6 +140,21 @@ fn panel_geometry_with(
         ));
     }
     fbdev_panel(sysfs, fb_var)
+}
+
+fn node_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("panel")
+        .to_owned()
+}
+
+fn node_names(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| node_name(path))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
@@ -164,15 +182,36 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         let entry = entry.map_err(|error| {
             PanelError::ReadFailed(format!("Cannot read {}: {error}", dir.display()))
         })?;
-        // `version` is a file. Connectors are directories. Sysfs publishes
-        // them as symlinks, and `DirEntry::metadata` does not follow those.
-        let metadata = fs::metadata(entry.path()).map_err(|error| {
-            PanelError::ReadFailed(format!("Cannot read {}: {error}", entry.path().display()))
-        })?;
+        // A dangling connector symlink is a leftover rather than a panel, so skip that entry
+        // instead of failing the whole scan.
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(PanelError::ReadFailed(format!(
+                    "Cannot read {}: {error}",
+                    entry.path().display()
+                )))
+            }
+        };
         if !metadata.is_dir() {
             continue;
         }
+        // `version` is a file and `cardN` is the card node; connectors are
+        // `card<N>-<connector>-<type>-<id>`. A connector must be honoured even when its status
+        // file cannot be read, otherwise an unreadable connector would silently fall back to
+        // fbdev on a device that does have DRM.
+        let connector = is_connector(&entry.file_name().to_string_lossy());
+        if connector {
+            scan.saw_connector = true;
+        }
         match read_text(&entry.path().join("status"))? {
+            None if connector => {
+                return Err(PanelError::ReadFailed(format!(
+                    "DRM connector {} is missing its status file",
+                    entry.path().display()
+                )))
+            }
             None => {}
             Some(status) => {
                 scan.saw_connector = true;
@@ -183,6 +222,16 @@ fn drm_scan(sysfs: &Path) -> Result<DrmScan, PanelError> {
         }
     }
     Ok(scan)
+}
+
+/// DRM connectors are published as `card<N>-<connector>-<type>-<id>` (for example
+/// `card0-DSI-1`). `card0` itself and `version` are not connectors.
+fn is_connector(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("card") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest.as_bytes().get(digits) == Some(&b'-')
 }
 
 fn fbdev_panel(sysfs: &Path, fb_var: &dyn Fn(&Path) -> FbVar) -> Result<PanelGeometry, PanelError> {
@@ -215,8 +264,9 @@ fn fbdev_panel(sysfs: &Path, fb_var: &dyn Fn(&Path) -> FbVar) -> Result<PanelGeo
     }
     if framebuffers.len() > 1 {
         return Err(PanelError::Ambiguous(format!(
-            "Expected one framebuffer, found {}",
-            framebuffers.len()
+            "Expected one framebuffer, found {}: {}",
+            framebuffers.len(),
+            node_names(&framebuffers)
         )));
     }
     let Some(framebuffer) = framebuffers.first() else {
@@ -255,6 +305,7 @@ fn framebuffer_size(
                     return Ok(PanelGeometry {
                         display: display_from(width, height)?,
                         source: PanelSource::FbdevVar,
+                        node: node_name(fb),
                         note: None,
                     })
                 }
@@ -278,6 +329,7 @@ fn framebuffer_size(
         return Ok(PanelGeometry {
             display: display_from(width, height)?,
             source: PanelSource::FbdevMode,
+            node: node_name(fb),
             note,
         });
     }
@@ -287,6 +339,7 @@ fn framebuffer_size(
             Ok(PanelGeometry {
                 display: display_from(width, height)?,
                 source: PanelSource::FbdevModes,
+                node: node_name(fb),
                 note,
             })
         }
@@ -519,6 +572,86 @@ fn display_from(width: i32, height: i32) -> Result<Display, PanelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Measured on the Fplus T1100 (mtkfb): there is no DRM class at all, `mode` is
+    /// empty, `modes` carries the panel, and `virtual_size` is a triple buffer
+    /// (2176 x 3) that must never be mistaken for the panel.
+    #[test]
+    fn t1100_mtkfb_uses_modes_and_rejects_virtual_size() {
+        let dir = sysfs(&[
+            ("class/graphics/fb0/mode", ""),
+            ("class/graphics/fb0/modes", "U:1600x2176p-0\n"),
+            ("class/graphics/fb0/virtual_size", "1600,6528\n"),
+            ("class/graphics/fb0/stride", "6400\n"),
+            ("class/graphics/fb0/bits_per_pixel", "32\n"),
+            ("class/graphics/fb0/name", "mtkfb\n"),
+        ]);
+        assert!(!dir.path().join("class/drm").exists());
+        let panel = geometry_with_probe(dir.path(), &|_| FbVar::Unavailable).unwrap();
+        assert_eq!(
+            (panel.display.native_width, panel.display.native_height),
+            (1600, 2176)
+        );
+        assert_eq!(panel.source, PanelSource::FbdevModes);
+        assert_eq!(panel.node, "fb0");
+        assert_ne!(
+            panel.display.native_height, 6528,
+            "virtual_size is a buffer, not the panel"
+        );
+    }
+
+    /// A connector whose status file cannot be read must not silently fall back to fbdev.
+    #[test]
+    fn unreadable_connector_status_does_not_fall_back_to_fbdev() {
+        let dir = sysfs(&[
+            ("class/drm/card0-DSI-1/modes", "1080x2340\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        let error = geometry_with_probe(dir.path(), &|_| FbVar::Unavailable).unwrap_err();
+        assert_eq!(error.reason_code(), "PANEL_GEOMETRY_READ_FAILED");
+    }
+
+    /// A dangling connector symlink is a leftover, not a panel: fbdev stays usable.
+    #[test]
+    fn dangling_connector_symlink_still_uses_fbdev() {
+        let dir = sysfs(&[
+            ("class/drm/version", "drm 1.1.0 20060810\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        std::os::unix::fs::symlink(
+            dir.path().join("devices/missing"),
+            dir.path().join("class/drm/card0-DSI-1"),
+        )
+        .unwrap();
+        assert_eq!(geometry(dir.path()).unwrap(), (720, 1600));
+    }
+
+    /// The card node and the `version` file are not connectors, so fbdev is still selected.
+    #[test]
+    fn card_node_and_version_are_not_connectors() {
+        let dir = sysfs(&[
+            ("class/drm/version", "drm 1.1.0 20060810\n"),
+            ("class/drm/card0/uevent", "DEVTYPE=drm_minor\n"),
+            ("class/graphics/fb0/modes", "U:720x1600p-0\n"),
+        ]);
+        assert_eq!(geometry(dir.path()).unwrap(), (720, 1600));
+    }
+
+    /// Ambiguous framebuffers must name the nodes, not only the count.
+    #[test]
+    fn multiple_framebuffers_name_the_nodes() {
+        let dir = sysfs(&[
+            ("class/graphics/fb0/modes", "U:1600x2176p-0\n"),
+            ("class/graphics/fb1/modes", "U:1280x720p-0\n"),
+        ]);
+        let error = geometry_with_probe(dir.path(), &|_| FbVar::Unavailable).unwrap_err();
+        assert_eq!(error.reason_code(), "PANEL_GEOMETRY_AMBIGUOUS");
+        let message = error.to_string();
+        assert!(
+            message.contains("fb0") && message.contains("fb1"),
+            "{message}"
+        );
+    }
 
     /// Measured on mtkfb: 14 bytes, including the trailing newline.
     const FB_MODES: &str = "U:720x1600p-0\n";

@@ -1,7 +1,7 @@
 //! Bounded, read-only readiness checks. Never run setup, input, or root bootstrap.
 use crate::{
-    devices::DeviceKind, physical_input, qmp::QmpClient, transport::DeviceTransport, CoreError,
-    CoreResult,
+    devices::DeviceKind, physical_input, qmp::QmpClient, rpm_arch, transport::DeviceTransport,
+    CoreError, CoreResult,
 };
 use audb_protocol::PROTOCOL_VERSION;
 use serde::Serialize;
@@ -16,7 +16,15 @@ if test -S /run/user/$uid/dbus/user_bus_socket; then printf 'session\ttrue\n'; e
 for tool in gdbus rpm journalctl; do
   if command -v "$tool" >/dev/null 2>&1; then printf 'tool.%s\ttrue\n' "$tool"; else printf 'tool.%s\tfalse\n' "$tool"; fi
 done
-if command -v rpm >/dev/null 2>&1; then printf 'agentRpm\t'; rpm -q --qf '%{VERSION}-%{RELEASE}\n' audb-agent 2>/dev/null || true; fi
+printf 'longBit\t%s\n' "$(getconf LONG_BIT 2>/dev/null)"
+if command -v rpm >/dev/null 2>&1; then
+  # %{_target_cpu} is the architecture rpm builds packages for; %{_arch} is its coarser
+  # family label and can differ (arm vs armv7hl on 32-bit Aurora devices).
+  printf 'rpmArch\t%s\n' "$(rpm --eval '%{_target_cpu}' 2>/dev/null)"
+  printf 'rpmArchClass\t%s\n' "$(rpm --eval '%{_arch}' 2>/dev/null)"
+  printf 'rpmLibdir\t%s\n' "$(rpm --eval '%{_libdir}' 2>/dev/null)"
+  printf 'agentRpm\t'; rpm -q --qf '%{VERSION}-%{RELEASE}\n' audb-agent 2>/dev/null || true
+fi
 "#;
 
 #[derive(Debug, Serialize)]
@@ -133,6 +141,21 @@ async fn probe(
     }
 }
 
+/// Optional inventory fields with the validator that decides whether they are reported. A value
+/// that fails validation is reported as absent rather than as a malformed observation.
+type InventoryValidator = fn(&str) -> bool;
+
+const OPTIONAL_INVENTORY: [(&str, InventoryValidator); 4] = [
+    ("rpmArch", rpm_arch::usable_arch),
+    ("rpmArchClass", rpm_arch::usable_arch),
+    ("rpmLibdir", rpm_arch::usable_libdir),
+    ("longBit", usable_bitness),
+];
+
+fn usable_bitness(value: &str) -> bool {
+    value.parse::<u32>().is_ok()
+}
+
 fn inventory(raw: &str) -> CoreResult<Value> {
     let mut fields = serde_json::Map::new();
     for line in raw.lines() {
@@ -151,6 +174,17 @@ fn inventory(raw: &str) -> CoreResult<Value> {
         .is_none_or(str::is_empty)
     {
         return Err(CoreError::runtime("SSH inventory has no architecture"));
+    }
+    // Optional diagnostics: an unresolved rpm macro, a missing tool or a non-numeric
+    // bitness is reported as absent rather than propagated as a malformed observation.
+    for (key, usable) in OPTIONAL_INVENTORY {
+        let unusable = fields
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|value| !usable(value));
+        if unusable {
+            fields.remove(key);
+        }
     }
     fields.insert("uid".into(), json!(uid));
     Ok(Value::Object(fields))
@@ -317,7 +351,28 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
         &qmp,
     );
     if ssh.ok() {
-        checks.push(Check::passed("identity", json!({"uid":ssh.data["uid"],"architecture":ssh.data["architecture"],"osVersion":files.data["osVersion"],"agentRpm":ssh.data["agentRpm"]})));
+        let mut identity = json!({"uid":ssh.data["uid"],"architecture":ssh.data["architecture"],"osVersion":files.data["osVersion"],"agentRpm":ssh.data["agentRpm"]});
+        // Report the rpm platform and userspace bitness next to `uname -m`: on a 32-bit
+        // ARM userspace an aarch64 kernel makes `architecture` alone misleading.
+        if let Some(object) = identity.as_object_mut() {
+            for (key, _) in OPTIONAL_INVENTORY {
+                if !ssh.data[key].is_null() {
+                    object.insert(key.into(), ssh.data[key].clone());
+                }
+            }
+        }
+        checks.push(Check::passed("identity", identity));
+        let bitness = ssh.data["longBit"].as_str();
+        let machine = ssh.data["architecture"].as_str().unwrap_or_default();
+        if bitness == Some("32") && is_64bit_machine(machine) {
+            checks.push(Check::problem(
+                "architectureBitness",
+                "warning",
+                "MIXED_KERNEL_USERSPACE_BITNESS",
+                &format!("32-bit userspace runs on a 64-bit {machine} kernel"),
+                "",
+            ));
+        }
         checks.push(if ssh.data["session"] == "true" {
             Check::passed("userSession", json!({"busSocketPresent":true}))
         } else {
@@ -335,7 +390,10 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
             } else { Check::problem("inputFocus", "warning", "INPUT_NOT_FOCUSED", "Unicode backend is available; no compatible editor is focused", "Tap an editable field before text. If an app was open during setup, restart that app once.") });
         }
     }
-    let touch_panel = touch_warning(&agent);
+    // Owned, so the agent check can be moved into the report below while the diagnostic stays
+    // available for the warning check.
+    let touch_panel = touch_problem(&agent)
+        .map(|(code, message, fix)| (code.to_owned(), message.to_owned(), fix));
     checks.splice(
         0..0,
         [
@@ -350,10 +408,10 @@ pub async fn inspect(t: &mut DeviceTransport, qmp: Option<&mut QmpClient>) -> Re
             qmp,
         ],
     );
-    if let Some(touch_panel) = touch_panel {
-        checks.push(touch_panel);
+    if let Some((code, message, fix)) = touch_panel {
+        checks.push(Check::problem("touch", "warning", &code, &message, fix));
     }
-    let healthy = checks.iter().all(|check| check.status != "failed");
+    let healthy = healthy(&checks);
     Report {
         report_version: 1,
         device: json!({"id":config.id,"kind":config.kind,"host":config.host,"sshUser":config.ssh_user,
@@ -368,7 +426,51 @@ fn skipped(name: &str, message: &str, fix: &str) -> Check {
     Check::problem(name, "skipped", "CHECK_SKIPPED", message, fix)
 }
 
-fn touch_warning(agent: &Check) -> Option<Check> {
+/// A device is unhealthy only when a check actually failed. Warnings (mixed kernel/userspace
+/// bitness, unavailable panel geometry) and skipped checks do not flip it.
+fn healthy(checks: &[Check]) -> bool {
+    checks.iter().all(|check| check.status != "failed")
+}
+
+/// `uname -m` values that denote a 64-bit kernel: every 64-bit `uname -m` ends in `64` except
+/// `s390x`. A 32-bit userspace on such a kernel is a supported configuration, so this only ever
+/// produces an informational warning.
+fn is_64bit_machine(name: &str) -> bool {
+    name.ends_with("64") || name == "s390x"
+}
+
+/// The kernel panel and the session geometry disagree, so gestures would land elsewhere. The
+/// agent reports this as `matchesSession: false`; an absent field means no comparison was
+/// possible (for example no graphical session).
+fn panel_mismatch(agent: &Check) -> bool {
+    agent.ok() && agent.data["panel"]["matchesSession"] == false
+}
+
+/// Oriented command space for gestures together with the kernel panel it maps onto.
+fn touch_geometry(agent: &Check) -> Option<Value> {
+    let display = &agent.data["display"];
+    let panel = &agent.data["panel"];
+    let mut value = json!({
+        "space": "oriented",
+        "width": display["width"].as_i64()?,
+        "height": display["height"].as_i64()?,
+        // The discovered kernel panel is authoritative for the native size; the session size is
+        // only a fallback for agents that do not report one.
+        "nativeWidth": panel["nativeWidth"].as_i64().or_else(|| display["nativeWidth"].as_i64())?,
+        "nativeHeight": panel["nativeHeight"].as_i64().or_else(|| display["nativeHeight"].as_i64())?,
+        "rotation": display["rotation"],
+    });
+    if let Some(source) = panel["source"].as_str() {
+        value["panelSource"] = json!(source);
+    }
+    Some(value)
+}
+
+/// Panel discovery failure reported by the agent, as (reason code, message, fix). Absent or
+/// empty means discovery succeeded, so it must not raise a warning.
+type TouchProblem<'a> = (&'a str, &'a str, &'static str);
+
+fn touch_problem(agent: &Check) -> Option<TouchProblem<'_>> {
     if !agent.ok() {
         return None;
     }
@@ -379,14 +481,10 @@ fn touch_warning(agent: &Check) -> Option<Check> {
     let message = agent.data["panel"]["message"]
         .as_str()
         .unwrap_or("Panel geometry is unavailable");
-    Some(Check::problem(
-        "touch",
-        "warning",
-        code,
-        message,
-        "Read the kernel DRM connector or fbdev mode and restart audb-agent. Keyboard, permissions and screenshots remain available.",
-    ))
+    Some((code, message, TOUCH_FIX))
 }
+
+const TOUCH_FIX: &str = "Read the kernel DRM connector or fbdev mode and restart audb-agent. Keyboard, permissions and screenshots remain available.";
 
 #[allow(clippy::too_many_arguments)]
 fn capabilities(
@@ -449,6 +547,7 @@ fn capabilities(
         && display.data["lockMode"] == "unlocked"
         && display.data["touchPolicy"] == "enabled";
     for name in ["tap", "swipe", "key", "text", "screenshot"] {
+        let touch_cap = matches!(name, "tap" | "swipe");
         let use_agent = !emulator
             || matches!(name, "key" | "text")
                 && agent.ok()
@@ -469,19 +568,9 @@ fn capabilities(
             );
             if !available {
                 // An installed agent that simply has no touchscreen is not fixed by reinstalling it.
-                if agent.ok() && matches!(name, "tap" | "swipe") {
-                    if let Some(warning) = touch_warning(agent) {
-                        cap = cap.blocked(
-                            warning
-                                .code
-                                .as_deref()
-                                .unwrap_or("PANEL_GEOMETRY_UNAVAILABLE"),
-                            warning
-                                .message
-                                .as_deref()
-                                .unwrap_or("Panel geometry is unavailable"),
-                            warning.fix.as_deref().unwrap_or(""),
-                        );
+                if agent.ok() && touch_cap {
+                    if let Some((code, message, fix)) = touch_problem(agent) {
+                        cap = cap.blocked(code, message, fix);
                     } else {
                         cap = cap.blocked(
                             "CAPABILITY_UNAVAILABLE",
@@ -505,10 +594,17 @@ fn capabilities(
                     "No compatible editor is focused",
                     "Tap an editable field before text.",
                 );
-            } else if matches!(name, "tap" | "swipe")
-                && (!screen_ready || agent.data["display"].is_null())
-            {
+            } else if touch_cap && panel_mismatch(agent) {
+                cap = cap.blocked(
+                    "PANEL_GEOMETRY_MISMATCH",
+                    "The graphical session geometry does not match the kernel panel, so gestures would land elsewhere",
+                    "Restart audb-agent after a panel or session geometry change; the session must report the kernel panel's native size.",
+                );
+            } else if touch_cap && (!screen_ready || agent.data["display"].is_null()) {
                 cap = cap.blocked("DISPLAY_NOT_READY", "Touch readiness requires graphical geometry, an awake screen and an unlocked session", "Wake/unlock the device and check display status; PIN entry remains manual.");
+            }
+            if touch_cap {
+                cap.geometry = touch_geometry(agent);
             }
             if name == "screenshot" {
                 cap = cap.notes(&["Geometry/backend readiness was probed without capturing an image; screen-off or locked content may differ."]);
@@ -704,6 +800,35 @@ mod tests {
             100000
         );
     }
+    #[test]
+    fn inventory_reports_rpm_platform_and_userspace_bitness() {
+        // Measured shape on an Fplus T1100: aarch64 kernel, 32-bit armv7hl userspace.
+        let data = inventory(
+            "uid\t100000\narchitecture\taarch64\nsession\ttrue\nlongBit\t32\nrpmArch\tarmv7hl\nrpmArchClass\tarm\nrpmLibdir\t/usr/lib",
+        )
+        .unwrap();
+        assert_eq!(data["architecture"], "aarch64");
+        assert_eq!(data["rpmArch"], "armv7hl");
+        assert_eq!(data["rpmArchClass"], "arm");
+        assert_eq!(data["rpmLibdir"], "/usr/lib");
+        assert_eq!(data["longBit"], "32");
+        // The mixed kernel/userspace warning must not fire on a genuine 32-bit device.
+        assert!(is_64bit_machine("aarch64") && is_64bit_machine("x86_64"));
+        assert!(!is_64bit_machine("armv7hl") && !is_64bit_machine("i686"));
+    }
+
+    #[test]
+    fn unusable_optional_inventory_fields_are_absent_not_malformed() {
+        let data = inventory(
+            "uid\t100000\narchitecture\tarmv7hl\nlongBit\tunknown\nrpmArch\t%{_target_cpu}\nrpmArchClass\t%{_arch}\nrpmLibdir\t%{_libdir}",
+        )
+        .unwrap();
+        assert!(data.get("longBit").is_none());
+        assert!(data.get("rpmArch").is_none());
+        assert!(data.get("rpmArchClass").is_none());
+        assert!(data.get("rpmLibdir").is_none());
+    }
+
     #[tokio::test]
     async fn check_timeout_is_explicit_and_does_not_retry() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -826,6 +951,69 @@ mod tests {
     }
 
     #[test]
+    fn panel_mismatch_blocks_gestures_but_not_screenshots() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "nativeWidth": 1600, "nativeHeight": 2176, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {"source": "fbdev", "node": "fb0", "nativeWidth": 1600, "nativeHeight": 2176, "matchesSession": false}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        for name in ["tap", "swipe"] {
+            assert_eq!(caps[name].available, Some(true), "{name}");
+            assert_eq!(caps[name].ready, Some(false), "{name}");
+            assert_eq!(
+                caps[name].reason_code.as_deref(),
+                Some("PANEL_GEOMETRY_MISMATCH"),
+                "{name}"
+            );
+            assert!(!caps[name]
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("setup-device"));
+        }
+        // Screenshots and keys do not depend on the touchscreen geometry.
+        assert_eq!(caps["screenshot"].ready, Some(true));
+        assert_eq!(caps["key"].ready, Some(true));
+    }
+
+    #[test]
+    fn touch_geometry_reports_oriented_space_and_panel_source() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "nativeWidth": 1600, "nativeHeight": 2176, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {"source": "fbdev", "node": "fb0", "nativeWidth": 1600, "nativeHeight": 2176, "matchesSession": true}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        let geometry = caps["tap"].geometry.as_ref().unwrap();
+        assert_eq!(caps["tap"].ready, Some(true));
+        assert_eq!(geometry["space"], "oriented");
+        assert_eq!(geometry["width"], 2176);
+        assert_eq!(geometry["height"], 1600);
+        assert_eq!(geometry["nativeWidth"], 1600);
+        assert_eq!(geometry["nativeHeight"], 2176);
+        assert_eq!(geometry["panelSource"], "fbdev");
+        // Successful discovery must not raise a touch warning.
+        assert!(touch_problem(&agent).is_none());
+    }
+
+    #[test]
     fn installed_agent_without_touch_does_not_prescribe_setup_device() {
         let agent = Check::passed(
             "agent",
@@ -853,7 +1041,7 @@ mod tests {
         );
         assert!(caps["key"].ready == Some(true));
         assert!(caps["screenshot"].ready == Some(true));
-        assert!(touch_warning(&agent).is_none());
+        assert!(touch_problem(&agent).is_none());
     }
 
     #[test]
@@ -894,17 +1082,74 @@ mod tests {
         );
         assert!(caps["key"].ready == Some(true));
         assert!(caps["screenshot"].ready == Some(true));
-        let warning = touch_warning(&agent).unwrap();
-        assert_eq!(warning.name, "touch");
-        assert_eq!(warning.status, "warning");
-        assert_eq!(warning.code.as_deref(), Some("PANEL_GEOMETRY_UNAVAILABLE"));
-        assert_eq!(
-            warning.message.as_deref(),
-            Some("No DRM connector or framebuffer was found")
-        );
-        assert!(!warning.fix.as_deref().unwrap().contains("setup-device"));
+        let (code, message, fix) = touch_problem(&agent).unwrap();
+        assert_eq!(code, "PANEL_GEOMETRY_UNAVAILABLE");
+        assert_eq!(message, "No DRM connector or framebuffer was found");
+        assert!(!fix.contains("setup-device"));
+        let warning = Check::problem("touch", "warning", code, message, fix);
         let checks = [Check::passed("agent", json!({})), warning];
-        assert!(checks.iter().all(|check| check.status != "failed"));
+        assert!(healthy(&checks));
+    }
+
+    #[test]
+    fn warning_checks_do_not_make_a_device_unhealthy() {
+        let warning = Check::problem(
+            "architectureBitness",
+            "warning",
+            "MIXED_KERNEL_USERSPACE_BITNESS",
+            "32-bit userspace runs on a 64-bit aarch64 kernel",
+            "",
+        );
+        assert!(healthy(&[
+            Check::passed("ssh", json!({})),
+            warning,
+            skipped("qmp", "physical", ""),
+        ]));
+        assert!(!healthy(&[Check::problem(
+            "agent",
+            "failed",
+            "CAPABILITY_UNAVAILABLE",
+            "Agent backend is unavailable",
+            "Run audb setup-device",
+        )]));
+    }
+
+    /// An agent that reports a panel but no session comparison must not block gestures: the
+    /// field is absent when there was no session geometry to compare against.
+    #[test]
+    fn panel_without_session_match_field_does_not_block_gestures() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "nativeWidth": 1600, "nativeHeight": 2176, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true},
+                "panel": {"source": "fbdev", "node": "fb0", "nativeWidth": 1600, "nativeHeight": 2176}
+            }),
+        );
+        let display = Check::passed(
+            "display",
+            json!({"display":"on","lockMode":"unlocked","touchPolicy":"enabled"}),
+        );
+        let caps = physical(&agent, &display);
+        assert_eq!(caps["tap"].ready, Some(true));
+        assert_eq!(caps["tap"].geometry.as_ref().unwrap()["nativeHeight"], 2176);
+    }
+
+    /// An older agent that reports only the session size still yields geometry, but the panel
+    /// size is not invented.
+    #[test]
+    fn touch_geometry_is_absent_without_native_dimensions() {
+        let agent = Check::passed(
+            "agent",
+            json!({
+                "protocolVersion": 3,
+                "display": {"width": 2176, "height": 1600, "rotation": 90},
+                "capabilities": {"tap": true, "swipe": true, "key": true, "text": true, "screenshot": true}
+            }),
+        );
+        assert!(touch_geometry(&agent).is_none());
+        assert!(touch_problem(&agent).is_none());
     }
 
     #[test]
@@ -946,11 +1191,9 @@ mod tests {
         assert!(!caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
         assert_eq!(caps["key"].ready, Some(true));
         assert_eq!(caps["screenshot"].ready, Some(true));
-        let warning = touch_warning(&agent).unwrap();
-        assert_eq!(warning.name, "touch");
-        assert_eq!(warning.status, "warning");
-        assert_eq!(warning.code.as_deref(), Some("PANEL_GEOMETRY_MISMATCH"));
-        assert!(!warning.fix.as_deref().unwrap().contains("setup-device"));
+        let (code, _, fix) = touch_problem(&agent).unwrap();
+        assert_eq!(code, "PANEL_GEOMETRY_MISMATCH");
+        assert!(!fix.contains("setup-device"));
     }
 
     #[test]
@@ -975,7 +1218,7 @@ mod tests {
         let caps = physical(&agent, &display);
         assert_eq!(caps["tap"].ready, Some(true));
         assert_eq!(caps["swipe"].ready, Some(true));
-        assert!(touch_warning(&agent).is_none());
+        assert!(touch_problem(&agent).is_none());
     }
 
     #[test]
@@ -990,6 +1233,6 @@ mod tests {
         let display = skipped("display", "Agent check failed", "setup");
         let caps = physical(&agent, &display);
         assert!(caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
-        assert!(touch_warning(&agent).is_none());
+        assert!(touch_problem(&agent).is_none());
     }
 }

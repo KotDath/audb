@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- 32-bit ARM (`armv7hl`) device support. The system-package gate accepts the
+  architecture the device's own rpm reports (`%{_target_cpu}`, e.g. `armv7hl`)
+  as well as `%{_arch}` (`arm`), so an armv7hl agent RPM can be installed on a
+  device with a 64-bit kernel and a 32-bit userspace. The gate still refuses a
+  32-bit ARM package on an `aarch64` device and vice versa.
+- `doctor` reports `rpmArch`, `rpmArchClass`, `rpmLibdir` and `longBit` next to
+  `uname -m`, and warns with `MIXED_KERNEL_USERSPACE_BITNESS` when a 32-bit
+  userspace runs on a 64-bit kernel. The warning never makes a device unhealthy.
+- Touch capabilities publish the coordinate space they accept (`geometry`:
+  oriented size, native panel size, rotation, panel source), and the agent
+  reports where the panel geometry came from (`panel.source` = `drm` | `fbdev`,
+  node and native size).
+- `scripts/build-agent-rpm.py` selects a platform preset (`--platform
+  aarch64|armv7hl|x86_64`) with the matching compiler driver, sysroot, Rust
+  target and `rpm --target`, validates the transferred RPM and the packaged
+  payload, and `--self-test` checks that logic without Docker.
+
 ### Changed
+
+- Package payload paths use `%{_libdir}`, so Qt QML modules and the Maliit
+  plugin install under `/usr/lib` on 32-bit ARM and `/usr/lib64` elsewhere.
 
 - The framebuffer panel size now comes from the framebuffer var
   (`FBIOGET_VSCREENINFO`) when the service unit allows `/dev/fb0`, falling back
@@ -41,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An unsigned agent RPM installs but cannot execute on a device that boots with
+  `ima_appraise=enforce`: `rpm-plugin-external-ima` only attributes files of a
+  signed package, so signing the RPM is required for the service to start.
 - Physical touch on framebuffer panels that have no DRM connector. The agent
   reads the fbdev mode file and falls back to modes. Keyboard, permissions and
   screenshots stay available when no panel mode exists. doctor stays healthy
@@ -48,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the agent is already installed.
 - DRM connector symlinks are followed, so an existing KMS panel is not replaced
   by a framebuffer mode.
+- A DRM connector whose status file cannot be read fails closed instead of
+  silently selecting the framebuffer, and a dangling connector symlink is
+  ignored per entry rather than aborting panel discovery.
 
 ## [0.3.0] - 2026-10-09
 
