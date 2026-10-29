@@ -77,14 +77,23 @@ mod tests {
 
     #[test]
     fn parses_preference_order_and_drops_noise() {
-        assert_eq!(parse_platform_archs("armv7hl arm\n").unwrap(), ["armv7hl", "arm"]);
+        assert_eq!(
+            parse_platform_archs("armv7hl arm\n").unwrap(),
+            ["armv7hl", "arm"]
+        );
         assert_eq!(parse_platform_archs("  aarch64\n\n").unwrap(), ["aarch64"]);
-        assert_eq!(parse_platform_archs("aarch64 aarch64").unwrap(), ["aarch64"]);
+        assert_eq!(
+            parse_platform_archs("aarch64 aarch64").unwrap(),
+            ["aarch64"]
+        );
         // rpm echoes unresolved macros verbatim.
         assert_eq!(parse_platform_archs("%{_target_cpu} arm").unwrap(), ["arm"]);
         // A compromised device cannot inject a shell fragment into the comparison.
         assert_eq!(parse_platform_archs("arm;id arm").unwrap(), ["arm"]);
-        assert_eq!(parse_platform_archs("../../etc/passwd arm").unwrap(), ["arm"]);
+        assert_eq!(
+            parse_platform_archs("../../etc/passwd arm").unwrap(),
+            ["arm"]
+        );
     }
 
     #[test]
@@ -128,7 +137,11 @@ mod tests {
         let platform = parse_platform_archs("armv7hl arm").unwrap();
         let error = ensure_package_arch("x86_64", &platform).unwrap_err();
         assert!(error.message.contains("'x86_64'"), "{}", error.message);
-        assert!(error.message.contains("armv7hl or arm"), "{}", error.message);
+        assert!(
+            error.message.contains("armv7hl or arm"),
+            "{}",
+            error.message
+        );
     }
 
     /// The probe is a shell command; its behaviour cannot be proven by the remote
@@ -148,7 +161,10 @@ mod tests {
                 .env("PATH", path)
                 .output()
                 .unwrap();
-            (String::from_utf8(output.stdout).unwrap(), output.status.success())
+            (
+                String::from_utf8(output.stdout).unwrap(),
+                output.status.success(),
+            )
         };
         let stub = |body: &str| {
             let dir = tempfile::tempdir().unwrap();

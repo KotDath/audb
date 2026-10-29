@@ -1191,11 +1191,9 @@ mod tests {
         assert!(!caps["tap"].fix.as_deref().unwrap().contains("setup-device"));
         assert_eq!(caps["key"].ready, Some(true));
         assert_eq!(caps["screenshot"].ready, Some(true));
-        let warning = touch_warning(&agent).unwrap();
-        assert_eq!(warning.name, "touch");
-        assert_eq!(warning.status, "warning");
-        assert_eq!(warning.code.as_deref(), Some("PANEL_GEOMETRY_MISMATCH"));
-        assert!(!warning.fix.as_deref().unwrap().contains("setup-device"));
+        let (code, _, fix) = touch_problem(&agent).unwrap();
+        assert_eq!(code, "PANEL_GEOMETRY_MISMATCH");
+        assert!(!fix.contains("setup-device"));
     }
 
     #[test]
@@ -1220,7 +1218,7 @@ mod tests {
         let caps = physical(&agent, &display);
         assert_eq!(caps["tap"].ready, Some(true));
         assert_eq!(caps["swipe"].ready, Some(true));
-        assert!(touch_warning(&agent).is_none());
+        assert!(touch_problem(&agent).is_none());
     }
 
     #[test]

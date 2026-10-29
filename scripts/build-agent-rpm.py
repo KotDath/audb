@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
+import atexit
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,22 +30,22 @@ ROOT = Path(__file__).resolve().parents[1]
 # the driver picks the matching sysroot and emits the hard-float ABI attribute.
 ARM_FLOAT_FLAGS = ['-march=armv7-a', '-mfloat-abi=hard', '-mfpu=vfpv3-d16']
 ARMHF_INTERPRETER = 'ld-linux-armhf.so.3'
-# Measured against the aurora-os-build-engine container: aarch64 is native, armv7hl and
-# x86_64 are cross-compiled from the toolchain installed by the cross-*-gcc packages.
+# Each installed sb2 target supplies its own gcc/g++ wrappers and pkg-config roots.
+# Explicit compiler/sysroot overrides remain available for other container layouts.
 # `libdir` is the device contract for that rpm architecture: where Qt QML modules and Maliit
 # plugins are actually resolved. /usr/lib/systemd/system is deliberately not part of it.
 PLATFORMS = {
     'aarch64': {'rustTarget': 'aarch64-unknown-linux-gnu', 'cc': 'gcc', 'cxx': 'g++',
                 'sysroot': '', 'rpmTarget': '', 'libdir': '/usr/lib64'},
     'armv7hl': {'rustTarget': 'armv7-unknown-linux-gnueabihf',
-                'cc': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-gcc',
-                'cxx': '/opt/cross/bin/armv7hl-meego-linux-gnueabi-g++',
-                'sysroot': '/opt/cross/armv7hl-meego-linux-gnueabi/sys-root',
+                'cc': 'gcc',
+                'cxx': 'g++',
+                'sysroot': '',
                 'rpmTarget': 'armv7hl-meego-linux', 'libdir': '/usr/lib'},
     'x86_64': {'rustTarget': 'x86_64-unknown-linux-gnu',
-               'cc': '/opt/cross/bin/x86_64-meego-linux-gnu-gcc',
-               'cxx': '/opt/cross/bin/x86_64-meego-linux-gnu-g++',
-               'sysroot': '/opt/cross/x86_64-meego-linux-gnu/sys-root',
+               'cc': 'gcc',
+               'cxx': 'g++',
+               'sysroot': '',
                'rpmTarget': 'x86_64-meego-linux', 'libdir': '/usr/lib64'},
 }
 # Expected `readelf -h` class and machine substring per rpm architecture.
@@ -52,6 +54,14 @@ ELF_EXPECT = {
     'armv7hl': ('ELF32', 'ARM'),
     'x86_64': ('ELF64', 'X86-64'),
 }
+
+
+def select_sdk_target(targets, platform):
+    candidates = sorted({name for name in targets.split()
+                         if name.startswith('AuroraOS-') and name.endswith('-' + platform)})
+    if len(candidates) != 1:
+        raise SystemExit(f'Expected one AuroraOS sb2 target for {platform}, found {candidates}; pass --target')
+    return candidates[0]
 
 
 def expected_machine(arch):
@@ -166,11 +176,10 @@ def self_test():
     assert not vfp_args_ok('Attribute Section: aeabi\n')
     assert interpreter_ok('[Requesting program interpreter: /lib/ld-linux-armhf.so.3]')
     assert not interpreter_ok('[Requesting program interpreter: /lib/ld-linux.so.3]')
-    # The presets encode measured container paths; a re-imaged container must not silently
-    # change which compiler, sysroot or libdir a platform build uses.
+    # sb2 supplies the compiler and sysroot for the selected target.
     assert PLATFORMS['armv7hl']['rpmTarget'] == 'armv7hl-meego-linux'
-    assert PLATFORMS['armv7hl']['cc'].endswith('armv7hl-meego-linux-gnueabi-gcc')
-    assert PLATFORMS['armv7hl']['sysroot'].endswith('armv7hl-meego-linux-gnueabi/sys-root')
+    assert PLATFORMS['armv7hl']['cc'] == 'gcc'
+    assert PLATFORMS['armv7hl']['sysroot'] == ''
     assert PLATFORMS['armv7hl']['libdir'] == '/usr/lib'
     assert PLATFORMS['x86_64']['libdir'] == '/usr/lib64'
     assert PLATFORMS['x86_64']['rustTarget'] == 'x86_64-unknown-linux-gnu'
@@ -188,7 +197,7 @@ def self_test():
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--container', default=os.environ.get('AUDB_SDK_CONTAINER', 'aurora-os-build-engine-5.2.1.200-mb2_kotdath'))
-    p.add_argument('--target', default='AuroraOS-5.2.1.200-aarch64', help='sb2 target name passed to the sb2 wrapper (the container shim ignores it)')
+    p.add_argument('--target', default=os.environ.get('AUDB_SDK_TARGET'), help='sb2 target (default: discover the unique installed AuroraOS target for --platform)')
     p.add_argument('--platform', choices=sorted(PLATFORMS), default='aarch64', help='target platform preset')
     p.add_argument('--rust-target', default=None, help='Rust triple (default: from --platform)')
     p.add_argument('--cc', default=None, help='C compiler driver inside the container (default: from --platform)')
@@ -231,12 +240,17 @@ def main():
     def sdk_output(argv):
         return capture(['docker', 'exec', '--user', 'mersdk', a.container, 'sb2', '-t', a.target, '-m', 'sdk-build', *argv])
 
+    if a.target is None:
+        a.target = select_sdk_target(capture(['docker', 'exec', '--user', 'mersdk', a.container, 'sb2-config', '-l']), a.platform)
+
     # 1. Ask the container's own rpm what the selected platform builds for, and fail closed on
     #    any disagreement with the device contract. `%{_libdir}` is an install path inside the
     #    payload and is never used as a host or container filesystem path.
     arch, libdir = parse_target_platform(
         sdk_output(['rpm', *rpm_target_args, '--eval', '%{_target_cpu} %{_arch} %{_libdir}'])
     )
+    if arch != a.platform:
+        raise SystemExit(f'SDK target builds {arch}, expected --platform {a.platform}')
     check_rust_target(arch, a.rust_target)
     if a.arch is not None and a.arch != arch:
         raise SystemExit(f'--arch {a.arch} contradicts the selected platform, which builds {arch}')
@@ -275,10 +289,12 @@ def main():
         )
     run(['rustup', 'run', 'stable', 'cargo', 'build', '-p', 'audb-agent', '--release', '--target', a.rust_target], env=env)
 
-    work = ROOT/'target'/'agent-rpm'/arch
+    output_dir = ROOT/'target'/'agent-rpm'/arch
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix='build-', dir=output_dir)
+    atexit.register(temporary.cleanup)
+    work = Path(temporary.name)
     stage = work/'stage'
-    if stage.exists():
-        shutil.rmtree(stage)
     for binary, destination in [('audb-agent', 'usr/sbin/audb-agent'), ('audb-agentctl', 'usr/bin/audb-agentctl')]:
         dest = stage/destination
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -342,8 +358,8 @@ def main():
     built = listing[0]
     if not Path(built).name.endswith('.' + arch + '.rpm'):
         raise SystemExit(f'{built} is not labelled {arch}')
-    output = work/('audb-agent-'+version+'-'+release+'.'+arch+'.rpm')
-    candidate = output.with_name(output.name + '.candidate')
+    output = output_dir/('audb-agent-'+version+'-'+release+'.'+arch+'.rpm')
+    candidate = work/(output.name + '.candidate')
     run(['docker', 'cp', a.container+':'+built, candidate])
     # A transfer that silently changes bytes would ship a package whose payload digest no longer
     # matches its header (seen once with a same-size copy), so compare digests with the original
@@ -373,7 +389,9 @@ def main():
     if lib64 and libdir == '/usr/lib':
         raise SystemExit(f'{candidate} contains lib64 paths although the device contract is {libdir}: {lib64}')
     # Every shipped ELF, validated in the packaged payload rather than the staging tree.
-    payload_dir = '/tmp/audb-payload-' + arch
+    # sb2 gives each invocation a private /tmp. Keep the extracted payload in the
+    # per-build container topdir so all readelf invocations see the same files.
+    payload_dir = top + '/payload'
     sdk_output(['/bin/sh', '-c', 'rm -rf ' + payload_dir + ' && mkdir -p ' + payload_dir
                 + ' && cd ' + payload_dir + ' && rpm2cpio ' + shlex.quote(str(candidate))
                 + ' | cpio -idm --quiet'])
@@ -400,7 +418,7 @@ def main():
         'containerOutputName': Path(built).name, 'hostPath': str(output),
         'rpmArchHeader': header, 'payload': sorted(payload),
     }
-    (work/'build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    (output_dir/'build-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print('Unsigned RPM: '+str(output), flush=True)
     print(json.dumps(receipt, indent=2), flush=True)
 
