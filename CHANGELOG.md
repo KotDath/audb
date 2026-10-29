@@ -63,6 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Exclude DRM Writeback connectors when discovering the physical touchscreen
+  panel. A DSI panel with connected writeback outputs, as reported on Dialog-S,
+  no longer fails discovery with "found 3". Multiple physical outputs remain
+  ambiguous, and the selected connector and native dimensions are logged.
+- Increase the agent RPM release to 11 so an existing 0.3.0-10 installation can
+  receive the fix through an upgrade.
+
 - An unsigned agent RPM installs but cannot execute on a device that boots with
   `ima_appraise=enforce`: `rpm-plugin-external-ima` only attributes files of a
   signed package, so signing the RPM is required for the service to start.
