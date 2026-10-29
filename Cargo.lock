@@ -281,7 +281,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "audb-agent"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "audb-protocol",
  "crc32fast",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "audb-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "audb-core",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "audb-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "audb-protocol",
  "chrono",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "audb-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",

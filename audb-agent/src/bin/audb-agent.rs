@@ -974,6 +974,38 @@ mod tests {
     }
 
     #[test]
+    fn status_preserves_panel_provenance_and_session_comparison() {
+        let display = Display {
+            native_width: 720,
+            native_height: 1600,
+            rotation: 0,
+        };
+        let mut touch = Some(touch_node(720, 1600));
+        let panel = PanelState {
+            source: Some("fbdev-var"),
+            node: Some("fb0".into()),
+            display: Some(display),
+            note: Some("diagnostic note".into()),
+            ..Default::default()
+        };
+        let result = response(
+            &mut touch,
+            &panel,
+            r#"{"protocolVersion":3,"display":{"nativeWidth":720,"nativeHeight":1600,"rotation":90},"action":{"command":"status"}}"#,
+        );
+        assert_eq!(result["data"]["panel"]["node"], "fb0");
+        assert_eq!(result["data"]["panel"]["source"], "fbdev-var");
+        assert_eq!(result["data"]["panel"]["note"], "diagnostic note");
+        assert_eq!(result["data"]["panel"]["matchesSession"], true);
+        let result = response(
+            &mut touch,
+            &panel,
+            r#"{"protocolVersion":3,"action":{"command":"status"}}"#,
+        );
+        assert!(result["data"]["panel"].get("matchesSession").is_none());
+    }
+
+    #[test]
     fn tap_without_panel_names_geometry_reason() {
         let mut touch = None;
         let panel = PanelState {

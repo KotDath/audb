@@ -342,6 +342,8 @@ def main():
     # do not delete each other's output.
     top = capture(['docker', 'exec', '--user', 'mersdk', a.container, 'mktemp', '-d',
                    '/home/mersdk/audb-agent-rpmbuild-XXXXXX']).strip()
+    atexit.register(subprocess.run, ['docker', 'exec', a.container, 'rm', '-rf', top],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     run(['docker', 'exec', '--user', 'mersdk', a.container, 'mkdir', '-p', top+'/SOURCES'])
     run(['docker', 'cp', archive, a.container+':'+top+'/SOURCES/audb-agent-stage.tar.gz'])
     run(['docker', 'cp', ROOT/'packaging/audb-agent.spec', a.container+':'+top+'/audb-agent.spec'])

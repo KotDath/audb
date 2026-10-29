@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-29
+
 ### Added
 
 - 32-bit ARM (`armv7hl`) device support. The system-package gate accepts the
@@ -19,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   userspace runs on a 64-bit kernel. The warning never makes a device unhealthy.
 - Touch capabilities publish the coordinate space they accept (`geometry`:
   oriented size, native panel size, rotation, panel source), and the agent
-  reports where the panel geometry came from (`panel.source` = `drm` | `fbdev`,
+  reports where the panel geometry came from (`panel.source` = `drm` | `fbdev-var` | `fbdev-mode` | `fbdev-modes`,
   node and native size).
 - `scripts/build-agent-rpm.py` selects a platform preset (`--platform
   aarch64|armv7hl|x86_64`) with the matching compiler driver, sysroot, Rust
@@ -63,12 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- RPM builds discover the matching installed sb2 target instead of using absent
+  cross-compiler paths. Payload checks use a unique container directory visible
+  across sb2 invocations, and build staging is isolated per invocation.
 - Exclude DRM Writeback connectors when discovering the physical touchscreen
   panel. A DSI panel with connected writeback outputs, as reported on Dialog-S,
   no longer fails discovery with "found 3". Multiple physical outputs remain
   ambiguous, and the selected connector and native dimensions are logged.
-- Increase the agent RPM release to 11 so an existing 0.3.0-10 installation can
-  receive the fix through an upgrade.
+- Virtual keyboards exist only during named-key requests, restoring normal
+  on-screen keyboard behavior while the agent is idle. Keys include bounded
+  device discovery and event-consumption waits.
 
 - An unsigned agent RPM installs but cannot execute on a device that boots with
   `ima_appraise=enforce`: `rpm-plugin-external-ima` only attributes files of a
