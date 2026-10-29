@@ -25,3 +25,6 @@ app/**/*.user
 
 # Aurora SDK / Qt Creator build output
 app/build-*/
+
+# Python bytecode from the packaging scripts
+__pycache__/
