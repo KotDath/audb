@@ -4,7 +4,33 @@
 
 Physical devices support SSH shell, SFTP push/pull, status, agent-backed tap/swipe/screenshots, Unicode text, named keys, permission management and common Aurora guest commands where the device permits them. Install the system agent with `setup-device` before using physical input, screenshots or permissions. The previous implementation is preserved in `backup/physical-devices-v0.1.0`.
 
-Install the host CLI release with `cargo install audb-client --version 0.3.1 --locked`. The executable is named `audb`. Device agent RPMs are distributed separately in the [v0.3.1 release](https://github.com/KotDath/audb/releases/tag/v0.3.1); choose the device architecture and pass the package explicitly to `setup-device --rpm`. Cargo installation does not bundle or install a device RPM.
+Install the host CLI release with `cargo install audb-client --version 0.3.1 --locked`. The executable is named `audb`. Device agent RPMs are distributed separately in the [v0.3.1 release](https://github.com/KotDath/audb/releases/tag/v0.3.1); choose the device architecture and pass the package explicitly to `setup-device --rpm`. Cargo installation does not bundle or install a device RPM. The v0.3.1 agent RPM assets are unsigned; sign the selected RPM with your Aurora developer credentials before installing on an IMA-enforced device.
+
+## Version 0.3.1 verification
+
+The combined changes were checked on KVADRA_T / Aurora 5.2.0.259 (aarch64),
+with a signed development `audb-agent-0.3.1-1` and matching CLI. The native DRM
+panel is 1200×2000; the session used rotation 270 and coordinates 2000×1200.
+Unicode and paced input were checked against exact JSON read-back from a temporary
+Qt/Silica editor, including Cyrillic, emoji, combining marks and Chinese. Editing
+keys, scrolling in both directions, PNG screenshots and permission grant/revoke/reset
+were checked. The virtual keyboard appeared only during a named-key request
+(`absent → present → absent`), and the on-screen keyboard returned afterward.
+The temporary application and its test data were removed after verification.
+
+All 163 workspace tests, Clippy with `-D warnings`, formatting and the packaging
+self-test pass. The revised SDK script built and verified the packaged ELF payloads
+for aarch64, armv7hl and x86_64. Only aarch64 was tested on hardware for this release;
+Dialog-S writeback discovery is covered by a sysfs fixture. One screenshot attempt
+reported a transient geometry-query failure; 30 subsequent direct geometry probes
+and later screenshot checks passed. No automatic retry of modifying actions was added.
+
+The tested device package used the public Regular development certificate. Release
+RPM assets are unsigned and require the recipient's own signing credentials. The
+Regular application validator rejects this system agent's service paths, dependencies
+and RPM scriptlets; it remains a developer system package installed through the
+explicit transaction-local validation override. The Linux x86_64 host archive needs
+glibc 2.39 or newer; Cargo builds use the recipient's local toolchain.
 
 ## Requirements
 

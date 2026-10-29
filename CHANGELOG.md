@@ -90,6 +90,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently selecting the framebuffer, and a dangling connector symlink is
   ignored per entry rather than aborting panel discovery.
 
+
+### Verification and distribution
+
+- 163 workspace tests, Clippy, formatting and packaging self-tests pass.
+- aarch64, armv7hl and x86_64 RPM payloads were built and checked with the SDK.
+  KVADRA_T / Aurora 5.2.0.259 passed rotation-270 touch/scroll, exact Unicode and
+  paced text read-back, editing keys, transient keyboard lifecycle and permissions.
+- Release agent RPMs are unsigned; the hardware test used a separate Regular
+  development-signed copy. System agent packages require the explicit developer
+  installation route and do not satisfy the Regular application profile.
+- One geometry-query failure occurred during a screenshot check; 30 subsequent
+  direct geometry probes and later screenshots passed. Other devices and rotations
+  were not re-tested for this release.
+
 ## [0.3.0] - 2026-10-09
 
 ### Added
