@@ -43,8 +43,8 @@ impl InstallerTransport for DeviceTransport {
     }
 }
 
-/// Install any explicitly supplied system RPM. The validation override applies
-/// only to these RPM invocations; system configuration is never modified.
+/// Install an explicitly supplied system RPM with native signature validation.
+/// An explicitly pinned developer key uses a private process configuration.
 pub async fn install_system_package(
     t: &mut DeviceTransport,
     local: &Path,
@@ -61,8 +61,20 @@ pub async fn setup_device(
     options: SystemPackageOptions,
 ) -> CoreResult<Value> {
     let check_only = options.check_only;
+    let root_password = options.root_password.clone();
     let mut result = install_file(t, local, options, Some(AGENT_PACKAGE_NAME)).await?;
     if !check_only {
+        // The first %post start may precede certificate registration/loading.
+        t.exec_privileged(
+            "systemctl reset-failed audb-agent.service && systemctl restart audb-agent.service",
+            root_password.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            CoreError::new(e.code, e.message).with_data(
+            json!({"phase":"agent_start", "rpmTransactionCompleted":true, "installation":result})
+        )
+        })?;
         // Maliit discovers plugins only at startup. This affects the keyboard,
         // without stopping the foreground application or altering user layouts.
         result["inputActivation"] = match t
@@ -132,6 +144,13 @@ async fn install_bytes(
     options: &SystemPackageOptions,
     expected: Option<&str>,
 ) -> CoreResult<Value> {
+    if let Some(key) = &options.developer_key_id {
+        if parse_developer_key_id(key).as_ref() != Ok(key) {
+            return Err(CoreError::invalid(
+                "Developer key ID must be lowercase hexadecimal (40–128 digits, even length)",
+            ));
+        }
+    }
     let dir = t
         .user("umask 077 && mktemp -d /tmp/audb-system-rpm.XXXXXX")
         .await?;
@@ -152,15 +171,15 @@ async fn install_bytes(
         let platform_archs =
             crate::rpm_arch::parse_platform_archs(&t.user(crate::rpm_arch::ARCH_QUERY).await?)?;
         crate::rpm_arch::ensure_package_arch(&package.arch, &platform_archs)?;
-        // --test uses the same mode and override as the actual transaction.
-        let check = t.root(&rpm_command(&remote, options.upgrade, options.reinstall, true), options.root_password.as_ref()).await
+        // --test uses the same signature policy as the actual transaction.
+        let check = t.root(&rpm_command(&remote, options, true), options.root_password.as_ref()).await
             .map_err(|e| phase_error(e, "check", &package))?;
         if options.check_only {
             return Ok(json!({"package": package, "installed": false, "checked": true, "checkOnly": true,
                 "mode": if options.upgrade {"upgrade"} else {"install"}, "reinstall": options.reinstall,
-                "transactionValidation": "disabled_for_this_transaction", "checkOutput": check}));
+                "transactionValidation": "enabled", "developerKeyId": options.developer_key_id, "checkOutput": check}));
         }
-        let output = t.root(&rpm_command(&remote, options.upgrade, options.reinstall, false), options.root_password.as_ref()).await
+        let output = t.root(&rpm_command(&remote, options, false), options.root_password.as_ref()).await
             .map_err(|e| phase_error(e, "install", &package))?;
         let installed = t.root(&format!("rpm -q --queryformat {} -- {}", shell_quote(QUERY_FORMAT), shell_quote(&package.name)), options.root_password.as_ref()).await
             .map_err(|e| phase_error(e, "verify", &package))?;
@@ -168,9 +187,13 @@ async fn install_bytes(
             return Err(CoreError::runtime("RPM returned success but installed package metadata does not match")
                 .with_data(json!({"phase":"verify", "rpmTransactionCompleted":true, "package":package, "rpmOutput":output})));
         }
+        let certificate_loading = t.root(
+            "if test -d /sys/kernel/security/ima; then /usr/libexec/ima/load-certificates 2>&1; else printf 'IMA is not enabled\\n'; fi",
+            options.root_password.as_ref(),
+        ).await.map_err(|e| phase_error(e, "certificate_load", &package))?;
         Ok(json!({"package": package, "installed": true, "checked": true, "checkOnly": false,
             "mode": if options.upgrade {"upgrade"} else {"install"}, "reinstall": options.reinstall,
-            "transactionValidation": "disabled_for_this_transaction", "checkOutput": check, "output": output}))
+            "transactionValidation": "enabled", "developerKeyId": options.developer_key_id, "checkOutput": check, "output": output, "certificateLoaderOutput": certificate_loading}))
     }.await;
     // Remove only the known uploaded file and its unique directory, never glob.
     let cleanup = t.user(&guard.command).await;
@@ -255,20 +278,47 @@ pub(crate) fn parse_info(raw: &str) -> CoreResult<PackageInfo> {
         arch: parts[3].into(),
     })
 }
-fn rpm_command(path: &str, upgrade: bool, reinstall: bool, test: bool) -> String {
-    format!(
-        "rpm {}{}{} --undefine=__transaction_validation -- {}",
-        if upgrade { "-Uvh" } else { "-ivh" },
+/// Validate the full public certificate key ID, never a short suffix. The OS
+/// still verifies the CMS and checks revocation; this value is not a signature.
+pub fn parse_developer_key_id(value: &str) -> Result<String, String> {
+    if !(40..=128).contains(&value.len())
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(
+            "Expected the full certificate key ID (40–128 hexadecimal digits, even length)".into(),
+        );
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn rpm_command(path: &str, options: &SystemPackageOptions, test: bool) -> String {
+    let rpm = format!(
+        "rpm {}{}{} -- {}",
+        if options.upgrade { "-Uvh" } else { "-ivh" },
         if test { " --test" } else { "" },
-        if reinstall { " --replacepkgs" } else { "" },
+        if options.reinstall {
+            " --replacepkgs"
+        } else {
+            ""
+        },
         shell_quote(path)
-    )
+    );
+    match &options.developer_key_id {
+        Some(key) => format!(
+            "sh -c {} audb-rpm {} {}",
+            shell_quote(include_str!("developer_rpm.sh")),
+            shell_quote(key),
+            rpm
+        ),
+        None => format!("env -u RPMSIGN_EXTERNAL_ROOTFS {rpm}"),
+    }
 }
 fn phase_error(mut e: CoreError, phase: &str, package: &PackageInfo) -> CoreError {
     let mut data = e.data.take().unwrap_or_else(|| json!({}));
     data["phase"] = json!(phase);
     data["package"] = json!(package);
-    if phase == "verify" {
+    if phase == "verify" || phase == "certificate_load" {
         data["rpmTransactionCompleted"] = json!(true);
     }
     e.data = Some(data);
@@ -287,6 +337,7 @@ mod tests {
         fail_check: bool,
         fail_install: bool,
         fail_upload: bool,
+        fail_loader: bool,
     }
     impl InstallerTransport for Mock {
         async fn user(&mut self, command: &str) -> CoreResult<String> {
@@ -305,9 +356,12 @@ mod tests {
         }
         async fn root(&mut self, command: &str, _: Option<&RootPassword>) -> CoreResult<String> {
             self.calls.push(command.into());
+            if self.fail_loader && command.contains("/usr/libexec/ima/load-certificates") {
+                return Err(CoreError::runtime("loader unavailable"));
+            }
             if self.fail_check && command.contains("--test")
                 || self.fail_install
-                    && command.contains("--undefine")
+                    && (command.contains("rpm -ivh") || command.contains("rpm -Uvh"))
                     && !command.contains("--test")
             {
                 return Err(CoreError::new(ErrorCode::RemoteCommandFailed, "RPM failed"));
@@ -344,7 +398,7 @@ mod tests {
         let transactions: Vec<_> = t
             .calls
             .iter()
-            .filter(|c| c.contains("--undefine"))
+            .filter(|c| c.contains("rpm -ivh") || c.contains("rpm -Uvh"))
             .collect();
         assert_eq!(transactions.len(), 2);
         assert!(transactions[0].contains("--test"));
@@ -365,10 +419,136 @@ mod tests {
         let transactions: Vec<_> = t
             .calls
             .iter()
-            .filter(|c| c.contains("--undefine"))
+            .filter(|c| c.contains("rpm -ivh") || c.contains("rpm -Uvh"))
             .collect();
         assert_eq!(transactions.len(), 1);
         assert!(transactions[0].contains("-Uvh --test"));
+        assert!(!t.calls.iter().any(|c| c.contains("load-certificates")));
+    }
+
+    #[tokio::test]
+    async fn certificate_loading_follows_verified_install_and_preserves_partial_failure() {
+        let mut t = Mock {
+            fail_loader: true,
+            ..Default::default()
+        };
+        let error = install_bytes(&mut t, &[], &SystemPackageOptions::default(), None)
+            .await
+            .unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["phase"], "certificate_load");
+        assert_eq!(data["rpmTransactionCompleted"], true);
+        assert_eq!(data["stagingCleanup"], true);
+        let verify = t
+            .calls
+            .iter()
+            .position(|c| c.starts_with("rpm -q "))
+            .unwrap();
+        let loader = t
+            .calls
+            .iter()
+            .position(|c| c.contains("load-certificates"))
+            .unwrap();
+        assert!(verify < loader);
+    }
+
+    #[tokio::test]
+    async fn invalid_developer_key_never_reaches_device() {
+        for key in ["44b61e10", "abcd; id", "", &"a".repeat(41), &"A".repeat(64)] {
+            let mut t = Mock::default();
+            let options = SystemPackageOptions {
+                developer_key_id: Some(key.into()),
+                ..Default::default()
+            };
+            assert!(install_bytes(&mut t, &[], &options, None).await.is_err());
+            assert!(t.calls.is_empty());
+        }
+        assert_eq!(
+            parse_developer_key_id(&"A".repeat(64)).unwrap(),
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn native_validation_is_never_disabled() {
+        let mut options = SystemPackageOptions::default();
+        assert!(rpm_command("package.rpm", &options, false)
+            .starts_with("env -u RPMSIGN_EXTERNAL_ROOTFS rpm -ivh"));
+        options.developer_key_id = Some("a".repeat(64));
+        for check in [false, true] {
+            let command = rpm_command("a'b.rpm", &options, check);
+            assert!(command.contains("RPMSIGN_EXTERNAL_ROOTFS"));
+            assert!(!command.contains("--undefine"));
+            assert!(!command.contains("--nosignature"));
+            assert_eq!(command.contains("--test"), check);
+            assert!(command.ends_with("'a'\\''b.rpm'"));
+        }
+    }
+
+    // Execute the real shell wrapper against an isolated configuration and a
+    // fake rpm. This checks policy preservation, exit propagation and cleanup,
+    // not merely the spelling of a generated command.
+    #[test]
+    fn developer_configuration_is_private_preserved_and_cleaned_on_failure() {
+        use std::process::Command;
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("source.ini");
+        let record = temp.path().join("record");
+        let original = "[main]\ndatabase_path = /var/lib/rpmsign-external/db.sqlite\nroot_ca_cert_path = /etc/keys/packages/ca.pem\nrevocation_conf = /etc/keys/packages/revocation.conf\nsystem_developer_keyid_path = /etc/keys/packages/system-developer-keyid\n[other]\nuntouched = yes\n";
+        std::fs::write(&config, original).unwrap();
+        let script = include_str!("developer_rpm.sh").replace(
+            "/etc/rpmsign-external/rpmsign-external.conf >",
+            &format!("{} >", shell_quote(config.to_str().unwrap())),
+        );
+        let probe = r#"set -eu
+printf '%s\n' "$RPMSIGN_EXTERNAL_ROOTFS" > "$1"
+cat "$RPMSIGN_EXTERNAL_ROOTFS/etc/rpmsign-external/rpmsign-external.conf" >> "$1"
+cat "$RPMSIGN_EXTERNAL_ROOTFS/keyid" >> "$1"
+exit 17"#;
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                &script,
+                "audb-rpm",
+                &"a".repeat(64),
+                "sh",
+                "-c",
+                probe,
+                "probe",
+            ])
+            .arg(&record)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(17), "{:?}", output);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), original);
+        let observed = std::fs::read_to_string(&record).unwrap();
+        let mut lines = observed.lines();
+        let private = lines.next().unwrap();
+        assert!(!Path::new(private).exists());
+        assert!(observed.contains("database_path = /var/lib/rpmsign-external/db.sqlite"));
+        assert!(observed.contains("root_ca_cert_path = /etc/keys/packages/ca.pem"));
+        assert!(observed.contains("revocation_conf = /etc/keys/packages/revocation.conf"));
+        assert!(observed.contains(&format!("system_developer_keyid_path = {private}/keyid")));
+        assert!(observed.contains("untouched = yes"));
+        assert_eq!(observed.lines().last().unwrap(), "a".repeat(64));
+
+        for bad in [
+            "[main]\n",
+            "[wrong]\nsystem_developer_keyid_path=x\n",
+            "[main]\nsystem_developer_keyid_path=x\nsystem_developer_keyid_path=y\n",
+        ] {
+            std::fs::write(&config, bad).unwrap();
+            std::fs::remove_file(&record).unwrap();
+            let output = Command::new("sh")
+                .args(["-c", &script, "audb-rpm", &"a".repeat(64), "touch"])
+                .arg(&record)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(42));
+            assert!(!record.exists());
+            // Recreate only the test marker for the next iteration.
+            std::fs::write(&record, "").unwrap();
+        }
     }
     #[tokio::test]
     async fn failed_preflight_never_installs_and_failure_is_not_retried() {
@@ -388,7 +568,8 @@ mod tests {
             assert_eq!(
                 t.calls
                     .iter()
-                    .filter(|c| c.contains("--undefine") && !c.contains("--test"))
+                    .filter(|c| (c.contains("rpm -ivh") || c.contains("rpm -Uvh"))
+                        && !c.contains("--test"))
                     .count(),
                 usize::from(!fail_check)
             );
@@ -410,7 +591,10 @@ mod tests {
             )
             .await
             .is_err());
-            assert!(!t.calls.iter().any(|c| c.contains("--undefine")));
+            assert!(!t
+                .calls
+                .iter()
+                .any(|c| c.contains("rpm -ivh") || c.contains("rpm -Uvh")));
             assert!(t.calls.last().unwrap().contains("rmdir"));
         }
     }
@@ -453,7 +637,10 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidArgument);
-            assert!(!t.calls.iter().any(|c| c.contains("--undefine")));
+            assert!(!t
+                .calls
+                .iter()
+                .any(|c| c.contains("rpm -ivh") || c.contains("rpm -Uvh")));
             assert!(t.calls.last().unwrap().contains("rmdir"));
         }
     }
@@ -497,6 +684,9 @@ mod tests {
     fn metadata_and_paths_cannot_inject_shell_commands() {
         assert!(parse_info("bad;id\t1\t1\taarch64").is_err());
         assert!(validate_stage("/tmp/audb-system-rpm.ABC123;id").is_err());
-        assert!(rpm_command("a'b.rpm", false, false, false).ends_with("'a'\\''b.rpm'"));
+        assert!(
+            rpm_command("a'b.rpm", &SystemPackageOptions::default(), false)
+                .ends_with("'a'\\''b.rpm'")
+        );
     }
 }

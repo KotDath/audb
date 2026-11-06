@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-06
+
+### Fixed
+
+- System RPM installation keeps Aurora's native validation plugin enabled so
+  the installed package and signing certificate are registered for IMA loading.
+  Previously a signed agent could install but fail to execute on a clean device,
+  or depend on an unrelated application having registered the same key.
+- Load registered IMA certificates after installation, then restart and verify
+  the agent. Report post-install loading/startup failures separately from RPM
+  transaction failure.
+
+### Added
+
+- `setup-device` and `package install-system` accept `--developer-key-id` to
+  authorize one explicitly selected signer using a private per-process Aurora
+  configuration. Global trust, CA, revocation and IMA policy are preserved.
+  Incorrect keys and unsupported configuration layouts fail closed.
+
+### Changed
+
+- The default system-package route uses the OS system-developer policy. Regular
+  developer signatures need the explicit full key ID; there is no automatic
+  validation bypass. JSON reports `transactionValidation: enabled`.
+- CLI/daemon protocol is 11 to prevent old daemons ignoring the new option.
+  Agent protocol remains 3. RPMs are still distributed unsigned.
+- Verification: 167 workspace tests, Clippy, formatting, packaging self-tests
+  and RPM builds for aarch64, armv7hl and x86_64.
+- Hardware verification: Aurora 5.2.2.454 / KVADRA_T, upgrade and independent
+  audb-agent certificate registration. Fresh-device and cold-boot testing remain
+  separate from this verified upgrade; see research/agent-trust/README.md.
+
 ## [0.3.1] - 2026-10-29
 
 ### Added

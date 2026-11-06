@@ -4,7 +4,39 @@
 
 Physical devices support SSH shell, SFTP push/pull, status, agent-backed tap/swipe/screenshots, Unicode text, named keys, permission management and common Aurora guest commands where the device permits them. Install the system agent with `setup-device` before using physical input, screenshots or permissions. The previous implementation is preserved in `backup/physical-devices-v0.1.0`.
 
-Install the host CLI release with `cargo install audb-client --version 0.3.1 --locked`. The executable is named `audb`. Device agent RPMs are distributed separately in the [v0.3.1 release](https://github.com/KotDath/audb/releases/tag/v0.3.1); choose the device architecture and pass the package explicitly to `setup-device --rpm`. Cargo installation does not bundle or install a device RPM. The v0.3.1 agent RPM assets are unsigned; sign the selected RPM with your Aurora developer credentials before installing on an IMA-enforced device.
+Install the host CLI with `cargo install audb-client --version 0.4.2 --locked`.
+The executable is named `audb`. Agent RPMs for aarch64, armv7hl and x86_64
+are separate **unsigned** assets in the [v0.4.2 release](https://github.com/KotDath/audb/releases/tag/v0.4.2).
+Sign the selected RPM using your Aurora developer credentials before installing.
+
+Version 0.4.2 fixes agent certificate registration on developer devices. Previous
+versions disabled the RPM validation plugin, which also skipped registration for
+boot-time IMA loading. Installation could succeed while execution failed, or work
+only after an unrelated application had registered the same certificate.
+
+For a Regular development signature, obtain the full `Key ID` from your own
+certificate (`sfdk engine exec rpmsign-external info /path/to/cert.pem`), then run:
+
+```sh
+audb --device phone setup-device --rpm ./audb-agent-0.4.2-1.aarch64.rpm \
+  --developer-key-id FULL_CERTIFICATE_KEY_ID
+# For an existing agent, also pass --upgrade.
+audb --device phone --json doctor
+```
+
+This explicitly authorizes that signer for this system-package transaction. Native
+CMS verification, revocation checks and certificate registration remain enabled;
+the device's existing CA and developer-mode rules apply. Without the option, RPM
+uses the OS system-developer policy. Neither IMA enforcement nor global validator
+configuration is changed. This route uses an internal Aurora configuration
+mechanism, tested on KVADRA_T / Aurora 5.2.2.454; it is not a production package
+certification or a promise of compatibility with every OS version.
+
+Agent 0.4.2 was upgraded and its own certificate registration verified on that
+tablet. The existing SDK key was already in memory: a factory-reset device and
+cold boot were not tested. [Research and verification](research/agent-trust/README.md)
+distinguish the observed fix from these limits. Earlier 0.3.x verification below
+is historical. The host archive requires glibc 2.39 or newer.
 
 ## Version 0.3.1 verification
 
@@ -110,15 +142,33 @@ audb --device phone package install-system ./system-package.rpm --upgrade
 audb --device phone package install-system ./system-package.rpm --upgrade --reinstall
 ```
 
-The installer uploads to a unique directory, reads RPM metadata, checks the userspace architecture using `rpm --eval '%{_target_cpu} %{_arch}'`, and accepts `noarch` or an exact match with either reported architecture. It first runs `rpm -ivh --test --undefine=__transaction_validation`, then `rpm -ivh --undefine=__transaction_validation`, both as root. `--upgrade` selects `-Uvh`; `--reinstall` adds `--replacepkgs`. `--check-only` stops after the test transaction and returns `installed: false`. A completed install is confirmed against the RPM database.
+The installer uploads to a unique directory, checks RPM name and userspace
+architecture, runs `rpm -ivh --test`, then the real transaction and verifies RPM
+metadata. `--upgrade` selects `-Uvh`; `--reinstall` adds `--replacepkgs`.
+`--check-only` stops before installation, certificate loading or service restart.
 
-This is the explicit developer-device route used for the system service. The override applies to these RPM invocations; it does not change persistent validator configuration. Existing `package install` continues to use APM. Package signing remains a separate operation via `package sign`.
+Signature validation is enabled in both transactions. `--developer-key-id` accepts
+one full certificate key ID, not a short suffix. It creates a root-owned private
+configuration for each RPM process, preserving the device's database, CA,
+revocation and developer-mode paths and changing only its system-developer key
+selection. The configuration is removed on completion or ordinary shell
+interruption. Unknown configuration layouts and wrong signers fail before install;
+there is no fallback that disables validation. Temporary files can remain after a
+power loss or SIGKILL, but cannot change global trust policy.
 
-With configured root SSH, the installer uses it. Otherwise, a manual terminal invocation requests a hidden password for devel-su. Agent integrations supply one password line on stdin and add `--root-password-stdin`; the credential is passed over the private CLI/daemon socket and SSH stdin, without saving it in configuration or putting it in remote command arguments. Missing noninteractive credentials return `ROOT_ACCESS_REQUIRED`. An explicitly supplied credential chooses devel-su even when a root SSH account is configured.
+`transactionValidation` is now `enabled`, with `developerKeyId` reporting the
+explicit pin (or null). After installation, the native IMA certificate loader is
+invoked if IMA is present. Its output is returned as `certificateLoaderOutput`;
+exit zero alone does not prove every key loaded. `setup-device` restarts the agent
+after this step and checks its actual response. A loader error reports
+`phase: certificate_load`; startup and readiness errors report `agent_start` or
+`agent_verify`, with `rpmTransactionCompleted: true`. No mutation is replayed.
 
-Errors include `phase` (`check`, `install`, or `verify`) where available. A lost response or deadline returns `OUTCOME_UNKNOWN` and never retries the transaction. Uploaded files are cleaned on success and failure; cancellation triggers best-effort cleanup. `--json` preserves one response document.
-
-`setup-device` delegates to the general installer and checks RPM Name `audb-agent`; it does not install arbitrary packages through that wrapper. Without `--rpm`, it looks for `packages/audb-agent.rpm` beside the executable. Build the package with `python3 scripts/build-agent-rpm.py`, sign the exact resulting RPM, then pass its path to `setup-device`. RPM scripts enable and start the service; setup also queries the agent in the graphical session and returns its geometry and capabilities. If readiness fails after installation, the error includes `phase: agent_verify` and `rpmTransactionCompleted: true`. A missing default package reports `NOT_FOUND`.
+`setup-device` restricts RPM Name to `audb-agent`. Without `--rpm`, it looks for
+`packages/audb-agent.rpm` beside the executable. Build with
+`python3 scripts/build-agent-rpm.py`, sign the exact RPM, then supply its path.
+This system service does not pass the Regular application packaging profile.
+Ordinary application `package install` continues to use APM.
 
 On `phone`, the test transaction for the existing signed `aurora-strongswan-0.1.0-3.aarch64.rpm` succeeded with `--check-only --upgrade --reinstall`. An obsolete `aurora-strongswan-runtime` RPM was correctly rejected during `check`. Neither probe installed a package or restarted a service.
 
@@ -140,7 +190,7 @@ Coordinates are pixels in the current oriented screen, with the origin at its to
 
 The aarch64 developer package `audb-agent-0.3.0-3.aarch64.rpm` was installed and launched on `phone` (KVADRA_T, Aurora 5.2.0.259). Visually confirmed opening Help, selecting a category, swiping back, swiping from the bottom edge to home, and scrolling Settings in both directions. Evidence is in `target/touch-evidence/`; `setup-final.json` records installation/readiness. Tests cover rotation/bounds, framing/deadlines, releasing a contact on disconnect, CLI routing/stdin and setup. A Mashtab TrustPhone T1 (Aurora 5.2.2.70, framebuffer panel, no DRM connector) confirmed a tap and a swipe at rotation 90 and a portrait swipe at rotation 0. Those earlier checks did not cover rotations 180 and 270; the 0.3.1 verification above adds rotation 270 on KVADRA_T. Other physical device/rotation combinations remain unverified; emulator touch input continues through QMP; text and named keys prefer the shared agent when available.
 
-The build script uses Aurora SDK 5.2.1.200 sb2 and rpmbuild, following the local StrongSwan build route and the official [Scratchbox2 documentation](https://developer.auroraos.ru/doc/5.2.0/sdk/tools/scratchbox2). Select the target platform with `--platform aarch64|armv7hl|x86_64`: the script discovers the unique installed AuroraOS sb2 target for that architecture and uses its gcc/g++ and pkg-config environment, together with the matching Rust and RPM targets, and the script fails closed when the toolchain or the rpm platform disagrees with it. Use `--target` when several SDK releases are installed; `--cc`, `--cxx` and `--sysroot` support other container layouts. `--arch` only asserts the expected RPM architecture, and `--self-test` checks the platform logic without Docker. The matching Rust target must already be installed. The hardware-test build used the Regular development certificate; the release RPM assets are unsigned. `rpm-validator -p regular` (SDK tool version reported as unknown) exits 1: system services, RPM scriptlets and system executable locations do not fit the regular application profile; it also reports missing desktop/icons/name conventions and an empty-rpath warning. Installation uses the explicit developer system-RPM route with the transaction validation override. No trusted root certificate was available for separate signature trust verification. This is not a validated production distribution package.
+The build script uses Aurora SDK 5.2.1.200 sb2 and rpmbuild, following the local StrongSwan build route and the official [Scratchbox2 documentation](https://developer.auroraos.ru/doc/5.2.0/sdk/tools/scratchbox2). Select the target platform with `--platform aarch64|armv7hl|x86_64`: the script discovers the unique installed AuroraOS sb2 target for that architecture and uses its gcc/g++ and pkg-config environment, together with the matching Rust and RPM targets, and the script fails closed when the toolchain or the rpm platform disagrees with it. Use `--target` when several SDK releases are installed; `--cc`, `--cxx` and `--sysroot` support other container layouts. `--arch` only asserts the expected RPM architecture, and `--self-test` checks the platform logic without Docker. The matching Rust target must already be installed. The hardware-test build used the Regular development certificate; the release RPM assets are unsigned. `rpm-validator -p regular` (SDK tool version reported as unknown) exits 1: system services, RPM scriptlets and system executable locations do not fit the regular application profile; it also reports missing desktop/icons/name conventions and an empty-rpath warning. That historical test used the old validation override, superseded by the 0.4.2 route above. No trusted root certificate was available for separate signature trust verification in that test. This is not a validated production distribution package.
 
 ## Physical screenshots
 
@@ -295,7 +345,7 @@ Failure:
 
 The public process starts a private daemon mode automatically. Each device has an independent runtime and operation queue; different targets can execute concurrently. Emulator SSH and QMP sessions are retained. Physical operations currently launch OpenSSH processes per invocation, retaining profile and authentication behavior. Registration updates recreate a runtime on its next request, and queued requests recheck the registry before execution. A watch/monitor still occupies its own device queue; freeing that queue between polls remains planned.
 
-`--command-timeout SECONDS` bounds daemon execution including queue wait (default 300, maximum 86400). A timeout can leave the remote result unknown and does not cause a retry. CLI/daemon protocol version 10 uses a separate socket from older releases.
+`--command-timeout SECONDS` bounds daemon execution including queue wait (default 300, maximum 86400). A timeout can leave the remote result unknown and does not cause a retry. CLI/daemon protocol version 11 uses a separate socket from older releases so an old daemon cannot silently ignore the signer option.
 
 `package install ./app.rpm --timeout 60` works on phones and emulators. The CLI sends the absolute local path to the daemon; SFTP streams the RPM into a private device staging directory without a JSON byte array or whole-file buffering. audb checks RPM metadata/architecture and calls ordinary-user APM installation with the existing OS validation policy. `--timeout` (1–3600 seconds, default 60) bounds the subsequent wait for matching package ID and version through `APM.GetPackage`; the global command deadline also includes upload and queue wait. A matching installed version returns `verified: true`, `alreadyInstalled: true`, `changed: false` without another installation.
 

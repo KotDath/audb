@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// One-shot bootstrap credential. Never include it in responses or Debug logs.
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +30,9 @@ impl Drop for RootPassword {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemPackageOptions {
+    /// Explicitly authorize this signer for this developer system-RPM transaction.
+    #[serde(default)]
+    pub developer_key_id: Option<String>,
     pub upgrade: bool,
     #[serde(default)]
     pub reinstall: bool,

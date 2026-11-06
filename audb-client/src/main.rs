@@ -663,6 +663,9 @@ struct SetupDeviceArgs {
 }
 #[derive(Args)]
 struct SystemInstallFlags {
+    /// Authorize this certificate key ID for this system RPM only (developer devices).
+    #[arg(long, value_parser = audb_core::system_package::parse_developer_key_id)]
+    developer_key_id: Option<String>,
     /// Use rpm -Uvh instead of -ivh. Does not force replacement of the same version.
     #[arg(long)]
     upgrade: bool,
@@ -750,6 +753,7 @@ fn system_install_request(
         }
     }
     let options = SystemPackageOptions {
+        developer_key_id: flags.developer_key_id,
         upgrade: flags.upgrade,
         reinstall: flags.reinstall,
         check_only: flags.check_only,

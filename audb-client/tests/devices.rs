@@ -109,7 +109,7 @@ case "$command" in
     test -z "${AUDB_TEST_DELAY:-}" || sleep "$AUDB_TEST_DELAY"
     test "${AUDB_TEST_FAIL_CHECK:-}" != 1 || { printf 'dependencies failed\n' >&2; exit 1; }
     printf 'fixture-credential\n';;
-  *--undefine*) printf 'installed\n';;
+  *'rpm -ivh'*|*'rpm -Uvh'*) printf 'installed\n';;
   *'rpm -q '*) printf 'audb-agent\t0.3.0\t1\tnoarch\n';;
 esac
 "#;
@@ -183,11 +183,13 @@ fn system_installer_bootstraps_via_stdin_and_setup_checks_our_package() {
     assert!(!log.contains("fixture-credential"));
     assert_eq!(
         log.lines()
-            .filter(|c| c.contains("devel-su") && c.contains("--undefine") && !c.contains("--test"))
+            .filter(|c| c.contains("devel-su")
+                && (c.contains("rpm -ivh") || c.contains("rpm -Uvh"))
+                && !c.contains("--test"))
             .count(),
         1
     );
-    assert!(log.contains("rpm -ivh --test --undefine=__transaction_validation"));
+    assert!(log.contains("rpm -ivh --test --"));
     assert!(!fs::read_to_string(w.registry())
         .unwrap()
         .contains("fixture-credential"));
@@ -232,7 +234,7 @@ fn system_installer_check_only_and_missing_credentials_are_explicit() {
     assert!(log.contains("rpm -Uvh --test --replacepkgs"));
     assert_eq!(
         log.lines()
-            .filter(|c| c.contains("--undefine") && !c.contains("--test"))
+            .filter(|c| (c.contains("rpm -ivh") || c.contains("rpm -Uvh")) && !c.contains("--test"))
             .count(),
         0
     );
@@ -285,7 +287,9 @@ fn deadline_cleans_staging_without_dispatching_install() {
         let log = fs::read_to_string(w.dir.path().join("rpm-calls")).unwrap();
         assert_eq!(
             log.lines()
-                .filter(|c| c.contains("--undefine") && !c.contains("--test"))
+                .filter(
+                    |c| (c.contains("rpm -ivh") || c.contains("rpm -Uvh")) && !c.contains("--test")
+                )
                 .count(),
             0
         );
@@ -335,7 +339,7 @@ fn authentication_failure_is_reported_without_installing_or_leaking_input() {
     let log = fs::read_to_string(w.dir.path().join("rpm-calls")).unwrap();
     assert_eq!(
         log.lines()
-            .filter(|c| c.contains("--undefine") && !c.contains("--test"))
+            .filter(|c| (c.contains("rpm -ivh") || c.contains("rpm -Uvh")) && !c.contains("--test"))
             .count(),
         0
     );

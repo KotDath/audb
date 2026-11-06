@@ -1,5 +1,5 @@
 Name: audb-agent
-Version: 0.3.1
+Version: 0.4.2
 Release: 1
 Summary: Device automation service for Aurora Debug Bridge
 License: MIT
